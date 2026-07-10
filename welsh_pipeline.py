@@ -1,0 +1,444 @@
+"""
+welsh_pipeline.py
+===========
+Thin entry point / CLI. This is the only file you run directly. It owns
+the interactive menu loop (analyze local MP3s, discover videos, process
+the queue, test a phrase, manage the queue, run the corpus analyzer) and
+session-level state like the loaded Whisper model -- all the actual
+linguistics and corpus I/O live in mutation_engine.py and corpus_ops.py.
+A Gmail notification email is sent when video processing (options 1 and 3
+only) finishes -- see corpus_ops.send_notification_email for setup.
+"""
+import torch
+import yt_dlp
+from tqdm import tqdm
+from faster_whisper import WhisperModel
+
+from mutation_engine import (
+    BASE_DIR, LOCAL_MP3_DIR,
+    ensure_dirs, run_stamp, run_paths, _video_slug, load_spacy,
+    reset_cysill_circuit_breaker, load_lemma_cache, save_lemma_cache,
+)
+from corpus_ops import (
+    load_queue, save_queue, load_processed, save_processed,
+    discover_new_videos, prompt_channel_selection, download_audio,
+    analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
+    send_notification_email,
+)
+import corpus_analyzer
+
+import pandas as pd
+import time
+
+# ========================= MAIN =========================
+
+# ========================= QUEUE MANAGER =========================
+def manage_queue():
+    """Interactive queue management submenu."""
+    while True:
+        queue = load_queue()
+        print(f"\n── Queue Manager ({len(queue)} videos) ──────────────────")
+        print("  a = Show queue")
+        print("  b = Remove videos by index")
+        print("  c = Remove videos by channel/source")
+        print("  d = Filter queue to specific channels only")
+        print("  e = Clear entire queue")
+        print("  f = Add a single YouTube URL")
+        print("  g = Show channel breakdown")
+        print("  q = Back to main menu")
+        cmd = input("Choice: ").strip().lower()
+
+        if cmd == "q":
+            print("Returning to main menu...")
+            break
+
+        elif cmd == "a":
+            if not queue:
+                print("  Queue is empty.")
+            else:
+                print(f"\n  {'#':<5} {'Title':<50} {'Register':<12} {'Source'}")
+                print("  " + "-" * 95)
+                for i, v in enumerate(queue):
+                    src = v.get("source", "?")
+                    # shorten source URL to channel name portion
+                    src_short = src.split("/")[-1] if "/" in src else src
+                    title = v.get("title", v.get("id", "?"))[:48]
+                    reg   = v.get("channel_register", "unverified")
+                    print(f"  {i:<5} {title:<50} {reg:<12} {src_short}")
+
+        elif cmd == "b":
+            if not queue:
+                print("  Queue is empty.")
+                continue
+            # show queue first
+            print(f"\n  {'#':<5} {'Title':<55} {'Source'}")
+            print("  " + "-" * 85)
+            for i, v in enumerate(queue):
+                src_short = v.get("source", "?").split("/")[-1]
+                title = v.get("title", v.get("id", "?"))[:53]
+                print(f"  {i:<5} {title:<55} {src_short}")
+            raw = input("\n  Enter indices to remove (e.g. 0 3 5-8 12): ").strip()
+            if not raw:
+                continue
+            to_remove = set()
+            for part in raw.split():
+                if "-" in part:
+                    try:
+                        a, b = part.split("-")
+                        to_remove.update(range(int(a), int(b) + 1))
+                    except ValueError:
+                        print(f"  Skipping invalid range: {part}")
+                else:
+                    try:
+                        to_remove.add(int(part))
+                    except ValueError:
+                        print(f"  Skipping invalid index: {part}")
+            new_queue = [v for i, v in enumerate(queue) if i not in to_remove]
+            removed = len(queue) - len(new_queue)
+            save_queue(new_queue)
+            print(f"  Removed {removed} video(s). Queue now has {len(new_queue)}.")
+
+        elif cmd == "c":
+            if not queue:
+                print("  Queue is empty.")
+                continue
+            # show unique sources
+            sources = sorted(set(v.get("source", "?") for v in queue))
+            print("\n  Sources in queue:")
+            for i, s in enumerate(sources):
+                count = sum(1 for v in queue if v.get("source") == s)
+                print(f"  {i}  {s}  ({count} videos)")
+            raw = input("  Enter source indices to remove: ").strip()
+            if not raw:
+                continue
+            try:
+                idxs = {int(x) for x in raw.split()}
+                remove_sources = {sources[i] for i in idxs if i < len(sources)}
+            except ValueError:
+                print("  Invalid input.")
+                continue
+            new_queue = [v for v in queue if v.get("source") not in remove_sources]
+            removed = len(queue) - len(new_queue)
+            save_queue(new_queue)
+            print(f"  Removed {removed} video(s) from {len(remove_sources)} source(s). "
+                  f"Queue now has {len(new_queue)}.")
+
+        elif cmd == "d":
+            if not queue:
+                print("  Queue is empty.")
+                continue
+            sources = sorted(set(v.get("source", "?") for v in queue))
+            print("\n  Sources in queue:")
+            for i, s in enumerate(sources):
+                count = sum(1 for v in queue if v.get("source") == s)
+                print(f"  {i}  {s}  ({count} videos)")
+            raw = input("  Enter indices of sources to KEEP (all others will be removed): ").strip()
+            if not raw:
+                continue
+            try:
+                idxs = {int(x) for x in raw.split()}
+                keep_sources = {sources[i] for i in idxs if i < len(sources)}
+            except ValueError:
+                print("  Invalid input.")
+                continue
+            new_queue = [v for v in queue if v.get("source") in keep_sources]
+            removed = len(queue) - len(new_queue)
+            save_queue(new_queue)
+            print(f"  Kept {len(keep_sources)} source(s), removed {removed} video(s). "
+                  f"Queue now has {len(new_queue)}.")
+
+        elif cmd == "e":
+            if not queue:
+                print("  Queue is already empty.")
+                continue
+            confirm = input(f"  Really clear all {len(queue)} videos? (yes/no): ").strip().lower()
+            if confirm == "yes":
+                save_queue([])
+                print("  Queue cleared.")
+            else:
+                print("  Cancelled.")
+
+        elif cmd == "f":
+            url = input("  YouTube URL or video ID: ").strip()
+            if not url:
+                continue
+            # normalise to full URL
+            if not url.startswith("http"):
+                url = f"https://www.youtube.com/watch?v={url}"
+            # PATCH: register isn't inferrable from a one-off URL the way it
+            # is from CURATED_CHANNELS, so ask explicitly. Defaults to
+            # "unverified" (not "informal"/"formal") if left blank, so it
+            # doesn't silently slide into either side of a register
+            # comparison without a deliberate choice.
+            reg = input("  Channel register (formal/informal/unverified) [unverified]: ").strip().lower() or "unverified"
+            if reg not in ("formal", "informal", "unverified"):
+                print(f"  Unrecognized register '{reg}', defaulting to 'unverified'.")
+                reg = "unverified"
+            opts = {"quiet": True, "no_warnings": True}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                vid_id = info.get("id")
+                title  = info.get("title", "unknown")
+                source = info.get("channel_url") or url
+                existing_ids = {v["id"] for v in queue}
+                if vid_id in existing_ids:
+                    print(f"  Already in queue: {title}")
+                else:
+                    queue.append({"id": vid_id, "url": url,
+                                  "title": title, "source": source,
+                                  "channel_register": reg})
+                    save_queue(queue)
+                    print(f"  Added: {title} [{reg}]")
+            except Exception as e:
+                print(f"  Failed to fetch video info: {e}")
+
+        elif cmd == "g":
+            if not queue:
+                print("  Queue is empty.")
+                continue
+            from collections import Counter
+            sources = [(v.get("source", "?").split("/")[-1], v.get("channel_register", "unverified"))
+                       for v in queue]
+            counts  = Counter(sources).most_common()
+            print(f"\n  {'Channel':<40} {'Register':<12} {'Videos':>7}")
+            print("  " + "-" * 61)
+            for (s, reg), n in counts:
+                print(f"  {s:<40} {reg:<12} {n:>7}")
+            print("  " + "-" * 61)
+            print(f"  {'TOTAL':<40} {'':<12} {len(queue):>7}")
+            # PATCH: register-level rollup, useful for eyeballing corpus
+            # balance between formal/informal before a big processing run
+            reg_counts = Counter(v.get("channel_register", "unverified") for v in queue)
+            print("\n  By register:")
+            for reg, n in reg_counts.most_common():
+                print(f"    {reg:<12} {n:>7}")
+
+        else:
+            print("  Unknown command.")
+
+def main():
+    ensure_dirs()
+    # PATCH: load persisted lemma cache so prior API calls aren't repeated
+    load_lemma_cache()
+    print("Loading Welsh dependency parser...")
+    load_spacy()
+
+    # PATCH: model is now session-scoped (loaded lazily, cached across menu
+    # loops) instead of being re-prompted/re-loaded every single choice.
+    model = None
+
+    def _append(df, path, flags, idx):
+        df.to_csv(path, mode="a", header=flags[idx], index=False,
+                  encoding="utf-8-sig", quoting=1)
+        flags[idx] = False
+
+    current_model_size = None
+
+    def _ensure_model():
+        nonlocal model, current_model_size
+        if model is not None:
+            switch = input(f"  Current Whisper model: {current_model_size}. "
+                           "Switch models? (y/N): ").strip().lower()
+            if switch != "y":
+                return model
+        print()
+        model_size = input("Enter model (small / medium / large-v3 / large-v3-turbo) "
+                           "[default: small]: ").strip() or "small"
+        print(f"Loading {model_size} model...")
+        device       = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        current_model_size = model_size
+        print("✅ Whisper model loaded!\n")
+        return model
+
+    # PATCH: the whole menu now lives inside a loop so every choice -- not
+    # just option 5 -- returns to "1 2 3 4 5 q" afterward. Only an explicit
+    # "q" breaks out and ends the program.
+    while True:
+        stamp = run_stamp()
+        paths = run_paths(stamp)
+
+        print("\n1 = Analyze local MP3 files")
+        print("2 = Discover new videos (add to queue)")
+        print("3 = Process queue")
+        print("4 = Test Welsh phrase")
+        print("5 = Manage queue")
+        print("6 = Run corpus analyzer (figures + summary from all runs so far)")
+        print("q = Quit")
+        choice = input("Enter 1, 2, 3, 4, 5, 6, or q: ").strip().lower()
+
+        if choice == "q":
+            print("Goodbye!")
+            save_lemma_cache()
+            return
+
+        all_mutation_rows = []
+        # PATCH: only set True for actual video processing (1, 3) -- not
+        # discovery, phrase testing, queue management, or corpus_analyzer --
+        # so the completion email only fires for the thing it was asked for.
+        notify_on_completion = False
+
+        if choice == "1":
+            mp3_files = list(LOCAL_MP3_DIR.glob("*.mp3")) if LOCAL_MP3_DIR.exists() else []
+            if not mp3_files:
+                print("No local MP3 files found.")
+                save_lemma_cache()
+                continue
+            print(f"Found {len(mp3_files)} local MP3 file(s).")
+            # PATCH: register isn't inferrable from a local filename, so ask
+            # once up front and tag the whole batch -- assumes test_audio/
+            # is register-homogeneous per run. If you're mixing formal and
+            # informal local clips in the same folder, run this twice with
+            # different subsets instead of trusting one tag for all of them.
+            local_reg = input("  Channel register for this local batch "
+                              "(formal/informal/unverified) [unverified], or q to cancel: "
+                              ).strip().lower() or "unverified"
+            if local_reg == "q":
+                print("  Cancelled.")
+                save_lemma_cache()
+                continue
+            if local_reg not in ("formal", "informal", "unverified"):
+                print(f"  Unrecognized register '{local_reg}', defaulting to 'unverified'.")
+                local_reg = "unverified"
+            # PATCH: cancel check happens before the (slow, RAM-heavy) model
+            # load, not after -- no point loading Whisper just to bail out.
+            reset_cysill_circuit_breaker()
+            _ensure_model()
+            notify_on_completion = True
+            keys = ["segments", "words", "lemmas", "pos", "mutations"]
+            for p in tqdm(mp3_files, desc="Videos", unit="video"):
+                meta = {"title": p.stem, "url": str(p), "source": "local",
+                        "channel_register": local_reg}
+                with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
+                    segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub)
+                all_mutation_rows.extend(muts)
+                vpaths = _video_slug(meta, stamp)
+                h = [True] * 5   # fresh header flags per video (new file each time)
+                for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
+                    if data:
+                        _append(pd.DataFrame(data), vpaths[key], h, hi)
+                tqdm.write(f"  {p.stem}: done in {dur:.1f}s")
+                tqdm.write("=" * 60)
+
+        elif choice == "2":
+            selected_channels = prompt_channel_selection()
+            raw_limit = input("Discovery limit [50], or q to cancel: ").strip().lower()
+            if raw_limit == "q":
+                print("  Cancelled.")
+                save_lemma_cache()
+                continue
+            discover_new_videos(int(raw_limit or "50"), channels=selected_channels)
+            save_lemma_cache()
+            continue   # skip summary + "Results saved" -- nothing was processed
+
+        elif choice == "3":
+            queue = load_queue()
+            processed = load_processed()
+            if not queue:
+                print("Queue is empty!")
+                save_lemma_cache()
+                continue
+            raw_count = input(f"Process count (max {len(queue)}) [10], or q to cancel: ").strip().lower()
+            if raw_count == "q":
+                print("  Cancelled.")
+                save_lemma_cache()
+                continue
+            how_many = int(raw_count or "10")
+            # PATCH: cancel check happens before the (slow, RAM-heavy) model
+            # load, not after -- no point loading Whisper just to bail out.
+            reset_cysill_circuit_breaker()
+            _ensure_model()
+            notify_on_completion = True
+            videos_to_process = queue[:how_many]
+            remaining_queue   = queue[how_many:]
+            keys = ["segments", "words", "lemmas", "pos", "mutations"]
+            for video in tqdm(videos_to_process, desc="Videos", unit="video"):
+                try:
+                    mp3_path = download_audio(video)
+                    with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
+                        segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub)
+                    all_mutation_rows.extend(muts)
+                    vpaths = _video_slug(video, stamp)
+                    h = [True] * 5   # fresh header flags per video (new file each time)
+                    for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
+                        if data:
+                            _append(pd.DataFrame(data), vpaths[key], h, hi)
+                    processed.add(video["id"])
+                    save_processed(processed)
+                    tqdm.write(f"  {video.get('title', video['id'])}: done in {dur:.1f}s")
+                    tqdm.write("=" * 60)
+                except Exception as e:
+                    tqdm.write(f"  💥 Error: {e}")
+                    tqdm.write("=" * 60)
+                    processed.add(video["id"])
+                    save_processed(processed)
+                time.sleep(2.0)   # rate limit buffer + session stabilization between videos
+            save_queue(remaining_queue)
+
+        elif choice == "4":
+            # PATCH: removed the _ensure_model() call that used to be here --
+            # analyze_phrase() takes no model argument and never touches
+            # Whisper (it's pure text: regex-tokenize -> enrich_words ->
+            # mutation detection). Loading a multi-GB model just to test a
+            # typed phrase was pure waste, and actively bad given how tight
+            # RAM already is on this machine.
+            phrase = input("Enter a Welsh phrase, or q to cancel: ").strip()
+            if phrase.lower() == "q":
+                print("  Cancelled.")
+                save_lemma_cache()
+                continue
+            if phrase:
+                word_rows, lemma_rows, pos_rows, mutation_rows = analyze_phrase(phrase)
+                all_mutation_rows = mutation_rows
+                save_analysis_outputs(stamp, [], word_rows, lemma_rows, pos_rows, mutation_rows)
+
+        elif choice == "5":
+            manage_queue()
+            save_lemma_cache()
+            continue   # skip summary + "Results saved" -- nothing was processed
+
+        elif choice == "6":
+            # PATCH: corpus_analyzer.main() is interactive on its own (batch
+            # selection) and calls sys.exit() on a couple of its own
+            # early-exit paths (e.g. no mutation CSVs found yet, or nothing
+            # left after deletion) -- catch SystemExit here so that just
+            # returns to this menu instead of killing the whole pipeline.
+            try:
+                corpus_analyzer.main()
+            except SystemExit:
+                pass
+            save_lemma_cache()
+            continue   # skip video-processing summary + email -- nothing was processed here
+
+        else:
+            print("Unknown choice.")
+            continue
+
+        generate_research_summary(all_mutation_rows, stamp)
+        # PATCH: persist lemma cache at end of every run
+        save_lemma_cache()
+        print(f"\nResults saved in: {BASE_DIR}")
+
+        if notify_on_completion:
+            send_notification_email(
+                subject=f"Welsh pipeline: video processing finished ({stamp})",
+                body=(
+                    f"Video processing has finished.\n\n"
+                    f"Run stamp: {stamp}\n"
+                    f"Mutation rows collected this run: {len(all_mutation_rows)}\n"
+                    f"Results saved in: {BASE_DIR}"
+                ),
+            )
+
+
+if __name__ == "__main__":
+    main()
+
+# ================================================================
+# Dedicated to a language that refused to disappear
+# And to all the languages whose voices still struggle to be heard
+#
+# - A researcher in Korea, 2026
+# ================================================================
