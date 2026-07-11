@@ -23,7 +23,7 @@ from corpus_ops import (
     load_queue, save_queue, load_processed, save_processed,
     discover_new_videos, prompt_channel_selection, download_audio,
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
-    send_notification_email,
+    send_notification_email, build_email_body,
 )
 import corpus_analyzer
 
@@ -266,8 +266,9 @@ def main():
         print("4 = Test Welsh phrase")
         print("5 = Manage queue")
         print("6 = Run corpus analyzer (figures + summary from all runs so far)")
+        print("7 = Manually review mutations (manual_editing.py)")
         print("q = Quit")
-        choice = input("Enter 1, 2, 3, 4, 5, 6, or q: ").strip().lower()
+        choice = input("Enter 1, 2, 3, 4, 5, 6, 7, or q: ").strip().lower()
 
         if choice == "q":
             print("Goodbye!")
@@ -279,6 +280,13 @@ def main():
         # discovery, phrase testing, queue management, or corpus_analyzer --
         # so the completion email only fires for the thing it was asked for.
         notify_on_completion = False
+        # PATCH: run-level metadata for the completion email (elapsed time,
+        # per-video success/failure) -- reset every loop iteration so a
+        # later choice doesn't inherit an earlier run's numbers.
+        run_type = None
+        run_start_time = None
+        videos_attempted = 0
+        failed_videos = []
 
         if choice == "1":
             mp3_files = list(LOCAL_MP3_DIR.glob("*.mp3")) if LOCAL_MP3_DIR.exists() else []
@@ -307,20 +315,28 @@ def main():
             reset_cysill_circuit_breaker()
             _ensure_model()
             notify_on_completion = True
+            run_type = "Local MP3 batch"
+            run_start_time = time.time()
+            videos_attempted = len(mp3_files)
             keys = ["segments", "words", "lemmas", "pos", "mutations"]
             for p in tqdm(mp3_files, desc="Videos", unit="video"):
                 meta = {"title": p.stem, "url": str(p), "source": "local",
                         "channel_register": local_reg}
-                with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                    segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub)
-                all_mutation_rows.extend(muts)
-                vpaths = _video_slug(meta, stamp)
-                h = [True] * 5   # fresh header flags per video (new file each time)
-                for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
-                    if data:
-                        _append(pd.DataFrame(data), vpaths[key], h, hi)
-                tqdm.write(f"  {p.stem}: done in {dur:.1f}s")
-                tqdm.write("=" * 60)
+                try:
+                    with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
+                        segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub)
+                    all_mutation_rows.extend(muts)
+                    vpaths = _video_slug(meta, stamp)
+                    h = [True] * 5   # fresh header flags per video (new file each time)
+                    for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
+                        if data:
+                            _append(pd.DataFrame(data), vpaths[key], h, hi)
+                    tqdm.write(f"  {p.stem}: done in {dur:.1f}s")
+                    tqdm.write("=" * 60)
+                except Exception as e:
+                    tqdm.write(f"  💥 Error on {p.stem}: {e}")
+                    tqdm.write("=" * 60)
+                    failed_videos.append(p.stem)
 
         elif choice == "2":
             selected_channels = prompt_channel_selection()
@@ -351,8 +367,11 @@ def main():
             reset_cysill_circuit_breaker()
             _ensure_model()
             notify_on_completion = True
+            run_type = "Queue processing"
+            run_start_time = time.time()
             videos_to_process = queue[:how_many]
             remaining_queue   = queue[how_many:]
+            videos_attempted = len(videos_to_process)
             keys = ["segments", "words", "lemmas", "pos", "mutations"]
             for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                 try:
@@ -372,6 +391,7 @@ def main():
                 except Exception as e:
                     tqdm.write(f"  💥 Error: {e}")
                     tqdm.write("=" * 60)
+                    failed_videos.append(video.get("title", video["id"]))
                     processed.add(video["id"])
                     save_processed(processed)
                 time.sleep(2.0)   # rate limit buffer + session stabilization between videos
@@ -412,25 +432,57 @@ def main():
             save_lemma_cache()
             continue   # skip video-processing summary + email -- nothing was processed here
 
+        elif choice == "7":
+            # PATCH: manual_editing.py is intentionally standalone (see its
+            # module docstring -- duplicated constants, no dependency on
+            # mutation_engine actually loading) so it's imported lazily here
+            # rather than at module load time, keeping that independence
+            # intact for people who still run it directly with
+            # `python manual_editing.py`. Its main() parses sys.argv itself;
+            # since this menu invokes it with no extra CLI args, it falls
+            # through to its documented default (every mutations_*.csv under
+            # mutations/, is_erosion==True rows, skipping already-reviewed
+            # ones). For --pick / --sample / --trigger / etc., run
+            # manual_editing.py directly from the command line instead.
+            # Same SystemExit-catch reasoning as option 6: manual_editing.py
+            # calls sys.exit(1) on its own early-exit path (no CSVs found),
+            # which should return to this menu, not kill the pipeline.
+            import manual_editing
+            try:
+                manual_editing.main()
+            except SystemExit:
+                pass
+            save_lemma_cache()
+            continue   # skip video-processing summary + email -- nothing was processed here
+
         else:
             print("Unknown choice.")
             continue
 
-        generate_research_summary(all_mutation_rows, stamp)
+        summary = generate_research_summary(all_mutation_rows, stamp)
         # PATCH: persist lemma cache at end of every run
         save_lemma_cache()
         print(f"\nResults saved in: {BASE_DIR}")
 
         if notify_on_completion:
-            send_notification_email(
-                subject=f"Welsh pipeline: video processing finished ({stamp})",
-                body=(
-                    f"Video processing has finished.\n\n"
-                    f"Run stamp: {stamp}\n"
-                    f"Mutation rows collected this run: {len(all_mutation_rows)}\n"
-                    f"Results saved in: {BASE_DIR}"
-                ),
+            videos_succeeded = videos_attempted - len(failed_videos)
+            elapsed = time.time() - run_start_time
+            subject = (f"Welsh pipeline: {videos_succeeded}/{videos_attempted} videos, "
+                       f"{len(all_mutation_rows)} mutation rows ({stamp})")
+            if failed_videos:
+                subject += f" -- {len(failed_videos)} failed"
+            body = build_email_body(
+                run_type=run_type,
+                stamp=stamp,
+                elapsed_seconds=elapsed,
+                videos_attempted=videos_attempted,
+                videos_succeeded=videos_succeeded,
+                failed_videos=failed_videos,
+                mutation_rows=all_mutation_rows,
+                summary=summary,
+                base_dir=BASE_DIR,
             )
+            send_notification_email(subject=subject, body=body, html=True)
 
 
 if __name__ == "__main__":

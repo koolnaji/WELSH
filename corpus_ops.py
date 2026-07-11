@@ -52,11 +52,11 @@ def save_processed(processed):
 
 
 # ========================= EMAIL NOTIFICATION =========================
-def send_notification_email(subject, body):
+def send_notification_email(subject, body, html=False):
     """
-    Sends a plain-text notification email via Gmail SMTP once video
-    processing finishes (menu options 1 and 3 -- NOT the corpus_analyzer
-    run, which is a separate, usually much quicker, offline step).
+    Sends a notification email via Gmail SMTP once video processing
+    finishes (menu options 1 and 3 -- NOT the corpus_analyzer run, which
+    is a separate, usually much quicker, offline step).
 
     Credentials are read from environment variables rather than hardcoded,
     so nothing sensitive lives in this file:
@@ -73,6 +73,11 @@ def send_notification_email(subject, body):
     If GMAIL_SENDER / GMAIL_APP_PASSWORD aren't set, this prints a warning
     and returns quietly rather than crashing the pipeline over a
     notification -- a failed email should never lose processed data.
+
+    PATCH: added `html` flag -- build_email_body() below produces an HTML
+    body with organized sections instead of three flat text lines; this
+    just needs to be sent with the right MIME subtype for Gmail to render
+    it instead of showing raw tags. Plain-text callers are unaffected.
     """
     sender       = os.environ.get("GMAIL_SENDER", "").strip()
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
@@ -83,7 +88,7 @@ def send_notification_email(subject, body):
               "GMAIL_APP_PASSWORD environment variables to enable it.")
         return
 
-    msg = MIMEText(body)
+    msg = MIMEText(body, "html" if html else "plain")
     msg["Subject"] = subject
     msg["From"]    = sender
     msg["To"]      = recipient
@@ -96,6 +101,91 @@ def send_notification_email(subject, body):
         print(f"  📧 Notification email sent to {recipient}")
     except Exception as e:
         print(f"  ⚠️  Failed to send notification email: {e}")
+
+
+def _fmt_hms(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+
+def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
+                      videos_succeeded, failed_videos, mutation_rows,
+                      summary, base_dir):
+    """
+    Builds an organized HTML run-report email, replacing the old 3-line
+    plain-text body. Sections mirror generate_research_summary()'s console
+    output (same numbers, same source of truth) plus run-level metadata
+    that summary alone doesn't have: elapsed time, per-video success/
+    failure, and a channel_register breakdown.
+
+    `summary` is the dict returned by generate_research_summary() (or None
+    if there was no mutation data this run -- e.g. every video failed).
+    """
+    def row(label, value):
+        return (f'<tr><td style="padding:2px 14px 2px 0;color:#555;">{label}</td>'
+                f'<td style="padding:2px 0;font-weight:600;">{value}</td></tr>')
+
+    def section(title, rows_html):
+        return (f'<h3 style="margin:18px 0 6px;font-size:14px;color:#1a1a1a;'
+                f'border-bottom:1px solid #ddd;padding-bottom:4px;">{title}</h3>'
+                f'<table style="border-collapse:collapse;font-size:13px;">{rows_html}</table>')
+
+    parts = [
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;'
+        'max-width:560px;color:#222;">',
+        '<h2 style="margin:0 0 4px;font-size:17px;">Welsh pipeline run finished</h2>',
+        f'<div style="color:#777;font-size:12px;margin-bottom:10px;">'
+        f'{run_type} &middot; run stamp {stamp}</div>',
+    ]
+
+    parts.append(section("Run", "".join([
+        row("Type", run_type),
+        row("Elapsed", _fmt_hms(elapsed_seconds)),
+        row("Results saved in", str(base_dir)),
+    ])))
+
+    fail_html = ""
+    if failed_videos:
+        titles = "".join(f"<li>{t}</li>" for t in failed_videos)
+        fail_html = (f'<div style="margin-top:6px;color:#b3261e;">'
+                     f'<strong>Failed ({len(failed_videos)}):</strong>'
+                     f'<ul style="margin:4px 0 0 18px;padding:0;">{titles}</ul></div>')
+    parts.append(section("Videos", "".join([
+        row("Attempted", videos_attempted),
+        row("Succeeded", videos_succeeded),
+        row("Failed", len(failed_videos)),
+    ])) + fail_html)
+
+    if summary:
+        parts.append(section("Mutation data collected this run", "".join([
+            row("Total contexts", summary["total_analyzed_contexts"]),
+            row("Code-switch cases", f'{summary["code_switch_cases"]} '
+                f'({summary["code_switch_rate"]:.1%})'),
+            row("Evaluable non-code-switch", summary["evaluable_non_code_switch_contexts"]),
+            row("Erosion (all)", f'{summary["erosion_cases_all"]} '
+                f'({summary["erosion_rate_all"]:.1%})'),
+            row("Erosion (high-confidence)", f'{summary["erosion_cases_high_confidence"]} '
+                f'({summary["erosion_rate_high_confidence"]:.1%})'),
+            row("Phantom omissions", summary["phantom_omission_cases"]),
+            row("Erosion unverified", summary["erosion_unverified_cases"]),
+            row("Homograph collision flags", summary["collision_flagged_cases"]),
+        ])))
+
+        if mutation_rows:
+            df = pd.DataFrame(mutation_rows)
+            if "channel_register" in df.columns:
+                reg_counts = df["channel_register"].value_counts().to_dict()
+                parts.append(section("By channel register", "".join(
+                    row(reg.capitalize(), n) for reg, n in
+                    sorted(reg_counts.items(), key=lambda kv: -kv[1]))))
+    else:
+        parts.append('<div style="margin-top:10px;color:#777;font-size:13px;">'
+                      'No mutation data collected this run.</div>')
+
+    parts.append('</div>')
+    return "".join(parts)
 
 
 # ========================= SUMMARY =========================
@@ -227,6 +317,11 @@ def generate_research_summary(mutation_rows, stamp):
         for k, v in sorted(agreement_dist.items(), key=lambda x: -x[1]):
             print(f"  {k:<25}: {v}")
     print("="*70)
+
+    # PATCH: return the summary dict so callers (e.g. the run-completion
+    # email in welsh_pipeline.py) can reuse these exact numbers instead of
+    # recomputing them -- single source of truth for console + email.
+    return summary
 
 
 # ========================= FILE UTILS =========================
