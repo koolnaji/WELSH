@@ -2068,6 +2068,30 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if t1.get("h_mutation") or expected == ["h-mutation"]:
         return _evaluate_h_mutation(current_node, target_found, norm_current), lookahead
 
+    # PATCH: unmutable-initial exemption. Some initial clusters simply
+    # have no defined output under ANY of a word's expected mutation
+    # types -- most commonly loanwords/proper nouns with non-native
+    # Welsh initials (e.g. "Victoria" -- Welsh has no native word-initial
+    # "v", so SOFT_MUTATION has no "v" entry at all and there is no such
+    # thing as a soft-mutated "Victoria"), or a nasal-mutation trigger
+    # followed by a vowel-initial word (NASAL_MUTATION only maps
+    # p/t/c/b/d/g -- vowels have no nasal-mutated form). Without this,
+    # any trigger landing in front of such a word gets scored as erosion
+    # for a mutation that was never phonologically possible to begin
+    # with, not one that actually eroded. Placed after the fem_ei/mixed/
+    # h_mutation dispatches above (those have their own separate rules,
+    # e.g. h-mutation specifically targets vowel-initial words) so this
+    # only gates the generic soft/soft_limited/nasal/aspirate path below.
+    if expected:
+        radical_cluster = initial_cluster(target_lemma or target_norm)
+        mutation_tables = {
+            "soft": SOFT_MUTATION, "soft_limited": SOFT_MUTATION_LIMITED,
+            "nasal": NASAL_MUTATION, "aspirate": ASPIRATE_MUTATION,
+        }
+        checkable = [e for e in expected if e in mutation_tables]
+        if checkable and not any(radical_cluster in mutation_tables[e] for e in checkable):
+            return None, lookahead
+
     outcome = _evaluate_mutation_outcome(target_found, expected)
     if outcome["skip"]:
         if outcome["t2"].get("is_code_switch"):

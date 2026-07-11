@@ -927,6 +927,26 @@ def print_corpus_summary(df, batch_log):
     erosion   = int(df["is_erosion"].sum()) if "is_erosion" in df.columns else 0
     collision = int(df["collision_flag"].notna().sum()) if "collision_flag" in df.columns else 0
 
+    # PATCH: the headline erosion-rate figure below used to divide by
+    # non_cs (total - code_switch only), which still includes
+    # phantom_mutation / selective_invariancy / erosion_unverified /
+    # colloquial_variant rows -- none of those are evaluable erosion
+    # contexts, and every OTHER erosion-rate calculation in this file
+    # (by mutation type, by channel, both explicitly labeled "evaluable
+    # contexts only") already excludes them via EVALUABLE_STATUSES. That
+    # meant the single headline number at the top of this summary was
+    # computed on a noisier, larger denominator than the breakdowns
+    # directly below it -- same status column, two different answers.
+    # evaluable_n/evaluable_erosion now match that same filter so the
+    # headline is consistent with the rest of the report; total/non_cs
+    # are kept as-is for informational corpus-size context only.
+    if "status" in df.columns:
+        evaluable_df    = df[df["status"].isin(EVALUABLE_STATUSES)]
+        evaluable_n      = len(evaluable_df)
+        evaluable_erosion = int(evaluable_df["is_erosion"].sum()) if "is_erosion" in evaluable_df.columns else 0
+    else:
+        evaluable_n, evaluable_erosion = non_cs, erosion
+
     print("\n" + "="*70)
     print("CORPUS SUMMARY - WELSH MUTATION ANALYSIS")
     print("="*70)
@@ -973,8 +993,11 @@ def print_corpus_summary(df, batch_log):
     print(f"Code-switch cases                  : {cs_cases:,} ({cs_cases/total:.1%})"
           if total > 0 else f"Code-switch cases                  : {cs_cases:,}")
     print(f"Non-CS contexts (analysable)       : {non_cs:,}")
-    print(f"Erosion cases                      : {erosion:,} ({erosion/non_cs:.1%} of non-CS)"
-          if non_cs > 0 else f"Erosion cases                      : {erosion:,}")
+    print(f"  of which evaluable (excl. phantom/selective-invariancy/"
+          f"unverified/colloquial-variant): {evaluable_n:,}")
+    print(f"Erosion cases                      : {evaluable_erosion:,} "
+          f"({evaluable_erosion/evaluable_n:.1%} of evaluable contexts)"
+          if evaluable_n > 0 else f"Erosion cases                      : {evaluable_erosion:,}")
     print(f"Homograph collision flags          : {collision:,}")
 
     if "expected_mutation" in df.columns and "is_erosion" in df.columns:
