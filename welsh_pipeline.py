@@ -3,9 +3,18 @@ welsh_pipeline.py
 ===========
 Thin entry point / CLI. This is the only file you run directly. It owns
 the interactive menu loop (analyze local MP3s, discover videos, process
-the queue, test a phrase, manage the queue, run the corpus analyzer) and
-session-level state like the loaded Whisper model -- all the actual
-linguistics and corpus I/O live in mutation_engine.py and corpus_ops.py.
+the queue, test a phrase, manage the queue, run the corpus analyzer,
+manually review mutations) and session-level state like the loaded
+Whisper model -- all the actual linguistics and corpus I/O live in
+mutation_engine.py and corpus_ops.py.
+
+For queue-processed (YouTube) videos, caption corroboration
+(fetch_captions.py) now runs automatically per video: captions are fetched
+before transcription, and the corroboration pass runs immediately after
+that video's mutations are written -- no separate manual step. Local MP3
+batches (choice 1) skip this, since local files have no YouTube video ID
+to fetch captions against.
+
 A Gmail notification email is sent when video processing (options 1 and 3
 only) finishes -- see corpus_ops.send_notification_email for setup.
 """
@@ -26,7 +35,13 @@ from corpus_ops import (
     send_notification_email, build_email_body,
 )
 import corpus_analyzer
+# PATCH: fetch_captions is now a normal top-level import rather than
+# lazy-imported inside a menu branch -- it's no longer an optional manual
+# step (former option 8), it's part of the standard choice-3 video loop
+# now (see below), so it needs to be available every time that loop runs.
+import fetch_captions
 
+import csv
 import pandas as pd
 import time
 
@@ -289,6 +304,10 @@ def main():
         failed_videos = []
 
         if choice == "1":
+            # PATCH: no caption corroboration here -- local files have no
+            # YouTube video ID to fetch captions against. Corroboration
+            # (see choice "3" below) only applies to queue-processed,
+            # YouTube-sourced videos.
             mp3_files = list(LOCAL_MP3_DIR.glob("*.mp3")) if LOCAL_MP3_DIR.exists() else []
             if not mp3_files:
                 print("No local MP3 files found.")
@@ -372,9 +391,47 @@ def main():
             videos_to_process = queue[:how_many]
             remaining_queue   = queue[how_many:]
             videos_attempted = len(videos_to_process)
+            # PATCH: caption corroboration is now a standard part of every
+            # queue-processed video rather than a separate manual menu step
+            # (former option 8) -- loaded once here (session-cached, same
+            # instance the rest of the pipeline uses) rather than per video.
+            nlp = load_spacy()
             keys = ["segments", "words", "lemmas", "pos", "mutations"]
             for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                 try:
+                    # PATCH: fetch captions FIRST, before transcription --
+                    # this is "getting transcription data and validating
+                    # it" as one step, not transcribe-now/validate-later.
+                    # Captured regardless of what Whisper does with the
+                    # audio, so corroboration data is sitting ready the
+                    # moment this video's mutations exist a few lines down
+                    # -- no separate manual pass needed. A caption-fetch
+                    # failure (network hiccup, no captions at all, video
+                    # taken down, etc.) only skips corroboration for THIS
+                    # video, never the transcription itself -- losing the
+                    # cross-check is not a reason to lose the data.
+                    captions_csv_path = None
+                    try:
+                        manual_cy, auto_cy, _ = fetch_captions.list_available_tracks(video["url"])
+                        if manual_cy or auto_cy:
+                            vtt_path, cap_lang, cap_kind, _ = fetch_captions.download_captions(video["url"])
+                            if vtt_path is not None:
+                                cap_segments = fetch_captions.parse_vtt(vtt_path)
+                                captions_csv_path = vtt_path.with_suffix(".csv")
+                                with open(captions_csv_path, "w", newline="",
+                                          encoding="utf-8-sig") as f:
+                                    writer = csv.DictWriter(f, fieldnames=[
+                                        "segment_start", "segment_end", "segment_text"])
+                                    writer.writeheader()
+                                    writer.writerows(cap_segments)
+                                tqdm.write(f"  Captions ({cap_kind}, {cap_lang}): "
+                                           f"{len(cap_segments)} segment(s)")
+                        else:
+                            tqdm.write("  No Welsh captions available for this video.")
+                    except Exception as e:
+                        tqdm.write(f"  Caption fetch failed (continuing without "
+                                   f"corroboration): {e}")
+
                     mp3_path = download_audio(video)
                     with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
                         segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub)
@@ -384,6 +441,19 @@ def main():
                     for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
                         if data:
                             _append(pd.DataFrame(data), vpaths[key], h, hi)
+
+                    # PATCH: corroborate immediately, same run -- mutations
+                    # + segments for this video were just written above, so
+                    # everything run_corroboration() needs is on disk now.
+                    if captions_csv_path is not None and muts:
+                        try:
+                            fetch_captions.run_corroboration(
+                                vpaths["mutations"], captions_csv_path, nlp=nlp)
+                        except SystemExit:
+                            tqdm.write("  Corroboration pass skipped (no matching segments file).")
+                        except Exception as e:
+                            tqdm.write(f"  Corroboration pass failed: {e}")
+
                     processed.add(video["id"])
                     save_processed(processed)
                     tqdm.write(f"  {video.get('title', video['id'])}: done in {dur:.1f}s")

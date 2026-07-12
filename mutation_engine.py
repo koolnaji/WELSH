@@ -279,6 +279,18 @@ DEFINITE_ARTICLE_FORMS             = {"y", "yr", "r"}
 # erosion.
 LL_RH_SOFT_EXEMPT_TRIGGERS_ANY_POS = {"yn", "cyn", "mor", "pur"}
 LL_RH_SOFT_EXEMPT_TRIGGERS_NOUN_ONLY = {"y", "yr", "r", "un"}
+
+# PATCH: per Wiktionary's Welsh mutations appendix, bare present-tense
+# bod-forms do NOT trigger mutation on the word immediately following them
+# in the general case -- that word is normally the SUBJECT ("Mae ci yn
+# cysgu" -- "ci" stays radical, correctly). Bod-forms only trigger soft
+# mutation via two much narrower environments: the predicate particle "yn"
+# (already handled on its own via the "yn" branch in
+# layer_1_trigger_detection) and a fronted predicate before a b-initial
+# bod-form (rare, not modelled here). "sy"/"sydd" are NOT in this set --
+# the relative sy(dd) genuinely does trigger soft mutation of a directly
+# following predicate, that's a different, legitimate rule.
+BOD_SUBJECT_EXEMPT_TRIGGERS = {"mae", "ydy", "oes"}
 NUMERAL_FEM_SOFT_LIMITED_TRIGGERS  = {"un"}
 NUMERAL_GENERAL_SOFT_TRIGGERS      = {"dau", "dwy"}
 NASAL_NUMERAL_TRIGGERS             = {
@@ -2020,6 +2032,27 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if is_english_code_switch(target_norm, target_lemma):
         return _build_cs_row(current_node, target_found, t1,
                              norm_current, conf_current), lookahead
+
+    # PATCH: mae/ydy/oes false-trigger fix. Confirmed live in the corpus:
+    # "mae gan praed popeth..." was scoring 'following: gan, expected:
+    # soft, found: none' as erosion -- but "gan" is the preposition that
+    # STARTS the interpolated PP "gan [possessor]", not a mutation target
+    # at all. More generally, the word right after a bare bod-form is
+    # normally the SUBJECT, which never mutates ("Mae ci yn cysgu"). The
+    # real (currently unimplemented) mutation site in "mae gan X Y"
+    # constructions is Y -- the word AFTER the whole PP -- per
+    # Wiktionary's "word after an interpolated prepositional phrase" rule
+    # (mae yn yr ardd gi -> ci mutates to gi). That's a positive rule that
+    # needs PP-span detection via the dependency tree, not simple
+    # lookahead, and is tracked separately (see potential_fixes.md --
+    # needs its own impact scan before it's added). Until then, this just
+    # stops the false positive: skip evaluation when what's next is (a)
+    # itself a known trigger/function word (we've landed on the START of
+    # a PP, not a target) or (b) the subject (spaCy dep == "nsubj").
+    if norm_current in BOD_SUBJECT_EXEMPT_TRIGGERS and expected:
+        target_dep = (target_found.get("spacy_token", {}) or {}).get("dep")
+        if target_norm in TRIGGERS or target_dep == "nsubj":
+            return None, lookahead
 
     # PATCH: yn + verb-noun exemption. Per Wiktionary's Welsh mutations
     # appendix, "yn" only mutates in two environments: the predicate
