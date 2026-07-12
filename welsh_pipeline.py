@@ -22,6 +22,7 @@ import torch
 import yt_dlp
 from tqdm import tqdm
 from faster_whisper import WhisperModel
+import mutation_engine
 
 from mutation_engine import (
     BASE_DIR, LOCAL_MP3_DIR,
@@ -30,6 +31,8 @@ from mutation_engine import (
 )
 from corpus_ops import (
     load_queue, save_queue, load_processed, save_processed,
+    load_failed, record_failure, clear_failure,
+    load_local_processed, save_local_processed,
     discover_new_videos, prompt_channel_selection, download_audio,
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
     send_notification_email, build_email_body,
@@ -313,7 +316,19 @@ def main():
                 print("No local MP3 files found.")
                 save_lemma_cache()
                 continue
+            local_processed = load_local_processed()
+            pending_mp3_files = []
+            for p in mp3_files:
+                stat = p.stat()
+                record = local_processed.get(str(p.resolve()))
+                if record and record.get("size") == stat.st_size and record.get("mtime_ns") == stat.st_mtime_ns:
+                    continue
+                pending_mp3_files.append(p)
+            if not pending_mp3_files:
+                print("All local MP3 files have already been processed. Change a file or clear processed_local_mp3s.json to rerun them.")
+                continue
             print(f"Found {len(mp3_files)} local MP3 file(s).")
+            print(f"Processing {len(pending_mp3_files)} new or changed file(s).")
             # PATCH: register isn't inferrable from a local filename, so ask
             # once up front and tag the whole batch -- assumes test_audio/
             # is register-homogeneous per run. If you're mixing formal and
@@ -336,9 +351,9 @@ def main():
             notify_on_completion = True
             run_type = "Local MP3 batch"
             run_start_time = time.time()
-            videos_attempted = len(mp3_files)
+            videos_attempted = len(pending_mp3_files)
             keys = ["segments", "words", "lemmas", "pos", "mutations"]
-            for p in tqdm(mp3_files, desc="Videos", unit="video"):
+            for p in tqdm(pending_mp3_files, desc="Videos", unit="video"):
                 meta = {"title": p.stem, "url": str(p), "source": "local",
                         "channel_register": local_reg}
                 try:
@@ -350,6 +365,9 @@ def main():
                     for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
                         if data:
                             _append(pd.DataFrame(data), vpaths[key], h, hi)
+                    stat = p.stat()
+                    local_processed[str(p.resolve())] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+                    save_local_processed(local_processed)
                     tqdm.write(f"  {p.stem}: done in {dur:.1f}s")
                     tqdm.write("=" * 60)
                 except Exception as e:
@@ -364,7 +382,14 @@ def main():
                 print("  Cancelled.")
                 save_lemma_cache()
                 continue
-            discover_new_videos(int(raw_limit or "50"), channels=selected_channels)
+            try:
+                limit = int(raw_limit or "50")
+                if limit < 1:
+                    raise ValueError
+            except ValueError:
+                print("Please enter a whole number greater than zero.")
+                continue
+            discover_new_videos(limit, channels=selected_channels)
             save_lemma_cache()
             continue   # skip summary + "Results saved" -- nothing was processed
 
@@ -380,7 +405,14 @@ def main():
                 print("  Cancelled.")
                 save_lemma_cache()
                 continue
-            how_many = int(raw_count or "10")
+            try:
+                how_many = int(raw_count or "10")
+                if how_many < 1:
+                    raise ValueError
+            except ValueError:
+                print("Please enter a whole number greater than zero.")
+                continue
+            how_many = min(how_many, len(queue))
             # PATCH: cancel check happens before the (slow, RAM-heavy) model
             # load, not after -- no point loading Whisper just to bail out.
             reset_cysill_circuit_breaker()
@@ -390,15 +422,25 @@ def main():
             run_start_time = time.time()
             videos_to_process = queue[:how_many]
             remaining_queue   = queue[how_many:]
+            retry_queue       = []
+            failed_state      = load_failed()
             videos_attempted = len(videos_to_process)
             # PATCH: caption corroboration is now a standard part of every
             # queue-processed video rather than a separate manual menu step
             # (former option 8) -- loaded once here (session-cached, same
             # instance the rest of the pipeline uses) rather than per video.
-            nlp = load_spacy()
+            nlp = mutation_engine.SPACY_NLP if load_spacy() else None
             keys = ["segments", "words", "lemmas", "pos", "mutations"]
             for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                 try:
+                    # PATCH: explicit start-of-video banner. Caption fetch
+                    # now prints BEFORE transcription, so without this the
+                    # previous video's tail output (hallucination warnings,
+                    # etc.) ran straight into the next video's caption line
+                    # with nothing marking the seam -- ambiguous in a long
+                    # scrolling log. Mirrors the "done in Xs" line that
+                    # already closes each video.
+                    tqdm.write(f"\n▶ {video.get('title', video['id'])}")
                     # PATCH: fetch captions FIRST, before transcription --
                     # this is "getting transcription data and validating
                     # it" as one step, not transcribe-now/validate-later.
@@ -456,16 +498,22 @@ def main():
 
                     processed.add(video["id"])
                     save_processed(processed)
+                    clear_failure(video["id"], failed_state)
                     tqdm.write(f"  {video.get('title', video['id'])}: done in {dur:.1f}s")
                     tqdm.write("=" * 60)
                 except Exception as e:
                     tqdm.write(f"  💥 Error: {e}")
                     tqdm.write("=" * 60)
                     failed_videos.append(video.get("title", video["id"]))
-                    processed.add(video["id"])
-                    save_processed(processed)
+                    if record_failure(video, e, failed_state):
+                        retry_queue.append(video)
+                        tqdm.write("  Will retry this video in a later queue run.")
+                    else:
+                        processed.add(video["id"])
+                        save_processed(processed)
+                        tqdm.write("  Retry limit reached; marked as processed. See failed_videos.json for details.")
                 time.sleep(2.0)   # rate limit buffer + session stabilization between videos
-            save_queue(remaining_queue)
+            save_queue(retry_queue + remaining_queue)
 
         elif choice == "4":
             # PATCH: removed the _ensure_model() call that used to be here --

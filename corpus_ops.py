@@ -20,7 +20,8 @@ import yt_dlp
 from tqdm import tqdm
 
 from mutation_engine import (
-    BASE_DIR, AUDIO_DIR, TRANS_DIR, SUMMARY_DIR, VIDEO_QUEUE, PROCESSED_LOG, CURATED_CHANNELS,
+    BASE_DIR, AUDIO_DIR, TRANS_DIR, SUMMARY_DIR, VIDEO_QUEUE, PROCESSED_LOG,
+    LOCAL_PROCESSED_LOG, FAILED_LOG, FAILED_MAX_RETRIES, CURATED_CHANNELS,
     EROSION_CONFIDENCE_THRESHOLD,
     ensure_dirs, run_stamp, run_paths,
     filter_hallucinated_segments, deduplicate_overlapping_segments,
@@ -31,24 +32,79 @@ from mutation_engine import (
 )
 
 # ========================= QUEUE / LOG HELPERS =========================
+def _write_json(path, value):
+    """Atomically replace a JSON state file to avoid corrupting it on a crash."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+
 def load_queue():
     if VIDEO_QUEUE.exists():
-        try: return json.loads(VIDEO_QUEUE.read_text(encoding="utf-8"))
-        except: return []
+        try:
+            data = json.loads(VIDEO_QUEUE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
     return []
 
 def save_queue(queue):
-    VIDEO_QUEUE.write_text(json.dumps(queue, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_json(VIDEO_QUEUE, queue)
 
 def load_processed():
     if PROCESSED_LOG.exists():
-        try: return set(json.loads(PROCESSED_LOG.read_text(encoding="utf-8")))
-        except: return set()
+        try:
+            data = json.loads(PROCESSED_LOG.read_text(encoding="utf-8"))
+            return set(data) if isinstance(data, list) else set()
+        except (OSError, json.JSONDecodeError):
+            return set()
     return set()
 
 def save_processed(processed):
-    PROCESSED_LOG.write_text(
-        json.dumps(sorted(list(processed)), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_json(PROCESSED_LOG, sorted(processed))
+
+def load_failed():
+    if not FAILED_LOG.exists():
+        return {}
+    try:
+        data = json.loads(FAILED_LOG.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_failed(failed):
+    _write_json(FAILED_LOG, failed)
+
+def record_failure(video, error, failed):
+    """Record a failed queue item and return whether it may be retried."""
+    video_id = str(video["id"])
+    previous = failed.get(video_id, {})
+    attempts = int(previous.get("attempts", 0)) + 1
+    failed[video_id] = {
+        "attempts": attempts,
+        "last_error": str(error),
+        "title": video.get("title", video_id),
+        "last_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    save_failed(failed)
+    return attempts < FAILED_MAX_RETRIES
+
+def clear_failure(video_id, failed):
+    if str(video_id) in failed:
+        failed.pop(str(video_id))
+        save_failed(failed)
+
+def load_local_processed():
+    if not LOCAL_PROCESSED_LOG.exists():
+        return {}
+    try:
+        data = json.loads(LOCAL_PROCESSED_LOG.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_local_processed(processed):
+    _write_json(LOCAL_PROCESSED_LOG, processed)
 
 
 # ========================= EMAIL NOTIFICATION =========================

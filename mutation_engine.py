@@ -17,7 +17,6 @@ import io
 import os
 import unicodedata
 import random
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import json
@@ -49,7 +48,11 @@ except Exception:
     simplemma_is_known = None
 
 # ========================= CONFIGURATION =========================
-BASE_DIR      = Path.home() / "Documents" / "welsh_analysis"
+# Keep data outside the source tree so the program can be copied, installed,
+# or run from any working directory.  Set WELSH_ANALYSIS_DIR to override this
+# location (for example, to use an external drive or a shared project folder).
+BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR",
+                                   str(Path.home() / "welsh_analysis"))).expanduser()
 AUDIO_DIR     = BASE_DIR / "audio"
 TRANS_DIR     = BASE_DIR / "transcriptions"
 MUT_DIR       = BASE_DIR / "mutations"
@@ -614,10 +617,54 @@ def save_lemma_cache():
     except Exception as e:
         print(f"⚠️  Could not save lemma cache: {e}")
 
+# PATCH: known suppletive Welsh comparative/superlative adjectives. Welsh
+# lemmatizers (Cysill and simplemma) collapse comparative/superlative forms
+# to their citation (positive-grade) lemma for dictionary purposes -- e.g.
+# "llai" (smaller) lemmatizes to "bach" (small), "gwell" (better) to "da"
+# (good). That's correct lexicographically, but this pipeline uses
+# get_welsh_lemma()'s result as a RADICAL for mutation purposes
+# (initial_cluster(lemma), expected_surface_forms(lemma, ...)), and each
+# comparative/superlative degree is its own suppletive radical with its own
+# mutation behaviour -- "llai" itself is ll-initial and exempt from soft
+# mutation after "yn", but the positive-grade lemma "bach" is b-initial and
+# expects soft mutation. Using the positive-grade lemma here silently
+# misclassified every comparative/superlative occurrence of these suppletive
+# lexemes (confirmed live in the corpus: "yn llai" was being evaluated as if
+# it were "bach"). Fixed by special-casing these forms to return their own
+# surface degree as the "lemma"/radical, before the normal lookup path runs.
+SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS = {
+    "gwell", "gorau",       # da (good) -> better, best
+    "gwaeth", "gwaethaf",   # drwg (bad) -> worse, worst
+    "mwy", "mwyaf",         # mawr (big) -> bigger, biggest
+    "llai", "lleiaf",       # bach (small) -> smaller, smallest
+    "nes", "nesaf",         # agos (near) -> nearer, nearest
+}
+
+def _resolve_suppletive_comparative_radical(raw):
+    """
+    Returns the correct comparative/superlative radical when `raw` is one of
+    SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS itself, or a regularly-
+    mutated surface form of one of them (e.g. "well" <- soft-mutated
+    "gwell"). Returns None for anything else, so the normal lemma lookup
+    (Cysill/simplemma) applies as before.
+    """
+    raw = normalize_word(raw)
+    if not raw:
+        return None
+    if raw in SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS:
+        return raw
+    for radical in SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS:
+        if raw in expected_surface_forms(radical, ["soft", "soft_limited", "nasal", "aspirate"]):
+            return radical
+    return None
+
 def get_welsh_lemma(word):
     w = normalize_word(word)
     if not w:
         return None
+    suppletive_radical = _resolve_suppletive_comparative_radical(w)
+    if suppletive_radical:
+        return suppletive_radical
     if w in LEMMA_CACHE:
         return LEMMA_CACHE[w]
     lemma = None
@@ -1310,6 +1357,27 @@ def layer_1_trigger_detection(trigger_word, cysill_pos=None,
     fem_ei = False
     mixed  = False
 
+    # PATCH: "oes" homograph guard. TRIGGERS maps "oes" unconditionally to
+    # the copula sense ("is/are there...?", soft-mutation trigger on the
+    # following predicate), but "oes" is also a genuine feminine noun
+    # meaning "age/era" (e.g. "oes aur" - golden age, "oes Fictoria" -
+    # Victorian era). In that noun sense "oes" isn't a mutation trigger at
+    # all -- treating every occurrence as copula risked wrongly firing on
+    # genitive noun+noun constructions headed by the noun "oes". The token's
+    # own POS tag (not the following word's) distinguishes the two senses:
+    # a noun tag here means this is "age/era", not the copula. This is
+    # separate from the unrelated `oes` COMPLEMENT question of whether
+    # "oes"-as-copula's own following word is itself the subject
+    # (see BOD_SUBJECT_EXEMPT_TRIGGERS).
+    if trigger == "oes":
+        pos = cysill_pos or ""
+        spacy_pos = spacy_token.get("pos") if spacy_token else None
+        is_noun_sense = pos.split("+")[0].startswith("N") or spacy_pos in ("NOUN", "PROPN")
+        if is_noun_sense:
+            return {"trigger_detected": False, "expected_mutation": None,
+                    "trigger_word": trigger, "fem_ei": False,
+                    "mixed": False, "h_mutation": False}
+
     if trigger == "yn":
         pos       = cysill_pos or ""
         spacy_dep = spacy_token.get("dep") if spacy_token else None
@@ -1530,7 +1598,21 @@ def radical_candidates_for_target(target_node, t2, expected):
     add(t2.get("lemma"))
     spacy_tok = target_node.get("spacy_token")
     if spacy_tok:
-        add(spacy_tok.get("lemma"))
+        # PATCH: only trust spaCy's own lemma guess when spaCy actually
+        # tagged this token with a content POS (not PUNCT/SPACE/X/absent).
+        # When spaCy's Welsh model doesn't recognize a word, it frequently
+        # echoes a demutated guess as the lemma anyway instead of signalling
+        # non-recognition -- confirmed live: "dibynol" (a genuine d-initial
+        # radical, mistagged by the surface heuristic as wrong-type erosion)
+        # got a nonsense "ibynol" candidate folded in here, apparently from
+        # spaCy incorrectly demutating a word it doesn't recognize. Gating
+        # on content-POS tagging (same bar used by
+        # pos_tagger_agreement_sufficient elsewhere) keeps genuine spaCy
+        # lemmatizations while dropping guesses made on unrecognized tokens.
+        spacy_pos = spacy_tok.get("pos")
+        spacy_content_tagged = spacy_pos not in (None, "", "PUNCT", "SPACE", "X", "unknown")
+        if spacy_content_tagged:
+            add(spacy_tok.get("lemma"))
     for candidate in reverse_mutation_candidates(t2.get("raw_word"), expected):
         add(candidate)
     add(t2.get("raw_word"))

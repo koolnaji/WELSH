@@ -1,0 +1,10 @@
+pandas>=2.2,<3
+requests>=2.31,<3
+tqdm>=4.66,<5
+yt-dlp>=2025.1.0
+faster-whisper>=1.1,<2
+torch>=2.2,<3
+spacy>=3.8,<4
+simplemma>=1.1,<2
+matplotlib>=3.8,<4
+seaborn>=0.13,<1
