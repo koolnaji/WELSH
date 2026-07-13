@@ -296,14 +296,23 @@ def parse_vtt(vtt_path):
 
 def find_segments_csv(mutations_csv_path):
     """Mirrors manual_editing.py's / scan_dom_verbnoun_impact.py's
-    find_segments_csv -- same layout, same fallback search."""
+    find_segments_csv -- same layout, same fallback search.
+
+    # PATCH: the fast-path candidate here was hardcoded to
+    # TRANS_DIR/<stamp>/<folder_name>/segments_<folder_name>.csv, matching
+    # _video_slug()'s old (buggy) two-level transcript nesting. _video_slug
+    # now puts both transcripts and mutations in the same single
+    # TRANS_DIR/<folder_name>/ and MUT_DIR/<folder_name>/ subfolders, so
+    # mutations_csv_path.parent.name IS folder_name directly -- no separate
+    # "stamp" folder to read off the parent. Updated to match; the rglob
+    # fallback below still covers anything from before this fix.
+    """
     stem = mutations_csv_path.stem
     if not stem.startswith("mutations_"):
         return None
     folder_name = stem[len("mutations_"):]
-    stamp = mutations_csv_path.parent.name
 
-    candidate = TRANS_DIR / stamp / folder_name / f"segments_{folder_name}.csv"
+    candidate = TRANS_DIR / folder_name / f"segments_{folder_name}.csv"
     if candidate.exists():
         return candidate
 

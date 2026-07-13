@@ -362,9 +362,25 @@ def main():
                     all_mutation_rows.extend(muts)
                     vpaths = _video_slug(meta, stamp)
                     h = [True] * 5   # fresh header flags per video (new file each time)
+                    any_written = False
                     for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
                         if data:
                             _append(pd.DataFrame(data), vpaths[key], h, hi)
+                            any_written = True
+                    # PATCH: when every output list is empty (all segments
+                    # got filtered out as hallucinations/non-speech/near-
+                    # duplicates upstream in analyze()), the loop above
+                    # writes nothing at all -- no CSVs, no folder contents --
+                    # but the video still gets marked processed and reports
+                    # "done in Xs" below, identically to a real success. That
+                    # made an empty output folder look exactly like a normal
+                    # run from the log, with no signal pointing at why.
+                    # Surfacing it explicitly here so an empty folder is
+                    # something you were told about, not something you have
+                    # to notice on your own.
+                    if not any_written:
+                        tqdm.write(f"  ⚠️  {p.stem}: 0 segments survived filtering -- "
+                                   f"nothing saved for this video (folder created but empty).")
                     stat = p.stat()
                     local_processed[str(p.resolve())] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
                     save_local_processed(local_processed)
@@ -480,9 +496,19 @@ def main():
                     all_mutation_rows.extend(muts)
                     vpaths = _video_slug(video, stamp)
                     h = [True] * 5   # fresh header flags per video (new file each time)
+                    any_written = False
                     for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
                         if data:
                             _append(pd.DataFrame(data), vpaths[key], h, hi)
+                            any_written = True
+                    # PATCH: see matching comment in the choice "1" (local MP3)
+                    # block above -- when every output list is empty, nothing
+                    # gets written and the run still reports "done" below with
+                    # no indication the folder is empty.
+                    if not any_written:
+                        tqdm.write(f"  ⚠️  {video.get('title', video['id'])}: 0 segments "
+                                   f"survived filtering -- nothing saved for this video "
+                                   f"(folder created but empty).")
 
                     # PATCH: corroborate immediately, same run -- mutations
                     # + segments for this video were just written above, so

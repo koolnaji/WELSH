@@ -236,6 +236,29 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
                 parts.append(section("By channel register", "".join(
                     row(reg.capitalize(), n) for reg, n in
                     sorted(reg_counts.items(), key=lambda kv: -kv[1]))))
+
+            # PATCH: tagger_agreement + detection rule breakdowns -- without
+            # these, "erosion (all)" is a single trust-everything number.
+            # tagger_agreement tells you how much of it is backed by actual
+            # multi-tagger confirmation (full_agreement) vs a single
+            # heuristic firing alone (heuristic_only) -- the same
+            # distinction manual_editing.py and corpus_stats.py already
+            # surface, just not previously in the email. `rule` breaks
+            # down WHICH detection layer is producing the volume (plain
+            # word_trigger vs spacy_obj_soft vs phantom_check etc.), so a
+            # spike from one rule (e.g. the mae/gan false-trigger pattern)
+            # is visible at a glance instead of buried in the aggregate.
+            if "tagger_agreement" in df.columns:
+                agreement_counts = df["tagger_agreement"].value_counts().to_dict()
+                parts.append(section("By tagger agreement", "".join(
+                    row(agreement.replace("_", " ").capitalize(), n) for agreement, n in
+                    sorted(agreement_counts.items(), key=lambda kv: -kv[1]))))
+
+            if "rule" in df.columns:
+                rule_counts = df["rule"].value_counts().to_dict()
+                parts.append(section("By detection rule", "".join(
+                    row(rule, n) for rule, n in
+                    sorted(rule_counts.items(), key=lambda kv: -kv[1]))))
     else:
         parts.append('<div style="margin-top:10px;color:#777;font-size:13px;">'
                       'No mutation data collected this run.</div>')

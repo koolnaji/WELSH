@@ -538,6 +538,19 @@ def _video_slug(meta, stamp):
     so corpus_analyzer.py's existing filename-based batch parsing keeps
     working unchanged even though the files now live one level deeper.
     Falls back to the video id, then the run stamp if neither is available.
+
+    # PATCH: this previously nested transcripts an extra level deep
+    # (TRANS_DIR / stamp / folder_name, i.e. two levels) while mutations
+    # got NO per-video subfolder at all (MUT_DIR / stamp, shared flat
+    # across every video processed in that run, distinguished only by
+    # filename) -- neither matched this docstring's own stated layout, and
+    # the two output types ended up in structurally different places for
+    # the same video. corpus_analyzer.py's MUT_DIR.rglob("mutations_*.csv")
+    # still found the files regardless of depth, so aggregation kept
+    # working -- but a video's own mutations file was never actually
+    # sitting alongside its own transcript files the way the docstring
+    # (and anyone browsing the folders by hand) would expect. Fixed so
+    # both use the single per-video folder_name subfolder described above.
     """
     import re
     title = meta.get("title") or meta.get("id") or stamp
@@ -547,16 +560,17 @@ def _video_slug(meta, stamp):
     slug = slug or "untitled"
 
     folder_name = f"{stamp}_{slug}"
-    video_trans_dir = TRANS_DIR / stamp / folder_name
+    video_trans_dir = TRANS_DIR / folder_name
+    video_mut_dir   = MUT_DIR / folder_name
     video_trans_dir.mkdir(parents=True, exist_ok=True)
-    (MUT_DIR / stamp).mkdir(parents=True, exist_ok=True)
+    video_mut_dir.mkdir(parents=True, exist_ok=True)
 
     return {
         "segments": video_trans_dir / f"segments_{stamp}_{slug}.csv",
         "words":    video_trans_dir / f"words_{stamp}_{slug}.csv",
         "lemmas":   video_trans_dir / f"lemmas_{stamp}_{slug}.csv",
         "pos":      video_trans_dir / f"pos_{stamp}_{slug}.csv",
-        "mutations":MUT_DIR / stamp / f"mutations_{stamp}_{slug}.csv",
+        "mutations":video_mut_dir   / f"mutations_{stamp}_{slug}.csv",
     }
 
 def normalize_word(word):
