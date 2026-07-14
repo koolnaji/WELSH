@@ -22,7 +22,7 @@ import torch
 import yt_dlp
 from tqdm import tqdm
 from faster_whisper import WhisperModel
-import mutation_engine
+import spacy_tagging
 
 from mutation_engine import (
     BASE_DIR, LOCAL_MP3_DIR,
@@ -440,11 +440,17 @@ def main():
             retry_queue       = []
             failed_state      = load_failed()
             videos_attempted = len(videos_to_process)
-            # PATCH: caption corroboration is now a standard part of every
-            # queue-processed video rather than a separate manual menu step
-            # (former option 8) -- loaded once here (session-cached, same
-            # instance the rest of the pipeline uses) rather than per video.
-            nlp = mutation_engine.SPACY_NLP if load_spacy() else None
+            # PATCH: was `mutation_engine.SPACY_NLP`, which no longer exists
+            # -- SPACY_NLP moved to spacy_tagging.py when mutation_engine.py
+            # got split up (AttributeError at runtime, since nothing ever
+            # re-exported the raw variable, only the load_spacy()/
+            # parse_spacy_doc() functions). Reading spacy_tagging.SPACY_NLP
+            # directly here -- not via `from spacy_tagging import SPACY_NLP`
+            # -- is required: that form would copy the value (None) at
+            # import time, before load_spacy() ever runs, and never update.
+            # Reading the module attribute after calling load_spacy() below
+            # gets the live value.
+            nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
             keys = ["segments", "words", "lemmas", "pos", "mutations"]
             for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                 try:
