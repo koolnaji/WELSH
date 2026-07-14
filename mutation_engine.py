@@ -12,33 +12,22 @@ pipeline. Everything here is "the linguistics", independent of how audio
 gets fed into it or how a human drives the CLI.
 """
 
-import sys
-import io
 import os
 import unicodedata
-import random
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import json
-import time
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
 import re
-import pandas as pd
-import yt_dlp
-import requests
-import torch
 from tqdm import tqdm
-from faster_whisper import WhisperModel
 
-try:
-    import spacy
-    SPACY_AVAILABLE = True
-except ImportError:
-    SPACY_AVAILABLE = False
-    print("⚠️  spaCy not installed -- dependency parser disabled.")
+# spaCy loading/parsing now lives in spacy_tagging.py (see that file for
+# SPACY_NLP/SPACY_AVAILABLE/load_spacy/parse_spacy_doc). load_spacy is
+# re-exported here for welsh_pipeline.py, which imports it from this module.
+from spacy_tagging import load_spacy, parse_spacy_doc
+
 
 try:
     from simplemma import lemmatize as simplemma_lemmatize
@@ -82,33 +71,16 @@ FAILED_MAX_RETRIES    = 3
 # PATCH: persistent lemma cache path
 LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
 
-TECHIAITH_API_KEY         = os.getenv("WELSH_LEMMATIZER", "").strip()
-WELSH_LEMMATIZER_ENDPOINT = "https://api.techiaith.cymru/cysill/v1/lemmatizer/v1"
-WELSH_POS_ENDPOINT        = "https://api.techiaith.cymru/cysill/v1/pos/v1"
+# PATCH: explicit imports instead of `import *` -- a star import makes
+# every name "maybe defined" to any linter/IDE, which is what generated
+# the wall of false-positive "possibly undefined" warnings after the
+# module split. Spelling out exactly what's used here fixes that.
+from cysill_client import (
+    TECHIAITH_API_KEY,
+    reset_cysill_circuit_breaker,   # re-exported for welsh_pipeline.py
+    fetch_lemma, fetch_pos_for_chunk, chunk_words_for_pos,
+)
 
-http_session = requests.Session()
-
-# PATCH: circuit breaker state for Cysill API
-_cysill_consecutive_failures = 0
-_CYSILL_FAILURE_THRESHOLD    = 5
-_cysill_disabled_for_run     = False
-
-
-def reset_cysill_circuit_breaker():
-    """
-    Reset the Cysill circuit breaker for a fresh run.
-
-    The three circuit-breaker globals are module-level, so they persist for
-    the lifetime of the Python process.  If the API failed during a previous
-    interactive choice (e.g. choice 1 → local MP3s) and the user then picks
-    choice 3 (queue processing) in the same session, the breaker would remain
-    open and silently disable Cysill for the second run.  Call this at the
-    start of each top-level processing branch in main() to give each run a
-    clean slate.
-    """
-    global _cysill_consecutive_failures, _cysill_disabled_for_run
-    _cysill_consecutive_failures = 0
-    _cysill_disabled_for_run     = False
 
 # PATCH: CURATED_CHANNELS entries now carry a "channel_register" tag
 # alongside the URL. It flows through discover_new_videos -> video queue
@@ -142,364 +114,29 @@ CURATED_CHANNELS = [
      "channel_register": "unverified"},  # BBC Cymru Wales -- bilingual, spot-check before use
 ]
 
-# ========================= SPACY =========================
-SPACY_NLP = None
-
-def load_spacy():
-    global SPACY_NLP
-    if not SPACY_AVAILABLE:
-        return False
-    if SPACY_NLP is not None:
-        return True
-    try:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            SPACY_NLP = spacy.load("cy_ud_cy_ccg")
-        print("✅ Welsh dependency parser loaded.")
-        return True
-    except Exception as e:
-        print(f"⚠️  Could not load Welsh dependency parser: {e}")
-        return False
-
-def parse_spacy_doc(text):
-    if SPACY_NLP is None:
-        return None
-    try:
-        doc = SPACY_NLP(text)
-        tokens = []
-        for t in doc:
-            morph = dict(t.morph.to_dict()) if t.morph else {}
-            head_morph = dict(t.head.morph.to_dict()) if t.head.morph else {}
-            tokens.append({
-                "text":     t.text,
-                "lemma":    t.lemma_,
-                "dep":      t.dep_,
-                "head":     t.head.text,
-                "head_dep": t.head.dep_,
-                "head_pos": t.head.pos_,
-                # PATCH: needed to distinguish a finite verb from a verb-noun
-                # governing this token -- POS alone (VERB/NOUN) is NOT
-                # reliable for this in cy_ud_cy_ccg: verb-nouns can surface
-                # as either POS tag, distinguished only by this feature.
-                # Per UD_Welsh-CCG docs, VerbForm takes Fin/FinRel/Vnoun and
-                # occurs on NOUN, VERB, and AUX tokens alike.
-                "head_verbform": head_morph.get("VerbForm"),
-                "pos":      t.pos_,
-                "morph":    morph,
-                "mutation": morph.get("Mutation"),
-                "gender":   morph.get("Gender"),
-                "is_punct": t.is_punct or t.is_space or t.pos_ in ("PUNCT", "SPACE"),
-            })
-        return tokens
-    except Exception as e:
-        tqdm.write(f" ⚠️ spaCy parse error: {e}")
-        return None
-
 # ========================= MUTATION TABLES =========================
-SOFT_MUTATION = {
-    "p": "b", "t": "d", "c": "g", "b": "f", "d": "dd", "g": "",
-    "ll": "l", "rh": "r", "m": "f"
-}
-SOFT_MUTATION_LIMITED = {k: v for k, v in SOFT_MUTATION.items()
-                         if k not in ("ll", "rh")}
-NASAL_MUTATION    = {"p": "mh", "t": "nh", "c": "ngh", "b": "m", "d": "n", "g": "ng"}
-ASPIRATE_MUTATION = {"p": "ph", "t": "th", "c": "ch"}
-COLLOQUIAL_AFFRICATE_MUTATION = {"ts": "j"}
-
-RADICAL_TO_MUTATED = {
-    "soft": SOFT_MUTATION, "soft_limited": SOFT_MUTATION_LIMITED,
-    "nasal": NASAL_MUTATION, "aspirate": ASPIRATE_MUTATION,
-    "colloquial_affricate": COLLOQUIAL_AFFRICATE_MUTATION,
-}
-
-MUTATION_MAP = {}
-for mtype, mapping in RADICAL_TO_MUTATED.items():
-    for radical, mutated in mapping.items():
-        if mutated and mutated not in MUTATION_MAP:
-            MUTATION_MAP[mutated] = mtype
-MUTATION_MAP[""] = "soft"
-
-MUTATION_TAG_MAP  = {"TM": "soft", "TT": "nasal", "TL": "aspirate", "TH": "h-mutation"}
-SPACY_MUTATION_MAP= {"SM": "soft", "NM": "nasal", "AM": "aspirate"}
-
-SELECTIVE_INVARIANT_MAP = {
-    "nasal":        {"m", "n", "ll", "rh", "f", "s", "ch", "h", "j"},
-    "aspirate":     {"m", "n", "ll", "rh", "b", "d", "g", "f", "s", "h", "j"},
-    "soft":         {"n", "f", "s", "ch", "h", "j"},
-    "soft_limited": {"n", "f", "s", "ch", "h", "j"},
-}
-ASPIRATE_INITIALS = set(ASPIRATE_MUTATION.keys())
-
-# ========================= TRIGGER TABLE =========================
-TRIGGERS = {
-    "am": "soft", "ar": "soft", "at": "soft", "dan": "soft",
-    "dros": "soft", "drwy": "soft", "heb": "soft", "wrth": "soft",
-    "gan": "soft", "i": "soft", "o": "soft", "hyd": "soft",
-    "tua": "aspirate", "thua": "aspirate",
-    "neu": "soft", "pan": "soft", "ail": "soft",
-    "ni": "soft|aspirate", "nid": "soft|aspirate",
-    "na": "soft|aspirate", "oni": "soft|aspirate",
-    "beth": "soft", "pa": "soft", "pwy": "soft", "sut": "soft",
-    "rhy": "soft", "lled": "soft", "pur": "soft_limited",
-    "reit": "soft", "hollol": "soft", "gweddol": "soft",
-    "go": "soft", "llwyr": "soft",
-    # PATCH: pre-posed adjectives -- when these precede their noun (instead
-    # of the usual noun+adjective order), the noun takes soft mutation
-    # regardless of gender/number, e.g. "hen ddyn", "rhyw brynhawn",
-    # "ychydig fisoedd", "amryw bethau", "prif fachgen".
-    "hen": "soft", "rhyw": "soft", "ychydig": "soft",
-    "amryw": "soft", "prif": "soft",
-    "mor": "soft_limited", "cyn": "soft_limited",
-    "mae": "soft", "ydy": "soft", "oes": "soft",
-    "sy": "soft", "sydd": "soft",
-    "dyma": "soft", "dyna": "soft", "yna": "soft",
-    "mai": "soft", "taw": "soft", "pe": "soft",
-    "fy": "nasal", "dy": "soft",
-    "ei": "soft|aspirate",
-    "ein": "h-mutation", "eu": "h-mutation", "u": "h-mutation",
-    "tri": "aspirate", "chwe": "aspirate",
-    "a": "soft|aspirate", "â": "aspirate",
-    "gyda": "aspirate", "tra": "aspirate",
-    "yn": "nasal|soft_limited", "ym": "nasal", "yng": "nasal",
-    "yr": "soft_limited",
-    "fe": "soft", "mi": "soft",
-    "dau": "soft", "dwy": "soft",
-}
-
-DEFINITE_ARTICLE_FORMS             = {"y", "yr", "r"}
-# PATCH: per Wiktionary's Welsh mutations appendix, ll and rh do NOT undergo
-# soft mutation after these triggers, even though other soft-mutable
-# consonants do. A pipeline that doesn't know this will see the correct,
-# un-mutated "llyfr"/"rhyd" after one of these triggers and wrongly flag it
-# as erosion, inflating the erosion rate. yn/cyn/mor/pur are exempt for any
-# POS; yr/y/r/un are exempt specifically for nouns (adjectives still mutate,
-# e.g. "y lonnaf", "un ryfedd" -- Wiktionary's own examples show ll/rh DO
-# mutate after these when the target is an adjective, only nouns are
-# exempt). "un llaw" (one hand) is Wiktionary's explicit un+noun example --
-# "un" was missing from this set entirely, so a genuine "un llaw"/"un rhyd"
-# would have wrongly expected mutation and flagged the correct radical as
-# erosion.
-LL_RH_SOFT_EXEMPT_TRIGGERS_ANY_POS = {"yn", "cyn", "mor", "pur"}
-LL_RH_SOFT_EXEMPT_TRIGGERS_NOUN_ONLY = {"y", "yr", "r", "un"}
-
-# PATCH: per Wiktionary's Welsh mutations appendix, bare present-tense
-# bod-forms do NOT trigger mutation on the word immediately following them
-# in the general case -- that word is normally the SUBJECT ("Mae ci yn
-# cysgu" -- "ci" stays radical, correctly). Bod-forms only trigger soft
-# mutation via two much narrower environments: the predicate particle "yn"
-# (already handled on its own via the "yn" branch in
-# layer_1_trigger_detection) and a fronted predicate before a b-initial
-# bod-form (rare, not modelled here). "sy"/"sydd" are NOT in this set --
-# the relative sy(dd) genuinely does trigger soft mutation of a directly
-# following predicate, that's a different, legitimate rule.
-BOD_SUBJECT_EXEMPT_TRIGGERS = {"mae", "ydy", "oes"}
-NUMERAL_FEM_SOFT_LIMITED_TRIGGERS  = {"un"}
-NUMERAL_GENERAL_SOFT_TRIGGERS      = {"dau", "dwy"}
-NASAL_NUMERAL_TRIGGERS             = {
-    "pump", "saith", "wyth", "naw", "deng",
-    "12", "15", "18", "20", "100",
-    "deuddeg", "pymtheg", "deunaw", "ugain", "cant",
-}
-NASAL_NUMERAL_VALID_TARGETS        = {"blynedd", "blwydd", "diwrnod"}
-MIXED_MUTATION_TRIGGERS            = {"ni", "nid", "na", "oni"}
-# PATCH (Bucket 2): preposed adjectives -- when one of these precedes its
-# noun (the inverse of normal Welsh noun-adjective order), the noun takes
-# soft mutation. Kept as a closed lexicon (not just any ADJ) because the
-# dependency check alone can't rule out other ADJ positions reliably, and
-# because some of these words are polysemous (e.g. "rhyw" can be a noun
-# meaning "sex/gender"); detection still requires the spaCy dependency
-# check below to confirm the adjective genuinely modifies the following
-# noun, not just lexical co-occurrence. "cyntaf" and other preposed
-# superlatives are deliberately excluded -- Wiktionary notes they do not
-# (reliably) trigger mutation. "prif" is excluded too: it has its own
-# extra mutation-of-the-adjective-itself rule after a feminine article
-# noun (e.g. "y brif fynedfa") that this simple noun-only layer can't
-# represent correctly.
-PREPOSED_ADJECTIVE_LEXICON         = {"hen", "rhyw", "ychydig", "amryw", 
-                                      "unig", "annwyl", "gau", "unrhyw", "holl", "ambell", "aml",
-                                      }
-# PATCH (Bucket 3b): known Welsh compound nouns whose second element takes
-# soft mutation when fused (e.g. "creigardd" = craig + (g)ardd). When
-# spoken/transcribed correctly the word surfaces as ONE fused token, so
-# there's nothing to flag -- correct usage is invisible to a token-pair
-# detector by design, which is fine (no false erosion). The only erosion
-# signature this layer can catch is the compound "coming apart" back into
-# two separate radical-form words (e.g. "craig gardd" instead of
-# "creigardd"). This is a small seed list, not exhaustive -- expand as
-# more compounds turn up in the corpus.
-COMPOUND_NOUN_SECOND_ELEMENT       = {
-    "craig": "gardd",     # creigardd "rock garden"
-    "haf":   "dydd",      # hafddydd "summer's day"
-    "bar":   "morwyn",    # barforwyn "barmaid"
-    "hwyl":  "pren",      # hwylbren "mast"
-    "rhwyd": "gwaith",    # rhwydwaith "network"
-    "modur": "tŷ",        # modurdy "garage"
-}
-OBJ_DEPS                           = {"obj", "iobj"}
-VOCAT_DEPS                         = {"vocative"}
-
-PHANTOM_CONTEXT_TAGS = {
-    "NF": "soft", "NM": "soft", "VBF": "soft", "VB": "soft",
-    "VB+NM": "soft", "NM+VBF": "soft", "PLACE": "soft", "PERSON": "soft",
-}
-GENDER_BEARING_PREFIXES  = ("N", "PRON", "CARD", "ORD")
-KNOWN_HOMOGRAPH_COLLISIONS = {
-    "chi": "Pronoun 'chi' (you) collides with aspirate-mutated 'ci' (dog -> chi).",
-}
-PREP_TAG_PREFIXES = ("PREP", "CPREP")
-PREDYN_TAGS       = {"PREDYN", "VERBADJ", "PREDYN+VERBADJ"}
-REL_INT_TAGS      = {"PRONREL", "PART", "EXCL"}
-
-DIGRAPHS      = ["ngh", "mh", "nh", "dd", "ff", "ll", "ph", "rh", "th",
-                 "ch", "ng", "ts", "j"]
-WELSH_FILLERS = {"ym", "er", "ah", "iawn", "gwybod", "chdi", "te", "ffeil"}
-WELSH_VOWELS  = {"a", "e", "i", "o", "u", "w", "y", "â", "ê", "î", "ô", "û", "ŵ", "ŷ"}
-
-# High-confidence English function words and common spoken insertions.
-# These are checked before Welsh lemmatisation/tagger evidence because Cysill
-# can occasionally Welshify English tokens (e.g. "the" -> "te", "for" -> "mor").
-ENGLISH_FUNCTION_WORDS = frozenset({
-    "the", "an", "and", "or", "but", "of", "to", "for", "with", "that",
-    "this", "these", "those", "is", "are", "was", "were", "be", "been",
-    "being", "it", "its", "as", "at", "from", "by", "if", "then", "than",
-    "not", "yes", "you", "your", "they", "he", "she", "them", "his", "her",
-    "their", "my", "got", "get", "just", "what", "who", "when", "where",
-    "why", "how", "can", "could", "would", "should", "will", "do", "does",
-    "did", "have", "has", "had", "because", "about", "into", "over",
-    "after", "before", "there", "here", "thing", "things", "people",
-    "that's", "it's", "we're", "you're", "they're", "i'm", "don't",
-    "doesn't", "didn't", "can't", "couldn't", "wouldn't", "shouldn't",
-    "won't",
-})
-WELSH_ENGLISH_HOMOGRAPHS = frozenset({
-    "a", "am", "i", "in", "mi", "no", "un",
-})
-
-# ========================= BOD SUPPRESSION =========================
-# All surface realisations of 'bod' (to be) suppressed as *mutation targets*.
-# These are either suppletive (mae, yw, oedd -- no morphophonological link to
-# a predictable radical) or genuinely mutated but in a verbal context that
-# is not triggered by the preceding trigger word's mutation slot (fydd→fod,
-# fu→bu). Analysing them as targets produces systematic false erosion counts.
-#
-# They are NOT suppressed as triggers -- mae/ydy/oes/dyma/dyna/sy/sydd
-# remain in TRIGGERS and correctly predict soft mutation on the following
-# noun/adjective. (Per Wiktionary's Welsh mutations appendix: "The verb
-# form sydd, sy triggers soft mutation of a predicate noun or adjective" --
-# sy/sydd were previously missing from TRIGGERS despite sitting right here
-# in this set, silently undercounting every genuine sydd/sy-triggered
-# context in the corpus.)
-BOD_SURFACE_FORMS = frozenset({
-    # Present tense
-    "mae", "maen", "maent",
-    "yw", "ydy", "ydyw",
-    "oes",
-    "sy", "sydd",
-    # 1st/2nd/3rd person present
-    "wyf", "wyt", "ydych", "ydym", "ydyn",
-    # Imperfect / past
-    "oedd", "oedden", "oeddech", "oeddet", "oeddwn", "oeddem",
-    "roedd", "roedden", "roeddech", "roeddet", "roeddwn", "roeddem",
-    # Preterite
-    "bu", "buodd", "buon", "buoch", "buost", "bues", "buom",
-    "fu", "fuodd", "fuon", "fuoch", "fuost", "fues", "fuom",
-    # Future / conditional
-    "bydd", "byddan", "byddwch", "byddi", "byddwn", "byddem", "byddent",
-    "fydd", "fyddan", "fyddwch", "fyddi", "fyddwn", "fyddem", "fyddent",
-    "byddai", "fyddai",
-    # Subjunctive / literary conditional / pluperfect
-    "byddaf", "byddo", "byddech",
-    "bo", "boed", "foed",
-    "buasai", "buasem", "buasent", "buaset", "buasech", "buaswn",
-    "fuasai", "fuasem", "fuasent", "fuaset", "fuasech", "fuaswn",
-    # Verbal noun (radical + soft-mutated form)
-    "bod", "fod",
-    # Colloquial / contracted forms
-    "dw", "dwi",          # dw i (present 1sg)
-    "on", "oni",          # o'n i (imperfect) -- 'oni' also a trigger but rare as target
-    "dan", "dyn",         # dan ni / dyn ni
-    "sa", "san", "set",   # sa i / conditional colloquial
-    "se", "sen",          # southern conditional
-})
-
-# ========================= WELSH ORTHOGRAPHIC VALIDATION =========================
-# Welsh uses exactly one productive diacritic: the circumflex (to bach) on the
-# seven vowels â ê î ô û ŵ ŷ. Acute accents appear in a small number of
-# loanwords (café, acíwt) and grave accents in a handful of poetry conventions.
-# All other combining marks -- umlaut/diaeresis (ö ü), tilde (õ ã), breve,
-# caron, cedilla, ring, ogonek -- are completely absent from native Welsh.
-#
-# When Whisper is forced into cy mode on low-energy or non-Welsh audio it
-# hallucinates tokens containing these foreign diacritics (e.g. töii, tõii).
-# This table lets us reject those tokens orthographically rather than relying
-# on confidence scores, which are unreliable for hallucinated tokens.
-
-WELSH_LEGAL_DIACRITIC_CHARS = frozenset(
-    "âêîôûŵŷ"   # circumflex (to bach) -- canonical Welsh diacritic
-    "áéíóú"     # acute -- attested in loanwords, tolerated
-    "àèìòù"     # grave -- rare but attested in poetry / some loanword spellings
+# All pure linguistic data now lives in mutation_tables.py -- see that
+# file for every trigger list, mutation dict, and lexicon. Explicit
+# imports here (not `import *`) so linters/IDEs can actually verify
+# every name instead of flagging all of them as "maybe undefined".
+from mutation_tables import (
+    SOFT_MUTATION, SOFT_MUTATION_LIMITED, NASAL_MUTATION, ASPIRATE_MUTATION,
+    RADICAL_TO_MUTATED, MUTATION_MAP, SPACY_MUTATION_MAP,
+    SELECTIVE_INVARIANT_MAP, ASPIRATE_INITIALS,
+    TRIGGERS, DEFINITE_ARTICLE_FORMS,
+    LL_RH_SOFT_EXEMPT_TRIGGERS_ANY_POS, LL_RH_SOFT_EXEMPT_TRIGGERS_NOUN_ONLY,
+    BOD_SUBJECT_EXEMPT_TRIGGERS, NUMERAL_FEM_SOFT_LIMITED_TRIGGERS,
+    NUMERAL_GENERAL_SOFT_TRIGGERS, NASAL_NUMERAL_TRIGGERS,
+    NASAL_NUMERAL_VALID_TARGETS, MIXED_MUTATION_TRIGGERS,
+    PREPOSED_ADJECTIVE_LEXICON, COMPOUND_NOUN_SECOND_ELEMENT,
+    OBJ_DEPS, PHANTOM_CONTEXT_TAGS, KNOWN_HOMOGRAPH_COLLISIONS,
+    PREP_TAG_PREFIXES, PREDYN_TAGS, REL_INT_TAGS,
+    DIGRAPHS, WELSH_FILLERS, WELSH_VOWELS,
+    ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
+    WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
+    _COMBINING_LEGAL,
 )
 
-# The combining marks that correspond to the legal diacritics above.
-# Any other combining mark signals a non-Welsh character.
-_COMBINING_LEGAL = frozenset({
-    "\u0302",   # combining circumflex  (â ê î ô û ŵ ŷ)
-    "\u0301",   # combining acute       (á é í ó ú)
-    "\u0300",   # combining grave       (à è ì ò ù)
-})
-
-
-def _is_plausible_welsh_token(word: str) -> bool:
-    """
-    Returns False if the token contains any diacritic combining mark that
-    cannot appear in genuine Welsh orthography.
-
-    Strategy: NFD-decompose each character. If it carries a combining mark
-    that is not circumflex (U+0302), acute (U+0301), or grave (U+0300), the
-    token is orthographically impossible in Welsh -- umlaut, tilde, breve,
-    caron, cedilla, ring, ogonek, etc. all fail.
-
-    Catches hallucinations such as:
-        töii   (umlaut-o,   U+0308 combining diaeresis)
-        tõii   (tilde-o,    U+0303 combining tilde)
-        děkuji (caron-e,    U+030C combining caron)
-        ţară   (cedilla-t,  U+0326 combining cedilla below)
-
-    Does NOT reject:
-        tŷ     (circumflex-y -- legal Welsh)
-        llên   (circumflex-e -- legal Welsh)
-        café   (acute-e     -- tolerated loanword)
-    """
-    for ch in unicodedata.normalize("NFC", word.lower()):
-        nfd = unicodedata.normalize("NFD", ch)
-        if len(nfd) == 1:
-            continue  # plain character, no combining marks
-        for mark in nfd[1:]:
-            if mark not in _COMBINING_LEGAL:
-                return False
-    return True
-
-LEMMA_CACHE = {}
-COLLOQUIAL_REGISTER           = True
-DECLINING_MUTATIONS           = {"nasal", "aspirate"}
-POS_CHUNK_MAX_CHARS           = 2700
-EROSION_CONFIDENCE_THRESHOLD  = 0.60
-HALLUCINATION_REPEAT_RATIO    = 0.4
-GAP_ALIGN_WINDOW              = 5    # lookahead window for gap-tolerant alignment
-
-# Welsh contractions that Whisper may keep joined but Cysill/spaCy will split.
-# Format: surface_form -> [sub_token_1, sub_token_2, ...]
-# Only the first sub-token inherits the original word's timestamp/confidence.
-WELSH_CONTRACTION_SPLITS = {
-    "i'r":  ["i", "'r"],
-    "a'r":  ["a", "'r"],
-    "o'r":  ["o", "'r"],
-    "yn y": ["yn", "y"],
-    "i'w":  ["i", "'w"],
-    "a'i":  ["a", "'i"],
-    "o'i":  ["o", "'i"],
-}
 
 
 # ========================= HELPERS =========================
@@ -608,10 +245,19 @@ def is_english_code_switch(word, techiaith_lemma):
             pass
     return False
 
+# ========================= TUNING CONSTANTS =========================
+# Not linguistic data (that's mutation_tables.py) -- these are pipeline
+# behaviour knobs: cache state, confidence thresholds, filter sensitivity.
+LEMMA_CACHE = {}
+COLLOQUIAL_REGISTER           = True
+DECLINING_MUTATIONS           = {"nasal", "aspirate"}
+EROSION_CONFIDENCE_THRESHOLD  = 0.60
+HALLUCINATION_REPEAT_RATIO    = 0.4
+GAP_ALIGN_WINDOW              = 5    # lookahead window for gap-tolerant alignment
+
 # ========================= LEMMA CACHE PERSISTENCE =========================
 def load_lemma_cache():
     """Load persisted lemma cache from disk to avoid redundant API calls across runs."""
-    global LEMMA_CACHE
     if LEMMA_CACHE_PATH.exists():
         try:
             LEMMA_CACHE.update(
@@ -631,29 +277,8 @@ def save_lemma_cache():
     except Exception as e:
         print(f"⚠️  Could not save lemma cache: {e}")
 
-# PATCH: known suppletive Welsh comparative/superlative adjectives. Welsh
-# lemmatizers (Cysill and simplemma) collapse comparative/superlative forms
-# to their citation (positive-grade) lemma for dictionary purposes -- e.g.
-# "llai" (smaller) lemmatizes to "bach" (small), "gwell" (better) to "da"
-# (good). That's correct lexicographically, but this pipeline uses
-# get_welsh_lemma()'s result as a RADICAL for mutation purposes
-# (initial_cluster(lemma), expected_surface_forms(lemma, ...)), and each
-# comparative/superlative degree is its own suppletive radical with its own
-# mutation behaviour -- "llai" itself is ll-initial and exempt from soft
-# mutation after "yn", but the positive-grade lemma "bach" is b-initial and
-# expects soft mutation. Using the positive-grade lemma here silently
-# misclassified every comparative/superlative occurrence of these suppletive
-# lexemes (confirmed live in the corpus: "yn llai" was being evaluated as if
-# it were "bach"). Fixed by special-casing these forms to return their own
-# surface degree as the "lemma"/radical, before the normal lookup path runs.
-SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS = {
-    "gwell", "gorau",       # da (good) -> better, best
-    "gwaeth", "gwaethaf",   # drwg (bad) -> worse, worst
-    "mwy", "mwyaf",         # mawr (big) -> bigger, biggest
-    "llai", "lleiaf",       # bach (small) -> smaller, smallest
-    "nes", "nesaf",         # agos (near) -> nearer, nearest
-}
-
+# SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS now lives in
+# mutation_tables.py (imported via `from mutation_tables import *` above).
 def _resolve_suppletive_comparative_radical(raw):
     """
     Returns the correct comparative/superlative radical when `raw` is one of
@@ -693,19 +318,6 @@ def get_welsh_lemma(word):
             lemma = None
     LEMMA_CACHE[w] = lemma
     return lemma
-
-def extract_gender_from_pos(pos_tag):
-    if not pos_tag:
-        return None
-    first = pos_tag.split("+")[0]
-    for prefix in GENDER_BEARING_PREFIXES:
-        if first.startswith(prefix):
-            suffix = first[len(prefix):]
-            if suffix == "F":
-                return "feminine"
-            elif suffix == "M":
-                return "masculine"
-    return None
 
 def extract_gender_from_spacy(spacy_token):
     if not spacy_token:
@@ -1079,169 +691,10 @@ def align_with_gap_tolerance(tagger_tokens, whisper_words, window=GAP_ALIGN_WIND
     return result
 
 
-# ========================= CYSILL API (with session resilience) =========================
-def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
-    """
-    HTTP GET with retry + session reconnection + circuit breaker.
-
-    PATCH additions over original:
-    - HTTP 429 (rate-limit) handling: respects Retry-After header
-    - raise_for_status() surfaces 5xx errors as exceptions so the retry
-      loop catches them instead of silently returning bad data
-    - Jitter on backoff delay to avoid thundering-herd on long queues
-    - Circuit breaker: if _CYSILL_FAILURE_THRESHOLD consecutive chunks
-      fail the API is disabled for the rest of the run
-    """
-    global http_session, _cysill_consecutive_failures, _cysill_disabled_for_run
-
-    if _cysill_disabled_for_run:
-        return None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = http_session.get(endpoint, params=params, timeout=15)
-
-            # PATCH: explicit 429 handling
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After",
-                                                   base_delay * attempt * 2))
-                tqdm.write(f" ⚠️ Cysill rate-limited (429) -- waiting {retry_after}s "
-                      f"(attempt {attempt}/{max_retries})")
-                time.sleep(retry_after)
-                continue
-
-            # PATCH: surface 5xx errors so the except block catches them
-            resp.raise_for_status()
-
-            # Success -- reset failure counter
-            _cysill_consecutive_failures = 0
-            return resp
-
-        except requests.exceptions.ConnectionError:
-            tqdm.write(f" ⚠️ Connection lost -- resetting session (attempt {attempt}/{max_retries})")
-            http_session = requests.Session()
-            # PATCH: jitter prevents all retries firing at the same moment
-            time.sleep(base_delay * attempt + random.uniform(0, 0.5))
-        except Exception as e:
-            tqdm.write(f" ⚠️ Request error (attempt {attempt}/{max_retries}): {e}")
-            time.sleep(base_delay * attempt + random.uniform(0, 0.5))
-
-    # All retries exhausted
-    _cysill_consecutive_failures += 1
-    if _cysill_consecutive_failures >= _CYSILL_FAILURE_THRESHOLD:
-        _cysill_disabled_for_run = True
-        tqdm.write(f" 🔴 Cysill API disabled for this run after "
-              f"{_cysill_consecutive_failures} consecutive failures. "
-              f"Pipeline will continue with spaCy + heuristics only.")
-    return None
-
-def parse_pos_result_extended(result):
-    """
-    Parse raw Cysill POS result string.
-    Strips punct/EOS/space tokens BEFORE returning so the token list
-    is content-only and matches Whisper's content-only word stream.
-    """
-    if not result:
-        return []
-    SKIP_POS = {"punct", "PUNCT", "EOS", "space"}
-    out = []
-    for item in str(result).split():
-        parts = item.split("/")
-        if len(parts) < 2:
-            continue
-        token, pos_tag = parts[0], parts[1]
-        if pos_tag in SKIP_POS:
-            continue
-        mutation_raw = parts[2] if len(parts) >= 3 else None
-        mutation_tag = None if mutation_raw in (None, "-") else mutation_raw
-        out.append({
-            "token":                token,
-            "text":                 token,   # unified key for _tokens_match_fuzzy
-            "pos":                  pos_tag,
-            "mutation_tag":         mutation_tag,
-            "tagger_mutation_type": MUTATION_TAG_MAP.get(mutation_tag),
-            "gender":               extract_gender_from_pos(pos_tag),
-            "is_punct":             False,   # already stripped above
-        })
-    return out
-
-def fetch_pos_for_chunk(chunk_text, max_retries=3, base_delay=1.5):
-    if not TECHIAITH_API_KEY:
-        return None
-    resp = _cysill_get(WELSH_POS_ENDPOINT,
-                       {"text": chunk_text, "api_key": TECHIAITH_API_KEY},
-                       max_retries=max_retries, base_delay=base_delay)
-    if resp is None:
-        tqdm.write(" 💥 POS API permanently failed for this chunk.")
-        return None
-    try:
-        data = resp.json()
-        if isinstance(data, dict) and data.get("success") is True:
-            return parse_pos_result_extended(data.get("result"))
-        tqdm.write(f" ⚠️ POS API success=False: {data}")
-    except Exception as e:
-        tqdm.write(f" ⚠️ POS API parse error: {e}")
-    return None
-
-def fetch_lemma(word, max_retries=2, base_delay=1.0):
-    if not TECHIAITH_API_KEY:
-        return None
-    resp = _cysill_get(WELSH_LEMMATIZER_ENDPOINT,
-                       {"text": word, "api_key": TECHIAITH_API_KEY},
-                       max_retries=max_retries, base_delay=base_delay)
-    if resp is None:
-        return None
-    try:
-        data = resp.json()
-        if isinstance(data, dict) and data.get("success") is True:
-            return data.get("result")
-    except Exception:
-        pass
-    return None
-
-def chunk_words_for_pos(all_words, max_chars=POS_CHUNK_MAX_CHARS):
-    """
-    Group a flat list of preprocessed word dicts into chunks that fit
-    within the Cysill API character limit. Used for both Cysill and spaCy
-    so both taggers see the same chunk boundaries.
-
-    Unlike the segment-based chunker, this operates on preprocessed words
-    (already expanded) so chunk text is built from the same token list
-    used for alignment. This guarantees the text sent to taggers matches
-    the token stream we align against.
-
-    PATCH: a change in "_seg_id" between consecutive words now forces a
-    new chunk, even if the character budget has room left. Previously
-    chunking was purely character-budget-driven with no awareness of
-    Whisper segment boundaries (silence gaps, and in multi-speaker audio,
-    likely speaker changes) -- a chunk could span across one of those
-    boundaries and hand the tagger a block of text with a sentence, or
-    two different speakers' turns, silently spliced together mid-parse.
-    Words with no "_seg_id" (e.g. from analyze_phrase's synthetic word
-    list, which isn't segment-derived) all share the value None and so
-    never trigger this break -- unchanged behavior for that path.
-    """
-    chunks    = []
-    cur_words = []
-    cur_len   = 0
-    cur_seg   = None
-
-    for w in all_words:
-        word_len = len(w["word"]) + 1  # +1 for space
-        seg_id   = w.get("_seg_id")
-        seg_changed = cur_words and seg_id != cur_seg
-        over_budget = cur_words and cur_len + word_len > max_chars
-        if seg_changed or over_budget:
-            chunks.append(cur_words)
-            cur_words = []
-            cur_len   = 0
-        cur_words.append(w)
-        cur_len += word_len
-        cur_seg  = seg_id
-
-    if cur_words:
-        chunks.append(cur_words)
-    return chunks
+# ========================= CYSILL API =========================
+# Moved to cysill_client.py: _cysill_get, parse_pos_result_extended,
+# fetch_pos_for_chunk, fetch_lemma, chunk_words_for_pos. Already
+# available here via the `from cysill_client import *` above.
 
 
 def enrich_words(all_preprocessed_words):
@@ -1269,7 +722,15 @@ def enrich_words(all_preprocessed_words):
         cysill_aligned = align_with_gap_tolerance(cysill_tokens, chunk)
 
         # ---- spaCy ----
-        spacy_raw     = parse_spacy_doc(chunk_text) if SPACY_NLP else []
+        # PATCH: was `if SPACY_NLP else []` -- SPACY_NLP is now module-level
+        # state that lives in spacy_tagging.py and gets set by load_spacy().
+        # A plain `from spacy_tagging import SPACY_NLP` copies its value at
+        # import time (None, before load_spacy() has run) and never updates
+        # again, so that check would always see "not loaded" even after a
+        # successful load. parse_spacy_doc() already checks its own
+        # module's SPACY_NLP internally and returns None when unset, so
+        # just rely on that instead of re-checking it here.
+        spacy_raw     = parse_spacy_doc(chunk_text) or []
         spacy_aligned = align_with_gap_tolerance(spacy_raw or [], chunk)
 
         # PATCH: both aligners must return one pair per input word
@@ -1456,6 +917,45 @@ _WELSH_VOWELS_CHECK    = frozenset("aeiouwyâêîôûŵŷ")
 _KNOWN_WELSH_CLUSTERS  = frozenset({
     "mh", "nh", "ng", "ll", "rh", "ch", "ph", "th", "ff", "ngh"
 })
+
+def _is_plausible_welsh_token(word: str) -> bool:
+    """
+    Returns False if the token contains any diacritic combining mark that
+    cannot appear in genuine Welsh orthography.
+
+    Strategy: NFD-decompose each character. If it carries a combining mark
+    that is not circumflex (U+0302), acute (U+0301), or grave (U+0300), the
+    token is orthographically impossible in Welsh -- umlaut, tilde, breve,
+    caron, cedilla, ring, ogonek, etc. all fail.
+
+    Catches hallucinations such as:
+        töii   (umlaut-o,   U+0308 combining diaeresis)
+        tõii   (tilde-o,    U+0303 combining tilde)
+        děkuji (caron-e,    U+030C combining caron)
+        ţară   (cedilla-t,  U+0326 combining cedilla below)
+
+    Does NOT reject:
+        tŷ     (circumflex-y -- legal Welsh)
+        llên   (circumflex-e -- legal Welsh)
+        café   (acute-e     -- tolerated loanword)
+
+    # PATCH: this function (and its two constants, WELSH_LEGAL_DIACRITIC_CHARS
+    # and _COMBINING_LEGAL) went missing entirely during the module split --
+    # dropped along with the mutation-tables block it happened to sit next to
+    # in the original file, leaving three call sites silently calling an
+    # undefined name. Caught by pyflakes, not by the earlier import smoke
+    # test, since a NameError here only fires the first time a caller
+    # actually executes this code path at runtime. Restored here; its two
+    # constants now live in mutation_tables.py since they're pure data.
+    """
+    for ch in unicodedata.normalize("NFC", word.lower()):
+        nfd = unicodedata.normalize("NFD", ch)
+        if len(nfd) == 1:
+            continue  # plain character, no combining marks
+        for mark in nfd[1:]:
+            if mark not in _COMBINING_LEGAL:
+                return False
+    return True
 
 def _is_plausible_welsh_word(word: str) -> bool:
     """

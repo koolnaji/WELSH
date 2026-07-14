@@ -1058,7 +1058,7 @@ def main():
     print(f"Reading from: {MUT_DIR}\n")
 
     df, batch_log = load_and_merge_mutations()
-    missing_cols = validate_columns(df)
+    validate_columns(df)
     df = prepare(df)
 
     merged_path = OUT_DIR / "merged_mutations.csv"

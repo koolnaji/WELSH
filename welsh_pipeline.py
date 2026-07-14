@@ -26,7 +26,7 @@ import mutation_engine
 
 from mutation_engine import (
     BASE_DIR, LOCAL_MP3_DIR,
-    ensure_dirs, run_stamp, run_paths, _video_slug, load_spacy,
+    ensure_dirs, run_stamp, _video_slug, load_spacy,
     reset_cysill_circuit_breaker, load_lemma_cache, save_lemma_cache,
 )
 from corpus_ops import (
@@ -276,7 +276,6 @@ def main():
     # "q" breaks out and ends the program.
     while True:
         stamp = run_stamp()
-        paths = run_paths(stamp)
 
         print("\n1 = Analyze local MP3 files")
         print("2 = Discover new videos (add to queue)")

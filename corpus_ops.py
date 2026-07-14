@@ -14,16 +14,15 @@ import smtplib
 import subprocess
 import time
 from email.mime.text import MIMEText
-from pathlib import Path
 import pandas as pd
 import yt_dlp
 from tqdm import tqdm
 
 from mutation_engine import (
-    BASE_DIR, AUDIO_DIR, TRANS_DIR, SUMMARY_DIR, VIDEO_QUEUE, PROCESSED_LOG,
+    AUDIO_DIR, SUMMARY_DIR, VIDEO_QUEUE, PROCESSED_LOG,
     LOCAL_PROCESSED_LOG, FAILED_LOG, FAILED_MAX_RETRIES, CURATED_CHANNELS,
     EROSION_CONFIDENCE_THRESHOLD,
-    ensure_dirs, run_stamp, run_paths,
+    run_paths,
     filter_hallucinated_segments, deduplicate_overlapping_segments,
     preprocess_segment, expand_whisper_tokens, enrich_words,
     normalize_word, get_welsh_lemma,
