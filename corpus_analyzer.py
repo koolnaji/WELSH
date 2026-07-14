@@ -291,9 +291,23 @@ def load_and_merge_mutations():
     # rather than flat in MUT_DIR, so this needs to recurse. "_deleted" is
     # excluded since files moved there by interactive_batch_selection()
     # should stay excluded from future runs, not silently reappear.
+    #
+    # PATCH: also exclude "*_precaption_backup.csv". fetch_captions.py's
+    # run_corroboration() corroborates a video's mutations file IN PLACE
+    # (adds the caption_corroboration columns directly onto the real
+    # mutations_<stamp>_<slug>.csv) and, before doing that, writes a
+    # one-time backup of the pre-corroboration state to
+    # mutations_<stamp>_<slug>_precaption_backup.csv -- so re-running
+    # corroboration later can't double-corroborate an already-corroborated
+    # file. That backup's name still starts with "mutations_" and ends in
+    # ".csv", so it matched this glob too: every corroborated video was
+    # being loaded twice and every mutation row double-counted in the
+    # merged corpus. The backup is intentional and should stay on disk as
+    # a safety net; it just shouldn't be treated as a second video's worth
+    # of data.
     csv_files = sorted(
         p for p in MUT_DIR.rglob("mutations_*.csv")
-        if "_deleted" not in p.parts
+        if "_deleted" not in p.parts and not p.name.endswith("_precaption_backup.csv")
     )
     if not csv_files:
         print(f"No mutations_*.csv files found in {MUT_DIR}")

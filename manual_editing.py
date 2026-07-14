@@ -160,12 +160,20 @@ TIMESTAMP_RE = re.compile(r"([\d.]+)s\s*-\s*([\d.]+)s")
 
 
 def find_mutation_csvs(explicit_paths):
+    # PATCH: exclude "*_precaption_backup.csv" -- see the matching comment
+    # in corpus_analyzer.py's load_and_merge_mutations(). These are
+    # fetch_captions.py's one-time pre-corroboration backups, not separate
+    # videos' worth of review data; without this filter they'd show up as
+    # duplicate files to review, with stale (pre-corroboration) rows.
     if explicit_paths:
         paths = []
         for p in explicit_paths:
             p = Path(p)
             if p.is_dir():
-                paths.extend(sorted(p.rglob("mutations_*.csv")))
+                paths.extend(sorted(
+                    f for f in p.rglob("mutations_*.csv")
+                    if not f.name.endswith("_precaption_backup.csv")
+                ))
             else:
                 paths.append(p)
         return paths
@@ -174,7 +182,10 @@ def find_mutation_csvs(explicit_paths):
               f"point this at your mutations CSVs directly, or check "
               f"BASE_DIR at the top of this script.")
         sys.exit(1)
-    return sorted(MUT_DIR.rglob("mutations_*.csv"))
+    return sorted(
+        f for f in MUT_DIR.rglob("mutations_*.csv")
+        if not f.name.endswith("_precaption_backup.csv")
+    )
 
 
 def quick_row_count(path):
