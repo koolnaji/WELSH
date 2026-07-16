@@ -29,6 +29,16 @@ WELSH_POS_ENDPOINT        = "https://api.techiaith.cymru/cysill/v1/pos/v1"
 # Cysill API limit, not a linguistic constant.
 POS_CHUNK_MAX_CHARS = 2700
 
+# PATCH: distinguishable sentinel for "the call itself failed" (rate limit,
+# timeout, circuit breaker open, unparseable response) as opposed to a
+# genuine `None`/empty result, which means the API was reached and
+# responded, it just had nothing to offer. Callers (currently just
+# get_welsh_lemma) need this distinction to decide what's safe to cache
+# permanently vs. what should be retried on a future run. Using a sentinel
+# object rather than a string/None avoids any risk of colliding with a
+# real API response value.
+CYSILL_CALL_FAILED = object()
+
 http_session = requests.Session()
 
 # PATCH: circuit breaker state for Cysill API
@@ -181,13 +191,23 @@ def fetch_lemma(word, max_retries=2, base_delay=1.0):
                        {"text": word, "api_key": TECHIAITH_API_KEY},
                        max_retries=max_retries, base_delay=base_delay)
     if resp is None:
-        return None
+        # PATCH: this is a genuine call failure (retries exhausted, or the
+        # circuit breaker is open) -- not the same thing as the API
+        # answering "no lemma". Distinguish it so the caller doesn't
+        # permanently cache a word that we simply never managed to ask.
+        return CYSILL_CALL_FAILED
     try:
         data = resp.json()
         if isinstance(data, dict) and data.get("success") is True:
             return data.get("result")
-    except Exception:
-        pass
+        tqdm.write(f" ⚠️ Lemma API success=False: {data}")
+    except Exception as e:
+        tqdm.write(f" ⚠️ Lemma API parse error: {e}")
+        # PATCH: a response we couldn't parse is closer to "we didn't get
+        # a usable answer" than "the API confirmed there's nothing" --
+        # treat it the same as a call failure so it gets retried later
+        # rather than calcified as a permanent null.
+        return CYSILL_CALL_FAILED
     return None
 
 

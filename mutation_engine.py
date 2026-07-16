@@ -79,6 +79,7 @@ from cysill_client import (
     TECHIAITH_API_KEY,
     reset_cysill_circuit_breaker,   # re-exported for welsh_pipeline.py
     fetch_lemma, fetch_pos_for_chunk, chunk_words_for_pos,
+    CYSILL_CALL_FAILED,
 )
 
 
@@ -304,19 +305,54 @@ def get_welsh_lemma(word):
     suppletive_radical = _resolve_suppletive_comparative_radical(w)
     if suppletive_radical:
         return suppletive_radical
+    # PATCH: check for English code-switching BEFORE hitting Cysill or
+    # simplemma, not after. is_english_code_switch() only ever inspects
+    # `word` itself (its second parameter, the lemma, is unused inside the
+    # function) -- so there was never a real dependency forcing the lemma
+    # lookup to happen first. Previously every English word (~8-10% of
+    # this corpus, per the code-switching research question itself) was
+    # sent to the Welsh lemmatizer regardless, burning an API call for
+    # nothing and sometimes getting "Welshified" into a nonsense answer
+    # (observed live: "gosh" -> "cosh", the same failure mode already
+    # documented for "the" -> "te" and "for" -> "mor" in
+    # ENGLISH_FUNCTION_WORDS' own comment). Skipping the network path
+    # entirely for recognized English words fixes both the wasted calls
+    # and the garbage cache entries in one place, for every caller of
+    # get_welsh_lemma (this was previously only checked downstream in
+    # layer_2_lemma_analysis, which doesn't cover corpus_ops.py's
+    # per-word loop that actually populates LEMMA_CACHE in the first
+    # place).
+    if is_english_code_switch(w, None):
+        return None
     if w in LEMMA_CACHE:
         return LEMMA_CACHE[w]
     lemma = None
+    cysill_call_failed = False
     # PATCH: route through fetch_lemma so retry/reconnect logic applies
     if TECHIAITH_API_KEY:
-        lemma = fetch_lemma(w)
+        result = fetch_lemma(w)
+        if result is CYSILL_CALL_FAILED:
+            cysill_call_failed = True
+        else:
+            lemma = result
     if not lemma and simplemma_lemmatize is not None:
         try:
             fallback = simplemma_lemmatize(w, lang="cy")
             lemma = fallback if fallback and fallback != w else None
         except Exception:
             lemma = None
-    LEMMA_CACHE[w] = lemma
+    # PATCH: only skip caching when Cysill's call itself genuinely failed
+    # (rate limit, timeout, circuit breaker) AND we still ended up with
+    # nothing. simplemma is local/deterministic -- if it already weighed
+    # in (found something, or confirmed nothing), that answer will be
+    # identical on every future run, so there's no benefit to leaving it
+    # uncached. Only a real, unanswered Cysill call is worth retrying.
+    # This also fixes the previous version of this patch, which skipped
+    # caching on ANY None result -- including simplemma's confirmed
+    # "no distinct lemma" answers, which are stable and were being
+    # needlessly re-fetched from the API on every future run.
+    if lemma is not None or not cysill_call_failed:
+        LEMMA_CACHE[w] = lemma
     return lemma
 
 def extract_gender_from_spacy(spacy_token):
@@ -904,6 +940,19 @@ _IMPOSSIBLE_WELSH_BIGRAMS = frozenset({
     # Consonant clusters impossible in Welsh onset/nucleus position
     "xw", "xr", "xb", "xd", "xf", "xg", "xl", "xm", "xn", "xp", "xs", "xt",
     "qy", "qw", "qa", "qe", "qi", "qo", "qu",
+    # PATCH: consonant+h clusters that are not legal Welsh digraphs and do
+    # not correspond to any real mutation output. The only legal C+h
+    # clusters in Welsh are ch/ph/th/rh (their own digraphs) and mh/nh/ngh
+    # (nasal mutation of p/t/c). Aspirate mutation ONLY applies to p/t/c
+    # (-> ph/th/ch) -- there is no aspirate mutation of b, d, g, f, or s,
+    # so a word-initial "bh" (etc.) has no possible linguistic origin.
+    # Previously absent from this list entirely, and also too short (2
+    # consonants) to trip the separate consecutive-consonant-length check
+    # below (threshold is >3) -- so a hallucinated "bh"-initial token
+    # passed both hallucination-plausibility filters undetected. Confirmed
+    # live: word-initial "bh" observed in output that should have been
+    # rejected at this stage.
+    "bh", "dh", "fh", "gh", "sh",
     # Vowel sequences impossible in Welsh (Welsh has ae, ai, au, aw, ei, eu,
     # ew, oe, oi, ou, wy, yw but NOT these):
     "uu", "ii", "aa",
@@ -1084,6 +1133,8 @@ def reverse_mutation_candidates(surface, expected_mutations=None):
 
     allowed = set(expected_mutations or RADICAL_TO_MUTATED.keys())
     candidates = set()
+    # PATCH: the surface's true atomic initial unit, digraph-aware.
+    surface_cluster = initial_cluster(surface)
 
     for mut_type, mapping in RADICAL_TO_MUTATED.items():
         if mut_type not in allowed:
@@ -1091,6 +1142,26 @@ def reverse_mutation_candidates(surface, expected_mutations=None):
         for radical_initial, mutated_initial in sorted(
                 mapping.items(), key=lambda x: len(x[1]), reverse=True):
             if mutated_initial and surface.startswith(mutated_initial):
+                # PATCH: `surface.startswith(mutated_initial)` alone is a
+                # naive string-prefix check that doesn't know Welsh
+                # digraphs (ff, dd, ll, rh, mh, ngh...) are atomic, single
+                # sounds, not two separate letters. A short mutated value
+                # like "f" (from b->f or m->f) will match any word that
+                # merely *starts with the character* f -- including one
+                # that actually begins with the unrelated, independently-
+                # radical digraph "ff" (e.g. "ffenest", "ffrind", or a
+                # Welsh-orthography English loanword like "fflamboyant"),
+                # which never mutates from anything. The same failure
+                # mode produces impossible clusters like "bh"/"gh": a
+                # surface genuinely starting with "mh" (nasal mutation of
+                # p) or "ngh" (nasal mutation of c) gets wrongly
+                # re-matched against the unrelated single-letter values
+                # "m" (b->m) / "ng" (g->ng). Requiring the surface's true
+                # digraph-aware initial cluster to equal mutated_initial
+                # exactly -- not just be string-prefixed by it -- fixes
+                # all of these at once.
+                if surface_cluster != mutated_initial:
+                    continue
                 candidates.add(radical_initial + surface[len(mutated_initial):])
             elif mutated_initial == "" and radical_initial == "g" and surface[0] in WELSH_VOWELS:
                 candidates.add("g" + surface)
@@ -1103,32 +1174,51 @@ def reverse_mutation_candidates(surface, expected_mutations=None):
 
 def radical_candidates_for_target(target_node, t2, expected):
     candidates = []
+    raw_word = normalize_word(t2.get("raw_word") or "")
 
-    def add(value):
+    def add(value, verify=False):
         value = normalize_word(value or "")
-        if value and value not in candidates:
-            candidates.append(value)
+        if not value or value in candidates:
+            return
+        if verify and value != raw_word:
+            # PATCH: cross-validate a tagger-supplied lemma guess against
+            # this pipeline's own forward mutation tables before trusting
+            # it as a candidate radical. The previous fix here only
+            # gated spaCy's lemma on content-POS tagging -- but POS and
+            # lemma are separate model outputs that can fail
+            # independently, and it never touched Cysill's own lemma
+            # guess (t2.get("lemma")) at all, which had no gate
+            # whatsoever. Confirmed live: "digalon" -> "igalon" and
+            # "fi" -> "i", both cases of a tagger stripping a real
+            # word-initial consonant as if it were a mutation artifact --
+            # the same failure mode already documented for
+            # "dibynol" -> "ibynol". The one thing we can actually verify
+            # without guessing: does forward-mutating this candidate
+            # under one of the mutation types genuinely expected in this
+            # context reproduce the surface word we transcribed? If
+            # forward-mutating "igalon" or "i" under soft/nasal/aspirate
+            # never produces "digalon"/"fi" -- and it doesn't, since
+            # those tables only take consonant-initial radicals, never
+            # vowel-initial ones -- there is no rule in this pipeline
+            # that explains the guess, and it's dropped rather than
+            # polluting the candidate list.
+            if raw_word not in expected_surface_forms(value, expected):
+                return
+        candidates.append(value)
 
-    add(t2.get("lemma"))
+    add(t2.get("lemma"), verify=True)
     spacy_tok = target_node.get("spacy_token")
     if spacy_tok:
-        # PATCH: only trust spaCy's own lemma guess when spaCy actually
-        # tagged this token with a content POS (not PUNCT/SPACE/X/absent).
-        # When spaCy's Welsh model doesn't recognize a word, it frequently
-        # echoes a demutated guess as the lemma anyway instead of signalling
-        # non-recognition -- confirmed live: "dibynol" (a genuine d-initial
-        # radical, mistagged by the surface heuristic as wrong-type erosion)
-        # got a nonsense "ibynol" candidate folded in here, apparently from
-        # spaCy incorrectly demutating a word it doesn't recognize. Gating
-        # on content-POS tagging (same bar used by
-        # pos_tagger_agreement_sufficient elsewhere) keeps genuine spaCy
-        # lemmatizations while dropping guesses made on unrecognized tokens.
+        # Only trust spaCy's own lemma guess when spaCy actually tagged
+        # this token with a content POS (not PUNCT/SPACE/X/absent) --
+        # kept as a cheap first-pass filter, but no longer the only one;
+        # see the verify=True cross-check in add() above.
         spacy_pos = spacy_tok.get("pos")
         spacy_content_tagged = spacy_pos not in (None, "", "PUNCT", "SPACE", "X", "unknown")
         if spacy_content_tagged:
-            add(spacy_tok.get("lemma"))
+            add(spacy_tok.get("lemma"), verify=True)
     for candidate in reverse_mutation_candidates(t2.get("raw_word"), expected):
-        add(candidate)
+        add(candidate)   # derived directly from this pipeline's own mutation tables -- always trustworthy
     add(t2.get("raw_word"))
     return candidates
 
