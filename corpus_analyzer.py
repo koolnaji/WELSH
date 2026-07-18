@@ -40,10 +40,17 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 
 # ========================= CONFIGURATION =========================
-BASE_DIR     = Path.home() / "Documents" / "welsh_analysis"
-MUT_DIR      = BASE_DIR / "mutations"
-OUT_DIR      = BASE_DIR / "analysis"
-FIG_DIR      = OUT_DIR / "figures"
+# PATCH: previously hardcoded BASE_DIR = Path.home() / "Documents" /
+# "welsh_analysis" here, completely independent of mutation_engine.py's
+# BASE_DIR (which honors WELSH_ANALYSIS_DIR, falling back to
+# Path.home() / "welsh_analysis" -- note: no "Documents"). Since
+# welsh_pipeline.py imports its BASE_DIR from mutation_engine.py, the two
+# had silently diverged into two different folders on disk -- this file
+# would look for mutations data in a location the actual pipeline never
+# wrote to. Importing the same names from mutation_engine.py makes this
+# the single source of truth: change WELSH_ANALYSIS_DIR once, and every
+# file (pipeline + all three companion tools) follows automatically.
+from mutation_engine import BASE_DIR, MUT_DIR, OUT_DIR, FIG_DIR
 
 # Seaborn theme -- clean, publication-friendly.
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)

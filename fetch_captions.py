@@ -48,11 +48,14 @@ from pathlib import Path
 import pandas as pd
 import yt_dlp
 
-# Same location convention as the rest of the pipeline -- duplicated here
-# rather than imported, per the standalone-script pattern.
-BASE_DIR      = Path.home() / "Documents" / "welsh_analysis"
-CAPTIONS_DIR  = BASE_DIR / "captions"
-TRANS_DIR     = BASE_DIR / "transcriptions"
+# PATCH: previously duplicated these here (Path.home() / "Documents" /
+# "welsh_analysis") per the old standalone-script pattern -- silently
+# diverged from mutation_engine.py's actual BASE_DIR (WELSH_ANALYSIS_DIR,
+# falling back to Path.home() / "welsh_analysis", no "Documents"), so
+# this looked for/wrote transcripts and captions in a different folder
+# than the one welsh_pipeline.py actually uses. Importing instead of
+# duplicating keeps every file in the project pointed at the same place.
+from mutation_engine import BASE_DIR, CAPTIONS_DIR, TRANS_DIR
 
 WELSH_LANG_CODES = ["cy", "cy-GB", "cy-orig"]
 
@@ -334,6 +337,52 @@ def covering_segment(df, t_start, t_end):
     return covering.iloc[0]
 
 
+# PATCH: margin (seconds) added on each side of [t_start, t_end] when
+# pooling segments for corroboration comparison. Small enough to stay
+# local to the target word's actual sentence/utterance, generous enough
+# to absorb the fact that Whisper's and the caption track's segment
+# boundaries are chunked completely independently and essentially never
+# coincide.
+CORROBORATION_WINDOW_MARGIN = 2.5
+
+
+def covering_segments_text(df, t_start, t_end, margin=CORROBORATION_WINDOW_MARGIN):
+    """Returns the concatenated segment_text of EVERY row in df whose
+    segment_start/segment_end overlaps [t_start - margin, t_end + margin],
+    in chronological order, or None if nothing overlaps.
+
+    Unlike covering_segment() (which returns only a single, first-matching
+    row), this pools every segment touching the window. That distinction
+    matters specifically for caption corroboration: Whisper segments its
+    own output by internal VAD/model boundaries, while a YouTube caption
+    track is segmented by whatever the caption author (or auto-caption
+    tool) chose for line breaks -- two independent chunking schemes over
+    the same audio that essentially never align. Comparing "the one
+    Whisper segment covering this timestamp" against "the one caption
+    segment covering this timestamp" is therefore comparing two
+    arbitrarily different-sized slices of the same stretch of speech, not
+    a fair like-for-like content comparison -- a short 3-second Whisper
+    segment measured against a caption block spanning 15 seconds of
+    dialogue will score as a poor match by word-overlap ratio even when
+    the transcription is perfect, purely because of the size mismatch.
+    Pooling every segment within a shared absolute time window on both
+    sides removes that artifact.
+
+    Confirmed against real corroboration output: segment_mismatch_too_large
+    was firing on the large majority of rows (63/88 in one run) -- far more
+    than plausible as genuine Whisper/caption disagreement, consistent with
+    this being a segmentation-granularity artifact rather than real
+    mismatches.
+    """
+    if df is None or "segment_start" not in df.columns or "segment_end" not in df.columns:
+        return None
+    covering = df[(df["segment_start"] <= t_end + margin) &
+                  (df["segment_end"]   >= t_start - margin)]
+    if covering.empty:
+        return None
+    return " ".join(str(t) for t in covering.sort_values("segment_start")["segment_text"])
+
+
 def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
     """The actual reinforcement pass: applies rules 1-3 to every row of a
     mutations_*.csv against the matching captions CSV (from a prior
@@ -383,13 +432,23 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
             continue
         t_start, t_end = float(m.group(1)), float(m.group(2))
 
-        w_seg = covering_segment(whisper_df, t_start, t_end)
-        c_seg = covering_segment(caption_df, t_start, t_end)
+        # PATCH: previously took a single row from each df via
+        # covering_segment() and compared just that row's segment_text.
+        # Whisper's and the caption track's segments are chunked by two
+        # completely independent processes and essentially never share
+        # boundaries, so a single-segment-to-single-segment comparison was
+        # frequently comparing differently-sized slices of the same
+        # speech (see covering_segments_text's docstring for the full
+        # reasoning and the confirmed real-world fall-through rate this
+        # was causing). Pooling every segment within a shared time window
+        # on both sides gives a fair, boundary-independent comparison.
+        whisper_text = covering_segments_text(whisper_df, t_start, t_end)
+        caption_text = covering_segments_text(caption_df, t_start, t_end)
 
         # Rule 1, part a: no caption at all for this stretch -- Whisper is
         # the only source, not "the winner" of a comparison that never
         # happened. Tracked separately from an active mismatch below.
-        if w_seg is None or c_seg is None:
+        if whisper_text is None or caption_text is None:
             new_cols["caption_available"].append(False)
             new_cols["caption_segment_match_ratio"].append(None)
             new_cols["caption_word"].append(None)
@@ -401,8 +460,6 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
             counts["no_caption"] += 1
             continue
 
-        whisper_text = str(w_seg["segment_text"])
-        caption_text = str(c_seg["segment_text"])
         ratio = segment_match_ratio(whisper_text, caption_text)
 
         # Rule 1, part b: caption present but substantially different --

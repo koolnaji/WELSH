@@ -68,6 +68,17 @@ LOCAL_PROCESSED_LOG = BASE_DIR / "processed_local_mp3s.json"
 FAILED_LOG           = BASE_DIR / "failed_videos.json"
 FAILED_MAX_RETRIES    = 3
 
+# PATCH: previously only defined locally inside fetch_captions.py and
+# corpus_analyzer.py respectively -- redefined here too (same value, same
+# BASE_DIR) purely so ensure_dirs() below can create every output folder
+# up front, not just the ones menu option 3 happens to write to. This
+# doesn't change where fetch_captions.py/corpus_analyzer.py look; it just
+# means the folder already exists by the time they get around to needing
+# it, instead of being created lazily on first use.
+CAPTIONS_DIR = BASE_DIR / "captions"
+OUT_DIR      = BASE_DIR / "analysis"
+FIG_DIR      = OUT_DIR / "figures"
+
 # PATCH: persistent lemma cache path
 LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
 
@@ -142,7 +153,18 @@ from mutation_tables import (
 
 # ========================= HELPERS =========================
 def ensure_dirs():
-    for p in [BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR]:
+    # PATCH: previously only created the folders menu option 3 needs
+    # (audio/transcriptions/mutations/summaries) -- LOCAL_MP3_DIR
+    # (test_audio), CAPTIONS_DIR, OUT_DIR (analysis), and FIG_DIR were
+    # each created lazily by whichever menu option first needed them
+    # (option 1, caption download, option 6). That's not wrong, just
+    # confusing to look at from the outside -- a user who's only run
+    # option 3 sees a handful of folders and no signal that the others
+    # are just as real, only not-yet-triggered. Creating everything up
+    # front makes the whole output layout visible from the very first
+    # run, regardless of which menu options get used afterward.
+    for p in [BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR,
+              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 def run_stamp():
@@ -1230,6 +1252,23 @@ def raw_has_radical_evidence(target_node, t2):
     Evidence hierarchy:
     1. Cysill successfully tagged this token AND its lemma equals the surface
        form -- the tagger has seen the radical form directly.
+    2. Cysill's lemma and the surface form share the same initial consonant
+       cluster (digraph-aware) -- since Welsh mutation categorically only
+       ever changes a word's INITIAL cluster, an unchanged initial cluster
+       is proof of no mutation regardless of what the rest of the word
+       does. This catches genuinely radical (unmutated) inflected forms
+       that evidence tier 1 misses -- e.g. "pethau" (lemma "peth", plural
+       -au suffix) or "plant" (lemma "plentyn", irregular plural) -- where
+       the full surface form differs from the lemma for a completely
+       unrelated reason (normal inflection) but the initial letter, the
+       only thing mutation can touch, is identical. A genuinely mutated
+       word's lemma (e.g. "gorff" -> lemma "corff") will NOT match on
+       initial cluster, so this can't misclassify real erosion as radical.
+       PATCH: previously this function only had tier 1, so any radical but
+       inflected surface form (plurals, in particular) fell all the way
+       through to the ambiguous "mutation_mismatch" bucket instead of
+       being correctly recognized -- confirmed live against real pipeline
+       output: 5/9 mutation_mismatch rows were exactly this pattern.
 
     The previous version included `raw == spacy_lemma` as evidence, but spaCy
     frequently echoes the surface form as its own lemma for unknown/rare words,
@@ -1242,8 +1281,12 @@ def raw_has_radical_evidence(target_node, t2):
 
     # Evidence 1: Cysill-confirmed lemma match
     lemma = normalize_word(t2.get("lemma") or "")
-    if lemma and raw == lemma and target_node.get("cysill_aligned"):
-        return True
+    if lemma and target_node.get("cysill_aligned"):
+        if raw == lemma:
+            return True
+        # Evidence 2: same initial cluster despite differing elsewhere
+        if initial_cluster(raw) == initial_cluster(lemma):
+            return True
 
     # A differing spaCy lemma is evidence for a possible mutated form
     # (e.g. gi -> ci), not evidence that the surface is radical.
@@ -1498,8 +1541,34 @@ def _build_row(current_node, target_node, expected, outcome,
 
     parser_mut_type = SPACY_MUTATION_MAP.get(
         spacy_tok["mutation"]) if spacy_tok and spacy_tok.get("mutation") else None
-    cysill_agrees   = (cysill_mut == surface_mut) if (cysill_mut and surface_mut) else None
-    parser_agrees   = (parser_mut_type == surface_mut) if (parser_mut_type and surface_mut) else None
+    # PATCH: previously `cysill_agrees`/`parser_agrees` were computed as
+    # `(cysill_mut == surface_mut) if (cysill_mut and surface_mut) else None`
+    # -- a truthy guard that requires BOTH values to be non-None/non-empty
+    # before even attempting the comparison. That's correct when checking
+    # "did the tagger confirm the SAME mutation type", but for any row
+    # where surface_mut is None (erosion, mutation_mismatch,
+    # selective_invariancy -- by definition, nothing was found on the
+    # surface), the guard fails immediately regardless of what the tagger
+    # actually said, forcing cysill_agrees/parser_agrees to None every
+    # time. Since `elif cysill_agrees is None and parser_agrees is None:
+    # agreement = "heuristic_only"` then always fires, EVERY erosion/
+    # mismatch/selective-invariancy row was unconditionally stamped
+    # "heuristic_only" -- even when Cysill's own tagger explicitly and
+    # independently reported "no mutation" on that exact word, which is
+    # genuine corroboration, not an absence of signal. Confirmed against
+    # real output: 68/68 erosion rows had cysill_mutation_type == "none"
+    # (Cysill agreeing) yet 68/68 were labelled heuristic_only, hiding
+    # 100% real corroboration.
+    #
+    # Fix: only treat a tagger as having no signal when it genuinely
+    # wasn't consulted or didn't align (cysill_aligned / spacy_aligned is
+    # False/missing) -- not merely when its answer happens to be None,
+    # since None from an aligned tagger legitimately means "confirmed no
+    # mutation" and should compare equal to a None surface_mut.
+    cysill_has_signal = bool(target_node.get("cysill_aligned"))
+    parser_has_signal = spacy_tok is not None
+    cysill_agrees = (cysill_mut == surface_mut) if cysill_has_signal else None
+    parser_agrees = (parser_mut_type == surface_mut) if parser_has_signal else None
 
     if cysill_agrees and parser_agrees:
         agreement = "all_three"
