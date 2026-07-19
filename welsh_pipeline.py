@@ -516,14 +516,19 @@ def main():
                                    f"(folder created but empty).")
 
                     # PATCH: corroborate immediately, same run -- mutations
-                    # + segments for this video were just written above, so
+                    # + words for this video were just written above, so
                     # everything run_corroboration() needs is on disk now.
+                    # cap_kind (manual/automatic) was already computed
+                    # above when captions were fetched -- previously
+                    # discarded after the console print at line ~490;
+                    # now threaded through so it's persisted onto the
+                    # mutations CSV as its own column.
                     if captions_csv_path is not None and muts:
                         try:
                             fetch_captions.run_corroboration(
-                                vpaths["mutations"], captions_csv_path, nlp=nlp)
+                                vpaths["mutations"], captions_csv_path, nlp=nlp, cap_kind=cap_kind)
                         except SystemExit:
-                            tqdm.write("  Corroboration pass skipped (no matching segments file).")
+                            tqdm.write("  Corroboration pass skipped (no matching words file).")
                         except Exception as e:
                             tqdm.write(f"  Corroboration pass failed: {e}")
 

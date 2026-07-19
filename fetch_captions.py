@@ -38,6 +38,7 @@ Usage:
         -- just reports what's available, downloads nothing.
 """
 import argparse
+import difflib
 import re
 import shutil
 import sys
@@ -325,68 +326,191 @@ def find_segments_csv(mutations_csv_path):
     return matches[0] if matches else None
 
 
-def covering_segment(df, t_start, t_end):
-    """Returns the row in df whose segment_start/segment_end overlaps
-    [t_start, t_end], or None. Same overlap logic as
-    scan_dom_verbnoun_impact.py's get_sentence_text."""
-    if df is None or "segment_start" not in df.columns or "segment_end" not in df.columns:
+def find_words_csv(mutations_csv_path):
+    """Mirrors find_segments_csv -- same layout, same fallback search --
+    but for words_*.csv. Needed here (and not by find_segments_csv's
+    caller previously) for its per-word word_start/word_end timestamps,
+    which segments_*.csv doesn't have at word granularity."""
+    mutations_csv_path = Path(mutations_csv_path)
+    stem = mutations_csv_path.stem
+    if not stem.startswith("mutations_"):
         return None
-    covering = df[(df["segment_start"] <= t_end) & (df["segment_end"] >= t_start)]
-    if covering.empty:
-        return None
-    return covering.iloc[0]
+    folder_name = stem[len("mutations_"):]
+
+    candidate = TRANS_DIR / folder_name / f"words_{folder_name}.csv"
+    if candidate.exists():
+        return candidate
+
+    target_name = f"words_{folder_name}.csv"
+    search_root = mutations_csv_path.parents[2] if len(mutations_csv_path.parents) >= 3 else BASE_DIR
+    matches = list(search_root.rglob(target_name))
+    return matches[0] if matches else None
 
 
-# PATCH: margin (seconds) added on each side of [t_start, t_end] when
-# pooling segments for corroboration comparison. Small enough to stay
-# local to the target word's actual sentence/utterance, generous enough
-# to absorb the fact that Whisper's and the caption track's segment
-# boundaries are chunked completely independently and essentially never
-# coincide.
-CORROBORATION_WINDOW_MARGIN = 2.5
+# ===================== Whole-video word-level alignment =====================
+# PATCH: replaces the previous segment-pooling approach entirely
+# (covering_segment / covering_segments_text / MISMATCH_RATIO_THRESHOLD /
+# segment_match_ratio-as-a-gate / align_target_word run per-row on a local
+# window). That approach compared TEXT WINDOWS bounded by an arbitrary
+# time margin, which reduced every case to "is this window's word-overlap
+# ratio above some threshold" -- a threshold with no principled value that
+# needed constant retuning, and which discarded real signal (e.g. manual
+# captions genuinely normalizing colloquial forms toward standard written
+# Welsh -- see the module docstring) by lumping it in with pure alignment
+# noise whenever the ratio came out low for either reason.
+#
+# This aligns the WHOLE video's Whisper word stream against the WHOLE
+# video's caption word stream ONCE (not per mutation row), via
+# difflib.SequenceMatcher. SequenceMatcher finds the longest matching
+# blocks first and recursively resolves what's left before/after each one
+# -- so a single deleted or substituted word doesn't cascade into
+# permanent misalignment for the rest of the video, unlike a fixed-offset
+# or purely positional walk would.
+#
+# The one real risk with pure content-based whole-video alignment:
+# mutation trigger words are a small closed set of very short, very
+# common words (yn, y, i, a...) that repeat dozens of times per video, so
+# the algorithm could occasionally anchor a match to the WRONG occurrence
+# of a common word far away in the video. Two safeguards against that:
+#   1. Timing plausibility check -- every proposed word-to-word pairing is
+#      checked against the two words' actual (approximate, for captions --
+#      VTT only has segment-level timing) timestamps. A pairing whose
+#      timestamps are wildly apart despite matching in content is almost
+#      certainly the "wrong occurrence" failure mode, not a real
+#      alignment, and gets flagged rather than trusted.
+#   2. Neighbor corroboration -- an isolated one-word "equal" match
+#      surrounded by replace/delete on both sides is weaker evidence than
+#      a match sitting inside a longer run of consecutive agreement.
+#      Recorded as a confidence signal (run_len) rather than treated as
+#      binary match/no-match.
+
+# Generous because caption timing is segment-level (a whole sentence/line
+# of dialogue), not per-word -- every word in a caption segment inherits
+# that segment's start time as an approximation, so a genuinely correct
+# match can easily be several seconds off from the Whisper word's precise
+# timestamp just from where in its segment that word happens to sit. This
+# is a sanity check for "wildly implausible" (the wrong occurrence of a
+# common word, potentially minutes away), not a precision filter.
+ALIGNMENT_TIMING_TOLERANCE = 15.0
+
+# Minimum consecutive-equal run length for a match to count as
+# well-corroborated by its neighbors rather than an isolated coincidence
+# -- see align_whole_video's docstring, safeguard 2.
+NEIGHBOR_CORROBORATION_MIN_RUN = 3
 
 
-def covering_segments_text(df, t_start, t_end, margin=CORROBORATION_WINDOW_MARGIN):
-    """Returns the concatenated segment_text of EVERY row in df whose
-    segment_start/segment_end overlaps [t_start - margin, t_end + margin],
-    in chronological order, or None if nothing overlaps.
+def build_whisper_token_stream(words_df):
+    """Whole-video, chronologically-ordered (word, timestamp) stream from
+    words_*.csv. Uses each word's own word_end (real per-word timing from
+    faster-whisper) -- matches what the mutations CSV's timestamp field
+    records for a target word (see run_corroboration's target-word lookup)."""
+    df = words_df.sort_values("word_start").reset_index(drop=True)
+    tokens = [normalize_word(w) for w in df["word"]]
+    times  = list(df["word_end"])
+    return tokens, times, df
 
-    Unlike covering_segment() (which returns only a single, first-matching
-    row), this pools every segment touching the window. That distinction
-    matters specifically for caption corroboration: Whisper segments its
-    own output by internal VAD/model boundaries, while a YouTube caption
-    track is segmented by whatever the caption author (or auto-caption
-    tool) chose for line breaks -- two independent chunking schemes over
-    the same audio that essentially never align. Comparing "the one
-    Whisper segment covering this timestamp" against "the one caption
-    segment covering this timestamp" is therefore comparing two
-    arbitrarily different-sized slices of the same stretch of speech, not
-    a fair like-for-like content comparison -- a short 3-second Whisper
-    segment measured against a caption block spanning 15 seconds of
-    dialogue will score as a poor match by word-overlap ratio even when
-    the transcription is perfect, purely because of the size mismatch.
-    Pooling every segment within a shared absolute time window on both
-    sides removes that artifact.
 
-    Confirmed against real corroboration output: segment_mismatch_too_large
-    was firing on the large majority of rows (63/88 in one run) -- far more
-    than plausible as genuine Whisper/caption disagreement, consistent with
-    this being a segmentation-granularity artifact rather than real
-    mismatches.
+def build_caption_token_stream(caption_df):
+    """Whole-video, chronologically-ordered (word, approx_timestamp)
+    stream from a parsed captions CSV. VTT captions only carry per-SEGMENT
+    timing, not per-word, so every word in a caption segment inherits
+    that segment's segment_start as an approximation."""
+    df = caption_df.sort_values("segment_start").reset_index(drop=True)
+    tokens, times = [], []
+    for _, row in df.iterrows():
+        for w in str(row["segment_text"]).split():
+            tokens.append(normalize_word(w))
+            times.append(row["segment_start"])
+    return tokens, times
+
+
+def align_whole_video(whisper_tokens, whisper_times, caption_tokens, caption_times):
+    """Aligns two full, chronologically-ordered token streams for one
+    video via difflib.SequenceMatcher, and returns a dict mapping each
+    whisper token index to its corresponding caption evidence:
+
+        {
+          whisper_idx: {
+              "caption_word": str or None,
+              "tag": "equal" | "replace" | "delete" | "replace_unmatched_length",
+              "timing_ok": bool or None,   # None when caption_word is None
+              "run_len": int,               # length of the opcode block this index sits in
+          },
+          ...
+        }
+
+    "delete" means the caption genuinely has nothing corresponding to
+    this whisper word -- SequenceMatcher's recursive block-matching has
+    already resolved everything it could around this point before
+    concluding there's no caption counterpart, so this isn't a
+    segmentation artifact the way the old approach's gaps could be.
     """
-    if df is None or "segment_start" not in df.columns or "segment_end" not in df.columns:
-        return None
-    covering = df[(df["segment_start"] <= t_end + margin) &
-                  (df["segment_end"]   >= t_start - margin)]
-    if covering.empty:
-        return None
-    return " ".join(str(t) for t in covering.sort_values("segment_start")["segment_text"])
+    sm = difflib.SequenceMatcher(None, whisper_tokens, caption_tokens, autojunk=False)
+    mapping = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        run_len = i2 - i1
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                w_idx, c_idx = i1 + offset, j1 + offset
+                dt = abs(whisper_times[w_idx] - caption_times[c_idx])
+                mapping[w_idx] = {"caption_word": caption_tokens[c_idx], "tag": "equal",
+                                   "timing_ok": dt <= ALIGNMENT_TIMING_TOLERANCE, "run_len": run_len}
+        elif tag == "replace":
+            span_w, span_c = i2 - i1, j2 - j1
+            # Best-effort positional pairing within the replaced block --
+            # a genuine word-for-word substitution (e.g. colloquial ->
+            # formal normalization of the same word count) lines up
+            # cleanly this way. Extra whisper words beyond the shorter
+            # side of an uneven block have no clean partner and are left
+            # unmapped rather than forced onto a guess.
+            for offset in range(span_w):
+                w_idx = i1 + offset
+                if offset < span_c:
+                    c_idx = j1 + offset
+                    dt = abs(whisper_times[w_idx] - caption_times[c_idx])
+                    mapping[w_idx] = {"caption_word": caption_tokens[c_idx], "tag": "replace",
+                                       "timing_ok": dt <= ALIGNMENT_TIMING_TOLERANCE, "run_len": run_len}
+                else:
+                    mapping[w_idx] = {"caption_word": None, "tag": "replace_unmatched_length",
+                                       "timing_ok": None, "run_len": run_len}
+        elif tag == "delete":
+            for offset in range(i2 - i1):
+                w_idx = i1 + offset
+                mapping[w_idx] = {"caption_word": None, "tag": "delete",
+                                   "timing_ok": None, "run_len": run_len}
+        # "insert" blocks have no whisper-side indices to attach evidence
+        # to -- caption has an extra word Whisper never produced at all.
+    return mapping
+
+
+def find_whisper_index(words_df_sorted, target_norm, t_end, tolerance=0.05):
+    """Locates the whisper-stream position (row position in the SAME sort
+    order build_whisper_token_stream used) of the specific word a
+    mutation row is about, by matching on its own recorded end-timestamp
+    (precise to the millisecond in words_*.csv) plus the word text
+    itself -- not by assuming any fixed relationship between the
+    mutations CSV's row order and the words CSV's row order."""
+    matches = words_df_sorted.index[
+        (abs(words_df_sorted["word_end"] - t_end) <= tolerance) &
+        (words_df_sorted["word"].apply(lambda w: normalize_word(w) == target_norm))
+    ]
+    return int(matches[0]) if len(matches) else None
+
+
+def local_window_text(tokens, center_idx, window=6):
+    """Small text window around a token index, for the POS-struggle proxy
+    (rule 2) -- that check just needs "does the local grammar look
+    sensible", not a precise segment boundary."""
+    if center_idx is None:
+        return ""
+    lo, hi = max(0, center_idx - window), min(len(tokens), center_idx + window + 1)
+    return " ".join(tokens[lo:hi])
 
 
 def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
     """The actual reinforcement pass: applies rules 1-3 to every row of a
     mutations_*.csv against the matching captions CSV (from a prior
-    fetch_captions.py run) and the video's own segments_*.csv, and writes
+    fetch_captions.py run) and the video's own words_*.csv, and writes
     the result back with new columns added.
 
     Deliberately additive-only: NEVER touches status/is_erosion/
@@ -396,13 +520,35 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
     pipeline mechanism) so they route into manual_editing.py's queue for
     a human decision, same as everything else that needs one.
     """
+def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=None):
+    """The actual reinforcement pass: applies rules 1-3 to every row of a
+    mutations_*.csv against the matching captions CSV (from a prior
+    fetch_captions.py run) and the video's own words_*.csv, and writes
+    the result back with new columns added.
+
+    Deliberately additive-only: NEVER touches status/is_erosion/
+    mutation_found/expected_mutation -- those are the pipeline's actual
+    classification and shouldn't be silently rewritten by a second-opinion
+    pass. Rows worth a second look get flagged=True (the existing
+    pipeline mechanism) so they route into manual_editing.py's queue for
+    a human decision, same as everything else that needs one.
+
+    cap_kind: "manual" or "automatic" if known (see download_captions's
+    return value) -- persisted as its own column so downstream analysis
+    can weigh a caption disagreement differently depending on whether it
+    came from a human caption author (who may deliberately normalize
+    colloquial speech toward standard written Welsh -- see module
+    docstring) or YouTube's automatic ASR (a second machine guess, not an
+    editorial choice). This function doesn't act on that distinction
+    itself; it just makes sure it isn't lost by the time anyone wants to.
+    """
     mutations_csv_path = Path(mutations_csv_path)
     captions_csv_path  = Path(captions_csv_path)
 
-    seg_path = find_segments_csv(mutations_csv_path)
-    if seg_path is None:
-        print(f"Couldn't find a matching segments_*.csv for {mutations_csv_path.name} "
-              f"-- can't corroborate without the Whisper segment text.")
+    words_path = find_words_csv(mutations_csv_path)
+    if words_path is None:
+        print(f"Couldn't find a matching words_*.csv for {mutations_csv_path.name} "
+              f"-- can't corroborate without per-word Whisper timestamps.")
         sys.exit(1)
 
     if nlp is None:
@@ -412,181 +558,192 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
             warnings.simplefilter("ignore")
             nlp = spacy.load("cy_ud_cy_ccg")
 
-    whisper_df = pd.read_csv(seg_path, encoding="utf-8-sig").sort_values("segment_start").reset_index(drop=True)
-    caption_df = pd.read_csv(captions_csv_path, encoding="utf-8-sig").sort_values("segment_start").reset_index(drop=True)
+    words_df   = pd.read_csv(words_path, encoding="utf-8-sig")
+    caption_df = pd.read_csv(captions_csv_path, encoding="utf-8-sig")
     mut_df     = pd.read_csv(mutations_csv_path, encoding="utf-8-sig")
 
     new_cols = {c: [] for c in (
-        "caption_available", "caption_segment_match_ratio", "caption_word",
-        "caption_word_alignment", "pos_struggle_whisper", "pos_struggle_caption",
-        "caption_corroboration", "caption_flag_reason",
+        "caption_available", "caption_word", "caption_alignment_tag",
+        "caption_alignment_confidence", "pos_struggle_whisper",
+        "pos_struggle_caption", "caption_corroboration", "caption_flag_reason",
     )}
     counts = Counter()
+
+    if words_df.empty or caption_df.empty:
+        for _ in range(len(mut_df)):
+            for c in new_cols:
+                new_cols[c].append(None)
+            counts["no_caption"] += 1
+        for c, vals in new_cols.items():
+            mut_df[c] = vals
+        mut_df["caption_kind"] = cap_kind
+        mut_df.to_csv(mutations_csv_path, index=False, encoding="utf-8-sig")
+        print("No usable words/captions data -- nothing corroborated.")
+        return
+
+    # Build both whole-video token streams and align them ONCE -- not
+    # per mutation row. See align_whole_video's docstring for the full
+    # reasoning behind this replacing the old per-row segment-window
+    # comparison.
+    whisper_tokens, whisper_times, words_df_sorted = build_whisper_token_stream(words_df)
+    caption_tokens, caption_times = build_caption_token_stream(caption_df)
+    alignment_map = align_whole_video(whisper_tokens, whisper_times, caption_tokens, caption_times)
 
     for _, row in mut_df.iterrows():
         m = TIMESTAMP_RE.search(str(row.get("timestamp", "")))
         if not m:
             for c in new_cols:
                 new_cols[c].append(None)
+            new_cols["caption_corroboration"][-1] = "no_timestamp"
             counts["no_timestamp"] += 1
             continue
         t_start, t_end = float(m.group(1)), float(m.group(2))
+        target_norm = normalize_word(row.get("following_word", ""))
 
-        # PATCH: previously took a single row from each df via
-        # covering_segment() and compared just that row's segment_text.
-        # Whisper's and the caption track's segments are chunked by two
-        # completely independent processes and essentially never share
-        # boundaries, so a single-segment-to-single-segment comparison was
-        # frequently comparing differently-sized slices of the same
-        # speech (see covering_segments_text's docstring for the full
-        # reasoning and the confirmed real-world fall-through rate this
-        # was causing). Pooling every segment within a shared time window
-        # on both sides gives a fair, boundary-independent comparison.
-        whisper_text = covering_segments_text(whisper_df, t_start, t_end)
-        caption_text = covering_segments_text(caption_df, t_start, t_end)
-
-        # Rule 1, part a: no caption at all for this stretch -- Whisper is
-        # the only source, not "the winner" of a comparison that never
-        # happened. Tracked separately from an active mismatch below.
-        if whisper_text is None or caption_text is None:
-            new_cols["caption_available"].append(False)
-            new_cols["caption_segment_match_ratio"].append(None)
-            new_cols["caption_word"].append(None)
-            new_cols["caption_word_alignment"].append(None)
-            new_cols["pos_struggle_whisper"].append(None)
-            new_cols["pos_struggle_caption"].append(None)
-            new_cols["caption_corroboration"].append("no_caption")
-            new_cols["caption_flag_reason"].append(None)
-            counts["no_caption"] += 1
+        # PATCH: previously found the target word by re-tokenizing a
+        # local text window and calling .index() on it -- fragile if the
+        # word repeats in that window. Now locates it directly in
+        # words_*.csv by its own recorded end-timestamp (millisecond
+        # precision) plus the word text, which is unambiguous.
+        w_idx = find_whisper_index(words_df_sorted, target_norm, t_end)
+        if w_idx is None:
+            for c in new_cols:
+                new_cols[c].append(None)
+            new_cols["caption_corroboration"][-1] = "no_alignment"
+            counts["no_alignment"] += 1
             continue
 
-        ratio = segment_match_ratio(whisper_text, caption_text)
+        evidence     = alignment_map.get(w_idx)
+        caption_word = evidence["caption_word"] if evidence else None
+        align_tag    = evidence["tag"] if evidence else "not_found"
+        timing_ok    = evidence["timing_ok"] if evidence else None
+        run_len      = evidence["run_len"] if evidence else 0
+        # Confidence: a match sitting inside a longer run of consecutive
+        # agreement (run_len >= NEIGHBOR_CORROBORATION_MIN_RUN) is
+        # trusted more than an isolated one-word coincidence -- see
+        # module-level note on the "wrong occurrence of a common word"
+        # risk this guards against.
+        if caption_word is None:
+            confidence = None
+        elif timing_ok is False:
+            confidence = "rejected"
+        elif run_len >= NEIGHBOR_CORROBORATION_MIN_RUN:
+            confidence = "high"
+        else:
+            confidence = "low"
 
-        # Rule 1, part b: caption present but substantially different --
-        # Whisper wins by default, but this is recorded as an active
-        # disagreement, not an absence, since the two are NOT the same
-        # thing for auditing corpus reliability later.
-        if ratio < MISMATCH_RATIO_THRESHOLD:
-            new_cols["caption_available"].append(True)
-            new_cols["caption_segment_match_ratio"].append(round(ratio, 3))
-            new_cols["caption_word"].append(None)
-            new_cols["caption_word_alignment"].append(None)
-            new_cols["pos_struggle_whisper"].append(None)
-            new_cols["pos_struggle_caption"].append(None)
-            new_cols["caption_corroboration"].append("segment_mismatch_too_large")
-            new_cols["caption_flag_reason"].append(None)
-            counts["segment_mismatch_too_large"] += 1
-            continue
+        # Rule 2: local grammaticality proxy on a small word window
+        # around the target, instead of a whole (arbitrarily-bounded)
+        # segment -- doesn't need precise boundaries, just "does the
+        # neighborhood parse sensibly".
+        whisper_local = local_window_text(whisper_tokens, w_idx)
+        struggle_w = pos_struggle_score(nlp, whisper_local)
+        struggle_c = None
+        caption_local = ""
+        if caption_word is not None:
+            same_word_positions = [i for i, t in enumerate(caption_tokens) if t == caption_word]
+            if same_word_positions:
+                c_idx = min(same_word_positions, key=lambda i: abs(caption_times[i] - t_end))
+                caption_local = local_window_text(caption_tokens, c_idx)
+                struggle_c = pos_struggle_score(nlp, caption_local)
 
-        # Rule 2: does Whisper's own text parse worse than the caption's?
-        struggle_w = pos_struggle_score(nlp, whisper_text)
-        struggle_c = pos_struggle_score(nlp, caption_text)
         flag_reasons = []
-        if struggle_w > POS_STRUGGLE_X_RATE and (struggle_w - struggle_c) >= POS_STRUGGLE_MARGIN:
+        if struggle_c is not None and struggle_w > POS_STRUGGLE_X_RATE and (struggle_w - struggle_c) >= POS_STRUGGLE_MARGIN:
             flag_reasons.append(
-                f"Whisper segment POS-struggle={struggle_w:.2f} vs caption={struggle_c:.2f} "
+                f"Whisper local POS-struggle={struggle_w:.2f} vs caption={struggle_c:.2f} "
                 f"-- caption parses more cleanly, worth a manual reparse"
             )
 
-        # Rule 3: word-level alignment + candidate-set gating at the
+        def _record(corroboration, extra_flags=None):
+            counts[corroboration] += 1
+            new_cols["caption_available"].append(caption_word is not None)
+            new_cols["caption_word"].append(caption_word)
+            new_cols["caption_alignment_tag"].append(align_tag)
+            new_cols["caption_alignment_confidence"].append(confidence)
+            new_cols["pos_struggle_whisper"].append(round(struggle_w, 3))
+            new_cols["pos_struggle_caption"].append(round(struggle_c, 3) if struggle_c is not None else None)
+            new_cols["caption_corroboration"].append(corroboration)
+            all_flags = flag_reasons + (extra_flags or [])
+            new_cols["caption_flag_reason"].append("; ".join(all_flags) if all_flags else None)
+
+        # Rule 1a: no caption content aligned to this word at all --
+        # "delete" means SequenceMatcher concluded, after resolving
+        # everything around it, that the caption genuinely has nothing
+        # here (your "Cymru -> (Nothing)" case). Distinct from simply
+        # never having found the word at all.
+        if caption_word is None:
+            _record("caption_omits_word" if align_tag == "delete" else "no_alignment")
+            continue
+
+        # Rule 1b: content matched somewhere, but the timing sanity check
+        # says it's implausibly far from this word's real timestamp --
+        # most likely the algorithm anchored to the WRONG occurrence of a
+        # common word elsewhere in the video, not a real alignment. Not
+        # trusted as evidence either way.
+        if timing_ok is False:
+            _record("alignment_timing_implausible", [
+                f"Caption word '{caption_word}' matched by content but its timing is "
+                f"implausibly far from this word's timestamp -- likely aligned to the "
+                f"wrong occurrence of a common word, not trusted."
+            ])
+            continue
+
+        # Rule 3: word-level agreement + candidate-set gating at the
         # specific target word this row is about.
-        whisper_tokens = [normalize_word(w) for w in whisper_text.split()]
-        caption_tokens = [normalize_word(w) for w in caption_text.split()]
-        target_norm = normalize_word(row.get("following_word", ""))
+        if caption_word == target_norm:
+            _record("confirmed_match")
+            continue
 
-        caption_word, alignment = None, None
-        try:
-            target_index = whisper_tokens.index(target_norm)
-        except ValueError:
-            target_index = None
+        lemma = row.get("lemma") or target_norm
+        candidates = generate_mutation_candidates(lemma)
+        if caption_word not in candidates:
+            # Not a valid mutated/radical form of this lemma at all
+            # (e.g. caption 'dath' vs lemma 'cath') -- ASR/caption noise
+            # unrelated to mutation, not evidence either way.
+            _record("caption_word_not_lemma_candidate")
+            continue
 
-        if target_index is None:
-            corroboration = "no_alignment"
-        else:
-            caption_word, alignment = align_target_word(whisper_tokens, caption_tokens, target_index)
-            if caption_word is None:
-                corroboration = "no_alignment"
-            elif caption_word == target_norm:
-                corroboration = "confirmed_match"
+        if differs_only_in_initial(target_norm, caption_word):
+            # Exactly the mutation-site position. Don't let the caption
+            # overrule Whisper here -- this IS the phenomenon being
+            # measured. But "don't overrule" isn't "don't distinguish" --
+            # the four caption/Whisper combinations at this site carry
+            # different evidential weight and get their own labels rather
+            # than being collapsed into one bucket.
+            caption_mut_type   = candidates[caption_word]
+            caption_is_mutated = caption_mut_type != "radical"
+            whisper_mutation_found = str(row.get("mutation_found", "none"))
+            whisper_is_mutated = whisper_mutation_found != "none"
+
+            if caption_is_mutated and not whisper_is_mutated:
+                _record("confirms_erosion")
+            elif not caption_is_mutated and whisper_is_mutated:
+                _record("caption_disputes_mutation", [
+                    f"Caption shows radical '{caption_word}' where Whisper "
+                    f"found a {whisper_mutation_found} mutation -- Whisper's "
+                    f"mutation call may be spurious, worth a listen."
+                ])
+            elif caption_is_mutated and whisper_is_mutated:
+                _record("confirms_mutation_present")
             else:
-                lemma = row.get("lemma") or target_norm
-                candidates = generate_mutation_candidates(lemma)
-                if caption_word not in candidates:
-                    # Not a valid mutated/radical form of this lemma at
-                    # all (e.g. caption 'dath' vs lemma 'cath') -- ASR/
-                    # caption noise unrelated to mutation, not evidence
-                    # either way.
-                    corroboration = "caption_word_not_lemma_candidate"
-                elif differs_only_in_initial(target_norm, caption_word):
-                    # Exactly the mutation-site position. Per the
-                    # discussion: don't let the caption overrule Whisper
-                    # here -- this IS the phenomenon being measured. But
-                    # "don't overrule" isn't the same as "don't
-                    # distinguish" -- the four caption/Whisper
-                    # combinations at this site carry different evidential
-                    # weight and get their own labels rather than being
-                    # collapsed into one bucket.
-                    caption_mut_type = candidates[caption_word]
-                    caption_is_mutated = caption_mut_type != "radical"
-                    whisper_mutation_found = str(row.get("mutation_found", "none"))
-                    whisper_is_mutated = whisper_mutation_found != "none"
-
-                    if caption_is_mutated and not whisper_is_mutated:
-                        # Caption shows the mutated form where Whisper
-                        # heard radical -- caption agrees the mutated
-                        # form was expected, so Whisper's radical is more
-                        # likely genuine erosion, not a mishearing.
-                        corroboration = "confirms_erosion"
-                    elif not caption_is_mutated and whisper_is_mutated:
-                        # Mirror case: caption shows radical where
-                        # Whisper found a mutation. Captions normally
-                        # normalize TOWARD the mutated form in an
-                        # obligatory-mutation environment, so a caption
-                        # showing radical here runs against that drift --
-                        # worth flagging that Whisper's mutation call may
-                        # be spurious, not just noting it and moving on.
-                        corroboration = "caption_disputes_mutation"
-                        flag_reasons.append(
-                            f"Caption shows radical '{caption_word}' where Whisper "
-                            f"found a {whisper_mutation_found} mutation -- Whisper's "
-                            f"mutation call may be spurious, worth a listen."
-                        )
-                    elif caption_is_mutated and whisper_is_mutated:
-                        # Agreement: both show a mutated form. Not
-                        # erosion-relevant (there's no erosion here to
-                        # confirm or dispute), but real corroboration --
-                        # kept distinct from the radical/radical case
-                        # below rather than merged into one "agrees" bucket.
-                        corroboration = "confirms_mutation_present"
-                    else:
-                        # Agreement: both show radical. Genuine support
-                        # for Whisper's "no mutation" call, not just an
-                        # unexamined default.
-                        corroboration = "confirms_no_mutation"
-                else:
-                    # Mismatch OUTSIDE the mutation site -- a genuine
-                    # phoneme-level ASR mishearing, not the thing under
-                    # study. Caption takes priority per the rule as
-                    # discussed; flagged rather than silently applied.
-                    corroboration = "caption_disagrees_non_initial"
-                    flag_reasons.append(
-                        f"Caption word '{caption_word}' disagrees with Whisper's "
-                        f"'{target_norm}' beyond just the mutation site -- likely "
-                        f"an ASR mishearing elsewhere in the word, worth a listen."
-                    )
-
-        counts[corroboration] += 1
-        new_cols["caption_available"].append(True)
-        new_cols["caption_segment_match_ratio"].append(round(ratio, 3))
-        new_cols["caption_word"].append(caption_word)
-        new_cols["caption_word_alignment"].append(alignment)
-        new_cols["pos_struggle_whisper"].append(round(struggle_w, 3))
-        new_cols["pos_struggle_caption"].append(round(struggle_c, 3))
-        new_cols["caption_corroboration"].append(corroboration)
-        new_cols["caption_flag_reason"].append("; ".join(flag_reasons) if flag_reasons else None)
+                _record("confirms_no_mutation")
+        else:
+            # Mismatch OUTSIDE the mutation site. For manual captions
+            # this could be a genuine editorial rewording (see module
+            # docstring); for automatic captions it's most likely just a
+            # second ASR system's own mishearing. Either way it's a real
+            # phoneme-level disagreement, not the mutation phenomenon
+            # itself -- flagged rather than silently applied.
+            _record("caption_disagrees_non_initial", [
+                f"Caption word '{caption_word}' disagrees with Whisper's "
+                f"'{target_norm}' beyond just the mutation site -- likely an ASR "
+                f"mishearing, or (if manual captions) a genuine editorial "
+                f"rewording -- worth a listen."
+            ])
 
     for c, vals in new_cols.items():
         mut_df[c] = vals
+    mut_df["caption_kind"] = cap_kind
 
     if "flagged" not in mut_df.columns:
         mut_df["flagged"] = False
@@ -628,12 +785,16 @@ def main():
                      help="the parsed captions CSV to corroborate against (the .csv "
                           "written next to a .vtt by a prior fetch run). Required with "
                           "--corroborate.")
+    ap.add_argument("--caption-kind", choices=["manual", "automatic"], default=None,
+                     help="whether --captions-csv came from a manual or automatic track "
+                          "(printed by a prior fetch run) -- optional, persisted as its "
+                          "own column if given.")
     args = ap.parse_args()
 
     if args.corroborate:
         if not args.captions_csv:
             ap.error("--corroborate requires --captions-csv PATH (from a prior fetch run)")
-        run_corroboration(Path(args.corroborate), Path(args.captions_csv))
+        run_corroboration(Path(args.corroborate), Path(args.captions_csv), cap_kind=args.caption_kind)
         return
 
     if not args.url:

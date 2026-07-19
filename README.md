@@ -19,7 +19,13 @@ figures.
 ## Setup
 
 1. Install Python 3.11 or newer and FFmpeg, ensuring both are available on
-   your command line.
+   your command line. Stick to Python 3.11-3.12 if you can -- pandas,
+   matplotlib, and seaborn (and the wider scientific-Python stack under
+   them) can lag behind the newest Python release by months before
+   publishing prebuilt wheels for it, and installing on a Python version
+   without wheels yet either fails outright or silently falls back to
+   building from source, which needs a C compiler toolchain most machines
+   don't have set up.
 2. Create and activate a virtual environment.
 3. Install the Python dependencies with `python -m pip install -r requirements.txt`.
 4. Install the Welsh spaCy model `cy_ud_cy_ccg` compatible with your spaCy
@@ -70,7 +76,12 @@ run on its own from the command line.
 automatically at the right point in the main workflow):**
 
 - `fetch_captions.py` -- downloads a video's YouTube captions and checks
-  them against a mutations CSV already produced for that video.
+  them against a mutations CSV already produced for that video. Aligns
+  the whole video's Whisper word stream (from `words_*.csv`, which has
+  per-word timestamps) against the whole caption track in one pass,
+  rather than comparing small time windows -- more robust to Whisper's
+  and the caption track's segments being chunked completely
+  independently of each other.
 - `manual_editing.py` -- an interactive terminal tool for reviewing
   mutation rows one at a time: confirm or overturn each finding, flag
   anything uncertain, leave notes, search, or just skim a summary.
@@ -142,16 +153,20 @@ more) for narrowing the queue before you start.
 ## Where your data ends up
 
 Everything lives under `WELSH_ANALYSIS_DIR` (or `~/welsh_analysis` if you
-didn't set that variable). Each video gets its own subfolder, named from
-the run timestamp and the video title, holding all of that video's output
-together:
+didn't set that variable). The full folder layout is created up front on
+every run (not lazily, one folder at a time, as each menu option first
+needs it), so you'll see all of it even before you've used every menu
+option:
 
 ```
 WELSH_ANALYSIS_DIR/
 ├── audio/                                  downloaded/local MP3s
+├── test_audio/                             drop local MP3s here for option 1
+├── captions/                               downloaded .vtt + parsed .csv caption files
 ├── transcriptions/<stamp>_<video-title>/
 │   ├── segments_<stamp>_<video-title>.csv  Whisper's segment-level transcript
-│   ├── words_<stamp>_<video-title>.csv     word-level transcript + POS tags
+│   ├── words_<stamp>_<video-title>.csv     word-level transcript + POS tags + per-word
+│   │                                        timestamps (what caption corroboration aligns against)
 │   ├── lemmas_<stamp>_<video-title>.csv
 │   └── pos_<stamp>_<video-title>.csv
 ├── mutations/<stamp>_<video-title>/
@@ -159,11 +174,18 @@ WELSH_ANALYSIS_DIR/
 │   │                                               manual_editing.py and corpus_analyzer.py read
 │   └── mutations_..._precaption_backup.csv        only present if captions were fetched --
 │                                                    a one-time pre-corroboration safety copy
-├── summaries/                              figures + text summaries from option 6
+├── summaries/                              per-run CSV summaries written by option 3 itself
+│                                              (research_summary/, erosion_by_trigger_type/,
+│                                              erosion_by_rule/), not option 6
+├── analysis/                               option 6's output: merged_mutations.csv,
+│   └── figures/                              utterance_export.csv, and chart images
 ├── video_queue.json                        pending videos (option 2 adds, option 3 consumes)
 ├── processed_videos.json                   videos already handled by option 3
 ├── processed_local_mp3s.json               local files already handled by option 1
-└── failed_videos.json                      videos that errored, with retry count
+├── failed_videos.json                      videos that errored, with retry count
+└── lemma_cache.json                        word -> lemma lookups, cached across every run so
+                                              repeat words (very common in Welsh function words)
+                                              don't re-hit the Cysill API or simplemma every time
 ```
 
 If you see a `_precaption_backup.csv` next to a video's main mutations

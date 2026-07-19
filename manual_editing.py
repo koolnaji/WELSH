@@ -116,11 +116,16 @@ from pathlib import Path
 
 import pandas as pd
 
-# Same locations mutation_engine.py uses -- duplicated, not imported,
-# per this project's existing standalone-script convention (see alaw.py).
-BASE_DIR  = Path.home() / "Documents" / "welsh_analysis"
-TRANS_DIR = BASE_DIR / "transcriptions"
-MUT_DIR   = BASE_DIR / "mutations"
+# PATCH: previously duplicated BASE_DIR by hand here (Path.home() /
+# "Documents" / "welsh_analysis") per this project's old
+# standalone-script convention -- but that convention is exactly what let
+# this drift silently out of sync with mutation_engine.py's actual
+# BASE_DIR (which honors WELSH_ANALYSIS_DIR, falling back to
+# Path.home() / "welsh_analysis", no "Documents"). This script still runs
+# standalone from the command line same as before; importing the path
+# constants doesn't change that, it just means there's one definition of
+# where the data lives instead of two that can quietly disagree.
+from mutation_engine import BASE_DIR, TRANS_DIR, MUT_DIR
 
 # The boolean column this script edits. "is_mutation" in casual conversation
 # maps to "is_erosion" in the actual CSV -- change this if that's wrong.
