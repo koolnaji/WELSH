@@ -113,10 +113,17 @@ from cysill_client import (
 # contaminating the "informal Welsh" bucket with non-Welsh audio.
 #
 # "unverified" register: channel is plausibly Welsh-medium but its actual
-# language mix hasn't been spot-checked yet. Don't fold these into either
-# side of a formal/informal comparison until checked -- see BBC Cymru Wales
-# below, which is a general bilingual channel (TV/Radio/Online), not
-# confirmed Welsh-medium.
+# language mix hasn't been spot-checked yet. Don't fold these into any
+# side of a formal/informal/casual comparison until checked -- see BBC
+# Cymru Wales below, which is a general bilingual channel (TV/Radio/
+# Online), not confirmed Welsh-medium.
+#
+# Register scale, most to least formal: formal (BBC Radio Cymru) >
+# informal (Hansh / Rownd a Rownd / S4C -- produced but informal) >
+# casual (fully spontaneous, unscripted peer conversation -- e.g.
+# podcasts like Haclediad). Casual sources currently only enter via the
+# local-MP3 path (option 1's register prompt in welsh_pipeline.py), not
+# CURATED_CHANNELS, since none of these are YouTube channels yet.
 CURATED_CHANNELS = [
     {"url": "https://www.youtube.com/c/HanshS4C/videos",   "channel_register": "informal"},
     {"url": "https://www.youtube.com/@RowndaRownd/videos", "channel_register": "informal"},
@@ -569,10 +576,17 @@ def expand_whisper_tokens(raw_words):
         if surface in WELSH_CONTRACTION_SPLITS:
             parts = WELSH_CONTRACTION_SPLITS[surface]
             for idx, part in enumerate(parts):
+                is_last = idx == len(parts) - 1
                 expanded.append({
                     **w,
                     "word":      part,
                     "synthetic": idx > 0,   # only first sub-token has real timestamp
+                    # PATCH: only the last sub-token was actually followed
+                    # by whatever punctuation the original whole word had;
+                    # earlier sub-tokens are immediately followed by the
+                    # next sub-token of the SAME original word, never a
+                    # real boundary.
+                    "_clause_boundary_after": w.get("_clause_boundary_after", False) if is_last else False,
                 })
         elif surface == "'n":
             # Whisper already split it off as its own token -- just
@@ -581,9 +595,12 @@ def expand_whisper_tokens(raw_words):
             expanded.append({**w, "word": "yn", "synthetic": False})
         elif surface.endswith("'n") and len(surface) > 2:
             # Fused "X'n" token (e.g. "mae'n") -- split into stem + "yn",
-            # both real (non-synthetic) tokens.
+            # both real (non-synthetic) tokens. Same boundary-ownership
+            # logic as above: only "yn" (the last sub-token) can have
+            # actually been followed by trailing punctuation.
             stem = surface[:-2]
-            expanded.append({**w, "word": stem, "synthetic": False})
+            expanded.append({**w, "word": stem, "synthetic": False,
+                              "_clause_boundary_after": False})
             expanded.append({**w, "word": "yn", "synthetic": False})
         else:
             expanded.append({**w, "synthetic": False})
@@ -617,9 +634,27 @@ def preprocess_segment(seg, seg_id=None):
     """
     raw_words = []
     for w in seg.words:
-        surface = w.word.strip().strip(".,!?;:\"()[]")
+        original = w.word.strip()
+        surface = original.strip(".,!?;:\"()[]")
         if not surface:
             continue
+        # PATCH: record whether this word was immediately followed by
+        # clause/list-boundary punctuation in Whisper's own output,
+        # BEFORE that punctuation gets stripped off below and lost
+        # forever. Without this, "roi pob ffaith, pob myth" collapses to
+        # a flat token sequence [..., "ffaith", "pob", "myth", ...] with
+        # nothing distinguishing the comma-separated "pob myth" (a new,
+        # unrelated list item) from a genuine adjacent word -- confirmed
+        # live: Layer 1C (fem_noun+adjective) fired treating "ffaith" as
+        # trigger and the NEXT list item's leading "pob" as its target
+        # adjective, purely because "pob" happened to sit at
+        # words_list[i+1] and got POS-tagged in a way that matched, with
+        # no awareness a comma (i.e. a clause/list boundary, not a real
+        # adjective relationship) separated them. Internal bookkeeping
+        # only, same convention as _seg_id -- never leaks into any CSV
+        # column, output rows are built from explicit key-selection
+        # dicts elsewhere.
+        clause_boundary_after = original.rstrip().endswith((",", ";", ":", "."))
         raw_words.append({
             "word":       surface,
             "start":      round(w.start, 3),
@@ -627,6 +662,7 @@ def preprocess_segment(seg, seg_id=None):
             "confidence": round(w.probability, 4),
             "synthetic":  False,
             "_seg_id":    seg_id,
+            "_clause_boundary_after": clause_boundary_after,
         })
     return expand_whisper_tokens(raw_words)
 
@@ -2051,6 +2087,18 @@ def process_comprehensive_mutations(words_list):
         conf_current  = current_node.get("confidence", 0.0)
         spacy_tok     = current_node.get("spacy_token")
         gender        = current_node.get("gender")
+        # PATCH: True when current_node was immediately followed by a
+        # comma/semicolon/colon/period in the original transcript --
+        # i.e. words_list[i+1] is NOT actually grammatically adjacent to
+        # current_node, it just happens to sit next to it in the flat
+        # token list because the punctuation marking a clause/list
+        # boundary between them got stripped out during preprocessing
+        # with nothing recording that it was ever there. See
+        # preprocess_segment's _clause_boundary_after for the full
+        # reasoning and the confirmed live false-positive this fixes
+        # ("roi pob ffaith, pob myth" wrongly treating the next list
+        # item's "pob" as an adjective following "ffaith").
+        no_clause_boundary = not current_node.get("_clause_boundary_after")
 
         if conf_current < 0.65 or len(norm_current) <= 1:
             i += 1
@@ -2087,7 +2135,7 @@ def process_comprehensive_mutations(words_list):
             continue
 
         # ---- Layer 1B: definite article + feminine noun → soft_limited ----
-        if norm_current in DEFINITE_ARTICLE_FORMS and i + 1 < len(words_list):
+        if norm_current in DEFINITE_ARTICLE_FORMS and no_clause_boundary and i + 1 < len(words_list):
             row = _process_gender_trigger(
                 current_node, words_list[i + 1], ["soft_limited"],
                 norm_current, "definite_article+fem_noun", "feminine", True,
@@ -2109,7 +2157,7 @@ def process_comprehensive_mutations(words_list):
         if gender == "feminine" and trigger_number != "plural" and \
                 (spacy_pos in ("NOUN", "PROPN") or
                 cysill_pos.split("+")[0].startswith("N")) and \
-                i + 1 < len(words_list):
+                no_clause_boundary and i + 1 < len(words_list):
             next_node = words_list[i + 1]
             nsp = next_node.get("spacy_token", {}).get("pos", "") if next_node.get("spacy_token") else ""
             ncp = next_node.get("cysill_pos") or ""
@@ -2141,7 +2189,7 @@ def process_comprehensive_mutations(words_list):
                     continue
 
         # ---- Layer 1D: un + feminine noun → soft_limited ----
-        if norm_current in NUMERAL_FEM_SOFT_LIMITED_TRIGGERS and i + 1 < len(words_list):
+        if norm_current in NUMERAL_FEM_SOFT_LIMITED_TRIGGERS and no_clause_boundary and i + 1 < len(words_list):
             row = _process_gender_trigger(
                 current_node, words_list[i + 1], ["soft_limited"],
                 norm_current, "numeral+fem_noun", "feminine", True)
@@ -2151,7 +2199,7 @@ def process_comprehensive_mutations(words_list):
                 continue
 
         # ---- Layer 1E: dau/dwy + any noun → soft ----
-        if norm_current in NUMERAL_GENERAL_SOFT_TRIGGERS and i + 1 < len(words_list):
+        if norm_current in NUMERAL_GENERAL_SOFT_TRIGGERS and no_clause_boundary and i + 1 < len(words_list):
             next_node = words_list[i + 1]
             nsp = next_node.get("spacy_token", {}).get("pos", "") if next_node.get("spacy_token") else ""
             ncp = next_node.get("cysill_pos") or ""
@@ -2165,7 +2213,7 @@ def process_comprehensive_mutations(words_list):
                     continue
 
         # ---- Layer 1F: restricted nasal numerals ----
-        if norm_current in NASAL_NUMERAL_TRIGGERS and i + 1 < len(words_list):
+        if norm_current in NASAL_NUMERAL_TRIGGERS and no_clause_boundary and i + 1 < len(words_list):
             next_node  = words_list[i + 1]
             next_norm = normalize_word(next_node["word"])
             next_lemma_for_cs = get_welsh_lemma(next_norm)
@@ -2191,7 +2239,7 @@ def process_comprehensive_mutations(words_list):
         # ---- Layer 1G: feminine ordinal + noun → soft ----
         is_fem_ordinal = (cysill_pos.startswith("ORDF") or
                           (spacy_tok and spacy_tok.get("pos") == "ADJ" and gender == "feminine"))
-        if is_fem_ordinal and i + 1 < len(words_list):
+        if is_fem_ordinal and no_clause_boundary and i + 1 < len(words_list):
             row = _process_gender_trigger(
                 current_node, words_list[i + 1], ["soft"],
                 norm_current, "feminine_ordinal+noun", None, True)
@@ -2210,7 +2258,7 @@ def process_comprehensive_mutations(words_list):
         if (norm_current in PREPOSED_ADJECTIVE_LEXICON and spacy_tok
                 and spacy_tok.get("pos") == "ADJ"
                 and spacy_tok.get("dep") == "amod"
-                and i + 1 < len(words_list)):
+                and no_clause_boundary and i + 1 < len(words_list)):
             next_node  = words_list[i + 1]
             next_raw   = normalize_word(next_node.get("word", ""))
             head_raw   = normalize_word(spacy_tok.get("head", ""))
@@ -2227,7 +2275,7 @@ def process_comprehensive_mutations(words_list):
         # PATCH (Bucket 3b): catches a known compound's components spoken
         # as two separate radical-form words instead of one fused,
         # correctly-mutated word (see COMPOUND_NOUN_SECOND_ELEMENT above).
-        if norm_current in COMPOUND_NOUN_SECOND_ELEMENT and i + 1 < len(words_list):
+        if norm_current in COMPOUND_NOUN_SECOND_ELEMENT and no_clause_boundary and i + 1 < len(words_list):
             next_node = words_list[i + 1]
             next_norm = normalize_word(next_node.get("word", ""))
             next_lemma = get_welsh_lemma(next_norm)

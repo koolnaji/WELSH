@@ -284,8 +284,9 @@ def main():
         print("5 = Manage queue")
         print("6 = Run corpus analyzer (figures + summary from all runs so far)")
         print("7 = Manually review mutations (manual_editing.py)")
+        print("8 = Re-run mutation rule(s) on already-transcribed videos (rerun_rules.py)")
         print("q = Quit")
-        choice = input("Enter 1, 2, 3, 4, 5, 6, 7, or q: ").strip().lower()
+        choice = input("Enter 1, 2, 3, 4, 5, 6, 7, 8, or q: ").strip().lower()
 
         if choice == "q":
             print("Goodbye!")
@@ -330,17 +331,21 @@ def main():
             print(f"Processing {len(pending_mp3_files)} new or changed file(s).")
             # PATCH: register isn't inferrable from a local filename, so ask
             # once up front and tag the whole batch -- assumes test_audio/
-            # is register-homogeneous per run. If you're mixing formal and
-            # informal local clips in the same folder, run this twice with
-            # different subsets instead of trusting one tag for all of them.
+            # is register-homogeneous per run. If you're mixing registers in
+            # the same folder, run this twice with different subsets instead
+            # of trusting one tag for all of them.
+            # Three-tier register scale, most to least formal:
+            # formal (e.g. BBC Radio Cymru) > informal (e.g. Hansh/S4C,
+            # produced-but-informal content) > casual (fully spontaneous,
+            # unscripted peer conversation -- e.g. podcasts like Haclediad).
             local_reg = input("  Channel register for this local batch "
-                              "(formal/informal/unverified) [unverified], or q to cancel: "
+                              "(formal/informal/casual/unverified) [unverified], or q to cancel: "
                               ).strip().lower() or "unverified"
             if local_reg == "q":
                 print("  Cancelled.")
                 save_lemma_cache()
                 continue
-            if local_reg not in ("formal", "informal", "unverified"):
+            if local_reg not in ("formal", "informal", "casual", "unverified"):
                 print(f"  Unrecognized register '{local_reg}', defaulting to 'unverified'.")
                 local_reg = "unverified"
             # PATCH: cancel check happens before the (slow, RAM-heavy) model
@@ -608,6 +613,44 @@ def main():
                 pass
             save_lemma_cache()
             continue   # skip video-processing summary + email -- nothing was processed here
+
+        elif choice == "8":
+            # PATCH: rerun_rules.py re-evaluates already-cached tagging data
+            # (re-parsing spaCy fresh per segment, reusing cached Cysill
+            # fields, never re-transcribing or re-hitting Cysill) after a
+            # change to a rule in mutation_engine.py or a table in
+            # mutation_tables.py -- see rerun_rules.py's module docstring
+            # for exactly what it does and doesn't touch. Unlike choice 7,
+            # this genuinely has no sensible default (there's no "just rerun
+            # everything" mode by design -- that's what choice 3 is for), so
+            # the filter has to be gathered here rather than falling through
+            # to a documented default the way manual_editing.py's does.
+            import rerun_rules
+            print("\nRe-run mutation rule(s) on already-transcribed videos.")
+            print("Leave both blank to cancel -- at least one is required.")
+            trig_input = input("Trigger word(s), comma-separated (e.g. yn,ei) [blank = any]: ").strip()
+            rule_input = input("Rule name(s), comma-separated (e.g. word_trigger) [blank = any]: ").strip()
+            if not trig_input and not rule_input:
+                print("Nothing specified -- cancelled.")
+                save_lemma_cache()
+                continue
+            video_input = input("Video folder-name substring to limit to [default: all]: ").strip() or "all"
+            mode_input = input("Write a comparison file first, or apply in place? "
+                               "(compare/apply) [compare]: ").strip().lower()
+            commit = mode_input == "apply"
+            if commit:
+                confirm = input("This will overwrite matching rows in the real mutations "
+                                "CSVs (manual-reviewed rows are always protected). "
+                                "Type 'yes' to continue: ").strip().lower()
+                if confirm != "yes":
+                    print("Cancelled -- nothing was written.")
+                    save_lemma_cache()
+                    continue
+            rerun_rules.run_rerun(trigger_arg=trig_input or None,
+                                   rule_arg=rule_input or None,
+                                   video=video_input, commit=commit)
+            save_lemma_cache()
+            continue   # skip video-processing summary + email -- nothing was transcribed here
 
         else:
             print("Unknown choice.")

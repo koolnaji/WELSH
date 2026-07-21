@@ -11,16 +11,24 @@ Usage:
 
 Output (all written to welsh_analysis/analysis/):
     - merged_mutations.csv          : all runs merged, deduped, with batch tag
+    Register axis is three-tier, most to least formal: formal (e.g. BBC
+    Radio Cymru) > informal (e.g. Hansh/S4C, produced-but-informal content)
+    > casual (fully spontaneous, unscripted peer conversation, e.g.
+    podcasts like Haclediad). One erosion_by_type/erosion_by_rule/
+    erosion_over_batches figure set is produced per tier:
     - figures/formal_erosion_by_type.png   : erosion rate per mutation type (formal register only)
     - figures/informal_erosion_by_type.png : erosion rate per mutation type (informal register only)
+    - figures/casual_erosion_by_type.png   : erosion rate per mutation type (casual register only)
     - figures/formal_erosion_by_rule.png   : erosion rate per detection rule (formal register only)
     - figures/informal_erosion_by_rule.png : erosion rate per detection rule (informal register only)
+    - figures/casual_erosion_by_rule.png   : erosion rate per detection rule (casual register only)
     - figures/erosion_by_channel.png: erosion rate per source channel
     - figures/codeswitch_by_channel.png: code-switch rate per channel
     - figures/status_distribution.png  : full status breakdown (stacked bar)
     - figures/tagger_agreement.png  : heuristic vs tagger agreement
     - figures/formal_erosion_over_batches.png   : erosion rate trend across runs (formal register only)
     - figures/informal_erosion_over_batches.png : erosion rate trend across runs (informal register only)
+    - figures/casual_erosion_over_batches.png   : erosion rate trend across runs (casual register only)
     - utterance_export.csv          : flat utterance-level rows for future joining
 """
 
@@ -499,10 +507,11 @@ def fig_erosion_by_type(df, register=None, filename_prefix=""):
     Excludes code-switch rows and phantom rows (no expected mutation type).
     Colour-coded per mutation type for consistency with other figures.
 
-    PATCH: takes an optional `register` filter ("formal" / "informal"), same
-    reasoning as fig_erosion_by_rule -- formal (BBC Radio Cymru) and informal
-    (Hansh / Rownd a Rownd / S4C) speech have different erosion baselines,
-    so this is called twice from main(), once per register.
+    PATCH: takes an optional `register` filter ("formal" / "informal" /
+    "casual"), same reasoning as fig_erosion_by_rule -- formal (BBC Radio
+    Cymru), informal (Hansh / Rownd a Rownd / S4C), and casual (fully
+    spontaneous unscripted speech, e.g. podcasts) have different erosion
+    baselines, so this is called once per register from main().
     """
     if "expected_mutation" not in df.columns or "is_erosion" not in df.columns:
         print(f"  [skip] {filename_prefix}erosion_by_type -- missing columns")
@@ -555,12 +564,13 @@ def fig_erosion_by_rule(df, register=None, filename_prefix=""):
     This is the figure that most directly shows which grammatical
     environments are most at risk -- key for the assimilation argument.
 
-    PATCH: takes an optional `register` filter ("formal" / "informal").
-    Formal (BBC Radio Cymru, scripted/edited) and informal (Hansh, Rownd a
-    Rownd, S4C -- spontaneous/colloquial) speech have structurally different
-    erosion baselines, so pooling them into one chart blurs exactly the
-    register contrast the research is trying to measure. Called twice from
-    main(), once per register, instead of once on the mixed pool.
+    PATCH: takes an optional `register` filter ("formal" / "informal" /
+    "casual"). Formal (BBC Radio Cymru, scripted/edited), informal (Hansh,
+    Rownd a Rownd, S4C -- produced but colloquial), and casual (fully
+    spontaneous unscripted peer speech, e.g. podcasts) have structurally
+    different erosion baselines, so pooling them into one chart blurs
+    exactly the register contrast the research is trying to measure.
+    Called once per register from main(), instead of once on the mixed pool.
     """
     if "rule" not in df.columns or "is_erosion" not in df.columns:
         print(f"  [skip] {filename_prefix}erosion_by_rule -- missing columns")
@@ -854,9 +864,10 @@ def fig_erosion_over_batches(df, batch_log, register=None, filename_prefix=""):
     Line chart: overall erosion rate per batch run, ordered chronologically.
     Lets you track whether successive corpus runs converge on a stable estimate.
 
-    PATCH: takes an optional `register` filter ("formal" / "informal"). A
-    single batch/run can mix videos from both registers (e.g. a queue that
-    pulled BBC Radio Cymru and Hansh videos together), so filtering by
+    PATCH: takes an optional `register` filter ("formal" / "informal" /
+    "casual"). A single batch/run can mix videos from multiple registers
+    (e.g. a queue that pulled BBC Radio Cymru and Hansh videos together),
+    so filtering by
     register happens on the rows within each batch, not by excluding whole
     batches. Needs its own >=2-batches-with-data check per register, since a
     register that's only ever appeared in one run so far can't show a trend
@@ -1091,14 +1102,17 @@ def main():
     print("\nGenerating figures...")
     fig_erosion_by_type(df, register="formal",   filename_prefix="formal_")
     fig_erosion_by_type(df, register="informal", filename_prefix="informal_")
+    fig_erosion_by_type(df, register="casual",   filename_prefix="casual_")
     fig_erosion_by_rule(df, register="formal",   filename_prefix="formal_")
     fig_erosion_by_rule(df, register="informal", filename_prefix="informal_")
+    fig_erosion_by_rule(df, register="casual",   filename_prefix="casual_")
     fig_erosion_by_channel(df)
     fig_codeswitch_by_channel(df)
     fig_status_distribution(df)
     fig_tagger_agreement(df)
     fig_erosion_over_batches(df, batch_log, register="formal",   filename_prefix="formal_")
     fig_erosion_over_batches(df, batch_log, register="informal", filename_prefix="informal_")
+    fig_erosion_over_batches(df, batch_log, register="casual",   filename_prefix="casual_")
     fig_collision_flags(df)
 
     export_utterance_level(df)

@@ -266,11 +266,21 @@ BOD_SURFACE_FORMS = frozenset({
 # Welsh contractions that Whisper may keep joined but Cysill/spaCy will split.
 # Format: surface_form -> [sub_token_1, sub_token_2, ...]
 # Only the first sub-token inherits the original word's timestamp/confidence.
+#
+# BUGFIX: this table is looked up in mutation_engine.py's contraction
+# expander against `surface = w["word"].strip().lower()...`, i.e. a single
+# Whisper word-level token. Every key below must therefore be a single
+# fused token (an apostrophe contraction Whisper could plausibly emit as
+# one word) -- a key containing a literal space can never match a
+# single-token surface and would silently never fire. A `"yn y": ["yn",
+# "y"]` entry was removed for exactly this reason: it was unreachable dead
+# data. If the intent was to catch Whisper *fusing* "yn y" into one glued
+# token (e.g. transcribed as "yny"), the correct key is "yny", not "yn y"
+# -- re-add it under that key if that's the real-world failure mode.
 WELSH_CONTRACTION_SPLITS = {
     "i'r":  ["i", "'r"],
     "a'r":  ["a", "'r"],
     "o'r":  ["o", "'r"],
-    "yn y": ["yn", "y"],
     "i'w":  ["i", "'w"],
     "a'i":  ["a", "'i"],
     "o'i":  ["o", "'i"],

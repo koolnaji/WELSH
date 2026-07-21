@@ -101,8 +101,29 @@ def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
 
             # PATCH: explicit 429 handling
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After",
-                                                   base_delay * attempt * 2))
+                # BUGFIX: Retry-After is technically allowed by HTTP to be
+                # either delta-seconds ("120") or an HTTP-date
+                # ("Wed, 21 Oct 2015 07:28:00 GMT"). A bare int(...) on a
+                # date string raises ValueError, which used to fall through
+                # to the generic `except Exception` below and get logged as
+                # a misleading "Request error" -- functionally harmless
+                # (it still backed off and retried) but it silently threw
+                # away the server's actual guidance and mislabeled the
+                # cause. Parsed defensively here instead: try int, then
+                # float-rounded-to-int, then fall back to our own backoff
+                # for anything else (e.g. a date string) without raising.
+                retry_after_header = resp.headers.get("Retry-After")
+                retry_after = None
+                if retry_after_header is not None:
+                    try:
+                        retry_after = int(retry_after_header)
+                    except ValueError:
+                        try:
+                            retry_after = int(float(retry_after_header))
+                        except ValueError:
+                            retry_after = None  # e.g. an HTTP-date -- not parsed, use default below
+                if retry_after is None:
+                    retry_after = int(base_delay * attempt * 2)
                 tqdm.write(f" ⚠️ Cysill rate-limited (429) -- waiting {retry_after}s "
                       f"(attempt {attempt}/{max_retries})")
                 time.sleep(retry_after)

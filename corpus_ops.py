@@ -258,6 +258,102 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
                 parts.append(section("By detection rule", "".join(
                     row(rule, n) for rule, n in
                     sorted(rule_counts.items(), key=lambda kv: -kv[1]))))
+
+            # PATCH: everything below is new -- previously the email
+            # reported erosion as one or two flat numbers, with no way to
+            # see WHERE it's concentrated without opening the CSVs
+            # yourself. These sections all derive from columns already
+            # sitting in mutation_rows for this run; nothing here reads
+            # anything beyond what was already collected.
+
+            # Erosion RATE (not just row count) broken out by mutation
+            # type -- the exact axis corpus_analyzer.py's own charts use,
+            # and the one that answers "is erosion concentrated in one
+            # mutation type or spread evenly" at a glance.
+            if {"expected_mutation", "is_erosion"} <= set(df.columns):
+                evaluable = df[df["status"].isin(
+                    ["correct_mutation", "erosion", "wrong_mutation_type", "mutation_mismatch"]
+                )] if "status" in df.columns else df
+                if len(evaluable):
+                    by_type = evaluable.groupby("expected_mutation")["is_erosion"].agg(["sum", "count"])
+                    parts.append(section("Erosion rate by mutation type", "".join(
+                        row(mut_type, f'{int(r["sum"])}/{int(r["count"])} '
+                            f'({r["sum"] / r["count"]:.1%})')
+                        for mut_type, r in by_type.sort_values("count", ascending=False).iterrows()
+                    )))
+
+            # Erosion RATE by channel_register -- the actual formal-vs-
+            # informal research comparison this whole project is built
+            # around; previously only row COUNTS per register were shown,
+            # which says nothing about whether erosion differs between them.
+            if {"channel_register", "is_erosion"} <= set(df.columns):
+                evaluable = df[df["status"].isin(
+                    ["correct_mutation", "erosion", "wrong_mutation_type", "mutation_mismatch"]
+                )] if "status" in df.columns else df
+                if len(evaluable):
+                    by_reg = evaluable.groupby("channel_register")["is_erosion"].agg(["sum", "count"])
+                    parts.append(section("Erosion rate by channel register", "".join(
+                        row(reg.capitalize(), f'{int(r["sum"])}/{int(r["count"])} '
+                            f'({r["sum"] / r["count"]:.1%})')
+                        for reg, r in by_reg.sort_values("count", ascending=False).iterrows()
+                    )))
+
+            # Full status distribution as percentages -- the same
+            # breakdown as corpus_analyzer.py's stacked-bar chart
+            # (correct / selective-invariancy / erosion / wrong-type /
+            # mismatch / phantom / code-switch), so a skim of the email
+            # gives the same picture without opening a chart.
+            if "status" in df.columns:
+                status_counts = df["status"].value_counts()
+                n_total = len(df)
+                parts.append(section("Full status distribution", "".join(
+                    row(s.replace("_", " ").capitalize(), f'{n} ({n / n_total:.1%})')
+                    for s, n in status_counts.items()
+                )))
+
+            # Per-video breakdown -- title, length, how many mutation
+            # contexts were found, and that video's own erosion rate.
+            # Previously the only per-video visibility was the
+            # succeeded/failed title lists above; this is the first place
+            # you can see at a glance whether one video is behaving very
+            # differently from the rest of the batch.
+            if "video_title" in df.columns:
+                video_rows = []
+                for title, vdf in df.groupby("video_title", sort=False):
+                    dur = vdf["video_duration_seconds"].iloc[0] \
+                        if "video_duration_seconds" in vdf.columns and pd.notna(vdf["video_duration_seconds"].iloc[0]) \
+                        else None
+                    v_evaluable = vdf[vdf["status"].isin(
+                        ["correct_mutation", "erosion", "wrong_mutation_type", "mutation_mismatch"]
+                    )] if "status" in vdf.columns else vdf
+                    v_erosion_rate = (v_evaluable["is_erosion"].mean()
+                                       if len(v_evaluable) and "is_erosion" in v_evaluable.columns else None)
+                    dur_str = _fmt_hms(dur) if dur is not None else "?"
+                    rate_str = f'{v_erosion_rate:.1%}' if v_erosion_rate is not None else "n/a"
+                    short_title = (title[:44] + "…") if isinstance(title, str) and len(title) > 45 else title
+                    video_rows.append(row(short_title, f'{dur_str} &middot; {len(vdf)} contexts &middot; erosion {rate_str}'))
+                parts.append(section("By video", "".join(video_rows)))
+
+            # Caption corroboration summary, if this run actually
+            # corroborated anything -- previously invisible in the email
+            # entirely despite being a whole subsystem that runs
+            # automatically inside choice 3.
+            if "caption_corroboration" in df.columns and df["caption_corroboration"].notna().any():
+                corrob_counts = df["caption_corroboration"].value_counts().to_dict()
+                parts.append(section("Caption corroboration", "".join(
+                    row(outcome.replace("_", " ").capitalize(), n) for outcome, n in
+                    sorted(corrob_counts.items(), key=lambda kv: -kv[1]))))
+
+            # How many rows this run left flagged for manual follow-up
+            # (caption corroboration disputes, low-confidence POS
+            # struggle, etc.) -- a direct pointer to "here's how much
+            # manual_editing.py work this run generated."
+            if "flagged" in df.columns:
+                flagged_n = int(df["flagged"].fillna(False).sum())
+                if flagged_n:
+                    parts.append(section("Needs manual review", "".join([
+                        row("Rows flagged this run", flagged_n),
+                    ])))
     else:
         parts.append('<div style="margin-top:10px;color:#777;font-size:13px;">'
                       'No mutation data collected this run.</div>')

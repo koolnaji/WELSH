@@ -131,6 +131,51 @@ from mutation_engine import BASE_DIR, TRANS_DIR, MUT_DIR
 # maps to "is_erosion" in the actual CSV -- change this if that's wrong.
 EDIT_COLUMN = "is_erosion"
 
+# ===================== Terminal color support =====================
+# PATCH: plain-text output made it hard to tell at a glance what mattered
+# most in a wall of near-identical-looking lines (the actual transcript,
+# buried at the bottom with the same visual weight as everything else,
+# was the specific complaint). ANSI escape codes work in VS Code's
+# integrated terminal, Windows Terminal, and PowerShell 7+ without any
+# extra dependency -- os.system("") is the standard trick to enable VT100
+# processing in legacy cmd.exe too. Falls back to empty strings (no
+# color, output unchanged) if colors can't be enabled or NO_COLOR is set,
+# rather than risk printing raw escape-code garbage on an unsupported
+# terminal.
+import os as _os
+
+_COLOR_ENABLED = _os.environ.get("NO_COLOR") is None
+if _COLOR_ENABLED and _os.name == "nt":
+    try:
+        _os.system("")  # enables ANSI VT100 processing in cmd.exe
+    except Exception:
+        _COLOR_ENABLED = False
+
+def _c(code):
+    return f"\033[{code}m" if _COLOR_ENABLED else ""
+
+RESET   = _c("0")
+BOLD    = _c("1")
+DIM     = _c("2")
+YELLOW  = _c("93")
+CYAN    = _c("96")
+GREEN   = _c("92")
+RED     = _c("91")
+MAGENTA = _c("95")
+GREY    = _c("90")
+
+# Status -> color, for an instant visual read on what kind of row this is
+# before reading a single word of detail.
+STATUS_COLOR = {
+    "erosion":               RED,
+    "wrong_mutation_type":   RED,
+    "correct_mutation":      GREEN,
+    "selective_invariancy":  GREEN,
+    "mutation_mismatch":     YELLOW,
+    "phantom_mutation":      MAGENTA,
+    "code_switch":           GREY,
+}
+
 # Default population to review: the two statuses that actually feed the
 # erosion rate numerator (see EVALUABLE_STATUSES / erosion_rate formula in
 # corpus_analyzer.py). mutation_mismatch is deliberately NOT included by
@@ -298,7 +343,8 @@ def highlight(text, words):
         w = str(w).strip()
         if not w or w == "[OMITTED]":
             continue
-        out = re.sub(rf"(?i)\b{re.escape(w)}\b", f">>>{w}<<<", out)
+        out = re.sub(rf"(?i)\b{re.escape(w)}\b",
+                      f"{BOLD}{YELLOW}>>>{w}<<<{RESET}", out)
     return out
 
 
@@ -326,9 +372,11 @@ def get_context(mutations_csv_path, row, context_n):
     highlight_words = [row.get("trigger_word"), row.get("following_word")]
     lines = []
     for _, s in window.iterrows():
-        marker = ">> " if s["segment_start"] <= t_end and s["segment_end"] >= t_start else "   "
-        lines.append(f"{marker}[{s['segment_start']:.1f}s-{s['segment_end']:.1f}s] "
-                      f"{highlight(str(s['segment_text']), highlight_words)}")
+        is_target_line = s["segment_start"] <= t_end and s["segment_end"] >= t_start
+        marker = f"{BOLD}{CYAN}>>{RESET} " if is_target_line else f"{DIM}   {RESET}"
+        line = (f"{marker}[{s['segment_start']:.1f}s-{s['segment_end']:.1f}s] "
+                f"{highlight(str(s['segment_text']), highlight_words)}")
+        lines.append(line if is_target_line else f"{DIM}{line}{RESET}")
     return "\n".join(lines)
 
 
@@ -341,36 +389,38 @@ def review_row(mutations_csv_path, video_title, row, context_n):
     m = TIMESTAMP_RE.search(str(row.get("timestamp", "")))
     t0 = fmt_mmss(float(m.group(1))) if m else None
 
-    # PATCH: reorganized into labeled sections (mutation context /
-    # confidence / current state / history, each only shown if it has
-    # something to say) instead of a flat stack of prints -- easier to
-    # scan at a glance, especially now that review_count/review_log adds
-    # a 4th thing competing for attention at the top of each row.
-    print("\n" + "=" * 78)
-    if t0:
-        print(f"VIDEO   : {video_title}")
-        print(f"TIME    : @ {t0}  ({row.get('timestamp')})")
-    else:
-        print(f"VIDEO   : {video_title}  ({row.get('timestamp')})")
-    print("-" * 78)
-    print("MUTATION CONTEXT")
+    # PATCH: reordered around what a reviewer actually needs, in the
+    # order they need it -- previously every section (mutation context,
+    # confidence, current state, history, transcript) had equal visual
+    # weight and the transcript (the thing you actually read to make the
+    # y/n call) was buried last, indistinguishable at a glance from
+    # metadata you don't need to make a decision. Now: header -> one-line
+    # colorized verdict summary -> transcript (the centerpiece, boxed) ->
+    # compact supporting detail -> history (only if there is any).
+    status = row.get("status")
+    status_color = STATUS_COLOR.get(status, "")
     rule_val = row.get("rule")
     gloss = RULE_DESCRIPTIONS.get(rule_val)
-    print(f"  trigger    : {row.get('trigger_word')!r}   rule: {rule_val}")
+
+    print("\n" + BOLD + "=" * 78 + RESET)
+    if t0:
+        print(f"{BOLD}{video_title}{RESET}   {DIM}@ {t0} ({row.get('timestamp')}){RESET}")
+    else:
+        print(f"{BOLD}{video_title}{RESET}   {DIM}({row.get('timestamp')}){RESET}")
+
+    print(f"{status_color}{BOLD}{str(status).upper()}{RESET}  "
+          f"{CYAN}{row.get('trigger_word')!r}{RESET} -> {CYAN}{row.get('following_word')!r}{RESET}  "
+          f"expected={row.get('expected_mutation')} found={row.get('mutation_found')}  "
+          f"{DIM}({row.get('tagger_agreement')}, conf={row.get('confidence_score')}){RESET}")
     if gloss:
-        print(f"               ({gloss})")
-    print(f"  following  : {row.get('following_word')!r}")
-    print(f"  expected   : {row.get('expected_mutation')}     "
-          f"found: {row.get('mutation_found')}")
-    print("-" * 78)
-    print("CONFIDENCE")
-    print(f"  status            : {row.get('status')}")
-    print(f"  tagger_agreement  : {row.get('tagger_agreement')}")
-    print(f"  confidence_score  : {row.get('confidence_score')}")
-    print("-" * 78)
-    print("CURRENT STATE")
-    print(f"  {EDIT_COLUMN:<17s} : {row.get(EDIT_COLUMN)}   "
-          f"(manual_reviewed: {row.get('manual_reviewed', False)})")
+        print(f"  {DIM}{rule_val}: {gloss}{RESET}")
+
+    print(f"{BOLD}{'-' * 78}{RESET}")
+    print(get_context(mutations_csv_path, row, context_n))
+    print(f"{BOLD}{'-' * 78}{RESET}")
+
+    print(f"{DIM}{EDIT_COLUMN}: {row.get(EDIT_COLUMN)}"
+          f"   (manual_reviewed: {row.get('manual_reviewed', False)}){RESET}")
 
     rc = row.get("review_count", 0)
     flagged = bool(row.get("flagged", False))
@@ -387,18 +437,14 @@ def review_row(mutations_csv_path, video_title, row, context_n):
         if flagged:
             note = row.get("flag_note")
             if str(note).strip() and str(note) != "nan":
-                print("  *** FLAGGED -- memo(s):")
+                print(f"  {YELLOW}*** FLAGGED -- memo(s):{RESET}")
                 for line in str(note).splitlines():
                     print(f"      {line}")
             else:
-                print("  *** FLAGGED (no memo) ***")
+                print(f"  {YELLOW}*** FLAGGED (no memo) ***{RESET}")
         if has_note:
             print(f"  note: {row.get('note')}")
-
-    print("-" * 78)
-    print("TRANSCRIPT CONTEXT")
-    print(get_context(mutations_csv_path, row, context_n))
-    print("-" * 78)
+        print("-" * 78)
 
     while True:
         choice = input(f"Genuinely erosion (radical form actually spoken)? "
