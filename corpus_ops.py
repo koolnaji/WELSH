@@ -25,10 +25,15 @@ from mutation_engine import (
     run_paths,
     filter_hallucinated_segments, deduplicate_overlapping_segments,
     preprocess_segment, expand_whisper_tokens, enrich_words,
-    normalize_word, get_welsh_lemma,
+    normalize_word, get_welsh_lemma, is_english_code_switch,
     cysill_coarse_pos, spacy_coarse_pos, pos_compatible,
     process_comprehensive_mutations,
 )
+# PATCH: single source of truth (see mutation_tables.py for rationale) --
+# was three separate inline copies of this same 4-status list in this
+# file, plus a fourth, DIFFERENT (and wrong) computation for the headline
+# email number. All four now reference this one import.
+from mutation_tables import EVALUABLE_STATUSES
 
 # ========================= QUEUE / LOG HELPERS =========================
 def _write_json(path, value):
@@ -216,8 +221,10 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
     if summary:
         parts.append(section("Mutation data collected this run", "".join([
             row("Total contexts", summary["total_analyzed_contexts"]),
-            row("Code-switch cases", f'{summary["code_switch_cases"]} '
-                f'({summary["code_switch_rate"]:.1%})'),
+            row("Total words (this run's videos)", summary["total_words"]),
+            row("Code-switch words (whole transcript)", f'{summary["code_switch_words_total"]} '
+                f'({summary["code_switch_rate"]:.1%} of {summary["code_switch_rate_denominator"]})'),
+            row("Code-switch cases at mutation triggers", summary["code_switch_cases_at_triggers"]),
             row("Evaluable non-code-switch", summary["evaluable_non_code_switch_contexts"]),
             row("Erosion (all)", f'{summary["erosion_cases_all"]} '
                 f'({summary["erosion_rate_all"]:.1%})'),
@@ -272,7 +279,7 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
             # mutation type or spread evenly" at a glance.
             if {"expected_mutation", "is_erosion"} <= set(df.columns):
                 evaluable = df[df["status"].isin(
-                    ["correct_mutation", "erosion", "wrong_mutation_type", "mutation_mismatch"]
+                    EVALUABLE_STATUSES
                 )] if "status" in df.columns else df
                 if len(evaluable):
                     by_type = evaluable.groupby("expected_mutation")["is_erosion"].agg(["sum", "count"])
@@ -288,7 +295,7 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
             # which says nothing about whether erosion differs between them.
             if {"channel_register", "is_erosion"} <= set(df.columns):
                 evaluable = df[df["status"].isin(
-                    ["correct_mutation", "erosion", "wrong_mutation_type", "mutation_mismatch"]
+                    EVALUABLE_STATUSES
                 )] if "status" in df.columns else df
                 if len(evaluable):
                     by_reg = evaluable.groupby("channel_register")["is_erosion"].agg(["sum", "count"])
@@ -324,7 +331,7 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
                         if "video_duration_seconds" in vdf.columns and pd.notna(vdf["video_duration_seconds"].iloc[0]) \
                         else None
                     v_evaluable = vdf[vdf["status"].isin(
-                        ["correct_mutation", "erosion", "wrong_mutation_type", "mutation_mismatch"]
+                        EVALUABLE_STATUSES
                     )] if "status" in vdf.columns else vdf
                     v_erosion_rate = (v_evaluable["is_erosion"].mean()
                                        if len(v_evaluable) and "is_erosion" in v_evaluable.columns else None)
@@ -372,16 +379,68 @@ def generate_research_summary(mutation_rows, stamp):
     total     = len(df)
     cs_cases  = int(df["is_code_switch"].sum()) if "is_code_switch" in df.columns else 0
     unverified = int((df["status"] == "erosion_unverified").sum()) if "status" in df.columns else 0
-    non_cs    = total - cs_cases
-    evaluable_non_cs = non_cs - unverified
-    erosion   = int(df["is_erosion"].sum()) if "is_erosion" in df.columns else 0
-    hc_erosion= int(df["is_high_confidence_erosion"].sum()) \
-        if "is_high_confidence_erosion" in df.columns else 0
+
+    # PATCH: was `evaluable_non_cs = non_cs - unverified`, which still
+    # counted phantom_mutation and selective_invariancy rows as
+    # "evaluable" -- neither one can register erosion by construction
+    # (phantom rows have no trigger word to evaluate against; selective-
+    # invariancy rows have no mutation expected at all). That meant the
+    # headline "Erosion (all)" / "Erosion (high-confidence)" numbers at
+    # the top of every completion email were computed on a looser,
+    # larger denominator than the breakdowns further down this same
+    # email (which already correctly filtered to EVALUABLE_STATUSES, see
+    # the three call sites below) -- confirmed live on a real run where
+    # this understated the true erosion rate by ~18 points. Now uses the
+    # same EVALUABLE_STATUSES filter as everywhere else in the pipeline.
+    if "status" in df.columns:
+        evaluable_df      = df[df["status"].isin(EVALUABLE_STATUSES)]
+        evaluable_non_cs  = len(evaluable_df)
+        erosion           = int(evaluable_df["is_erosion"].sum()) if "is_erosion" in evaluable_df.columns else 0
+        hc_erosion        = int(evaluable_df["is_high_confidence_erosion"].sum()) \
+            if "is_high_confidence_erosion" in evaluable_df.columns else 0
+    else:
+        non_cs            = total - cs_cases
+        evaluable_non_cs  = non_cs - unverified
+        erosion           = int(df["is_erosion"].sum()) if "is_erosion" in df.columns else 0
+        hc_erosion        = int(df["is_high_confidence_erosion"].sum()) \
+            if "is_high_confidence_erosion" in df.columns else 0
+
+    # PATCH: numerator changed to a true whole-transcript code-switch word
+    # count (video_codeswitch_word_count -- every English word detected
+    # anywhere in the transcript, via the same classifier get_welsh_lemma
+    # already runs on every word), not cs_cases (mutation-trigger-context
+    # rows only, a much narrower and less representative slice). Both
+    # numerator and denominator are per-video totals repeated across every
+    # row from that video, so both dedupe by video_url before summing --
+    # otherwise a video with more trigger contexts would silently inflate
+    # its own contribution to either total. cs_cases itself is kept as its
+    # own field below (still meaningful: how many mutation TARGETS
+    # specifically were code-switched), just no longer used as the
+    # headline code-switch rate's numerator. Older cached rows (predating
+    # these fields, or rebuilt via rerun_rules.py, which doesn't currently
+    # carry them through) fall back to the old contexts-based rate so this
+    # doesn't divide by zero on that data.
+    if {"video_word_count", "video_codeswitch_word_count", "video_url"} <= set(df.columns):
+        video_level      = df.dropna(subset=["video_url"]).drop_duplicates("video_url")
+        total_words      = int(video_level["video_word_count"].fillna(0).sum())
+        codeswitch_words = int(video_level["video_codeswitch_word_count"].fillna(0).sum())
+    else:
+        total_words, codeswitch_words = 0, None
+    if total_words > 0 and codeswitch_words is not None:
+        code_switch_rate = float(codeswitch_words / total_words)
+        code_switch_denominator_label = "total_words"
+    else:
+        codeswitch_words = cs_cases
+        code_switch_rate = float(cs_cases / total) if total > 0 else 0
+        code_switch_denominator_label = "total_contexts (video_word_count unavailable)"
 
     summary = {
         "total_analyzed_contexts":       total,
-        "code_switch_cases":             cs_cases,
-        "code_switch_rate":              float(cs_cases / total) if total > 0 else 0,
+        "code_switch_cases_at_triggers": cs_cases,
+        "code_switch_words_total":       codeswitch_words,
+        "total_words":                   total_words,
+        "code_switch_rate":              code_switch_rate,
+        "code_switch_rate_denominator":  code_switch_denominator_label,
         "erosion_cases_all":             erosion,
         "erosion_cases_high_confidence": hc_erosion,
         "evaluable_non_code_switch_contexts": evaluable_non_cs,
@@ -457,8 +516,9 @@ def generate_research_summary(mutation_rows, stamp):
     print("RESEARCH SUMMARY - WELSH MUTATION ENGINE v7")
     print("="*70)
     print(f"Total analyzed contexts              : {total}")
-    print(f"Code-switch cases                     : {cs_cases} ({cs_cases/total:.1%})"
-          if total > 0 else f"Code-switch cases                     : {cs_cases}")
+    print(f"Code-switch words (whole transcript)  : {summary['code_switch_words_total']} "
+          f"({summary['code_switch_rate']:.1%} of {summary['code_switch_rate_denominator']})")
+    print(f"Code-switch cases at mutation triggers : {cs_cases}")
     print(f"Evaluable non-code-switch contexts    : {evaluable_non_cs}")
     er_rate = erosion / evaluable_non_cs if evaluable_non_cs > 0 else 0
     hc_rate = hc_erosion / evaluable_non_cs if evaluable_non_cs > 0 else 0
@@ -677,6 +737,35 @@ def analyze(audio_path, model, video_meta, substeps=None):
         all_preprocessed.extend(words)
         seg_boundaries.append((start_idx, len(all_preprocessed), seg))
 
+    # PATCH: total content-word count for this video, captured the same
+    # way as video_duration_seconds above -- once per video, then stamped
+    # onto every output row below. Nothing before this tracked total
+    # words spoken at all, only mutation-trigger-context counts, so
+    # anything wanting a genuine rate-per-speech-volume metric (e.g.
+    # code-switch rate against total words rather than against trigger
+    # contexts only) had no denominator to use. preprocess_segment()
+    # already drops punctuation-only tokens (see its docstring), so this
+    # is a content-word count, not a raw whitespace-split token count.
+    video_word_count = len(all_preprocessed)
+
+    # PATCH: true whole-transcript code-switch count, not just trigger-
+    # adjacent instances. is_english_code_switch() already runs on every
+    # single word in this video -- it's called inside get_welsh_lemma(),
+    # which the word_rows loop below calls for every content word (one of
+    # the four per-video CSVs this pipeline already writes) -- but that
+    # result was only ever used internally to decide whether to skip the
+    # Cysill/simplemma lookup, never surfaced or counted. No new
+    # transcription, tagging, or API work needed: just counting a
+    # classification that was already happening on the full word stream.
+    # This is a separate concept from mutation_rows' own "is_code_switch"
+    # column, which flags only whether a mutation-trigger TARGET word was
+    # English (relevant to mutation detection itself, unchanged here) --
+    # this new count is corpus-wide, across every word in the video.
+    video_codeswitch_word_count = sum(
+        1 for w in all_preprocessed
+        if is_english_code_switch(w["word"], None)
+    )
+
     # Enrich: Cysill + spaCy via unified gap-tolerant alignment
     _step("Tagging + aligning (Cysill + spaCy)")
     enriched = enrich_words(all_preprocessed)
@@ -692,6 +781,8 @@ def analyze(audio_path, model, video_meta, substeps=None):
             "source":               video_meta["source"],
             "channel_register":     video_meta.get("channel_register", "unverified"),
             "video_duration_seconds": video_duration_seconds,
+            "video_word_count":     video_word_count,
+            "video_codeswitch_word_count": video_codeswitch_word_count,
             "segment_start":        round(seg.start, 3),
             "segment_end":          round(seg.end, 3),
             "segment_text":         seg_text,
@@ -785,6 +876,8 @@ def analyze(audio_path, model, video_meta, substeps=None):
             "source":      video_meta["source"],
             "channel_register": video_meta.get("channel_register", "unverified"),
             "video_duration_seconds": video_duration_seconds,
+            "video_word_count": video_word_count,
+            "video_codeswitch_word_count": video_codeswitch_word_count,
         })
 
     return segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows, \

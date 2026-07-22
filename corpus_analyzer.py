@@ -106,20 +106,11 @@ STATUS_COLORS = {
     "Colloquial Variant":           "#FFD700",
 }
 
-# Statuses where erosion is genuinely evaluable -- i.e. a mutation was
-# expected and we can determine whether it occurred or not.
-# Excluded from erosion rate denominators:
-#   phantom_mutation     -- no trigger word, different detection logic
-#   selective_invariancy -- mutation not expected for this initial, can't erode
-#   code_switch          -- English target, not applicable
-#   erosion_unverified   -- both taggers absent, too noisy
-#   colloquial_variant   -- documented variant, not plain erosion
-EVALUABLE_STATUSES = frozenset({
-    "correct_mutation",
-    "erosion",
-    "wrong_mutation_type",
-    "mutation_mismatch",
-})
+# Statuses where erosion is genuinely evaluable -- imported from
+# mutation_tables.py, the single source of truth (see that file for the
+# full rationale and exclusion list). Previously defined independently
+# here and had drifted from corpus_ops.py's own separate copy.
+from mutation_tables import EVALUABLE_STATUSES
 
 # Single source of truth for channel label mapping.
 # Each entry is (full_url_substring, short_slug, display_name).
@@ -675,16 +666,37 @@ def fig_erosion_by_channel(df):
 
 def fig_codeswitch_by_channel(df):
     """
-    Horizontal bar chart: code-switch rate per channel.
+    Horizontal bar chart: code-switch rate per channel -- share of all
+    words spoken (not just mutation-trigger contexts) that are English.
     """
-    if "channel" not in df.columns or "is_code_switch" not in df.columns:
+    if "channel" not in df.columns:
         print("  [skip] codeswitch_by_channel -- missing columns")
         return
 
-    grouped = df.groupby("channel").agg(
-        total=("is_code_switch", "count"),
-        cs_rate=("is_code_switch", "mean"),
-    ).reset_index().sort_values("cs_rate", ascending=True)
+    # video_word_count and video_codeswitch_word_count are stamped once
+    # per video onto every row from that video (same pattern as
+    # video_duration_seconds), computed from the classifier
+    # is_english_code_switch() already runs on every word in the
+    # transcript (see corpus_ops.py's analyze()) -- so this is a genuine
+    # whole-transcript rate, not limited to mutation-trigger sites. Both
+    # dedupe by video_url per channel before summing -- otherwise a video
+    # with more trigger-context rows would silently inflate its own
+    # channel's totals.
+    if not {"video_word_count", "video_codeswitch_word_count", "video_url"} <= set(df.columns):
+        print("  [skip] codeswitch_by_channel -- missing video_word_count/"
+              "video_codeswitch_word_count/video_url (older data predating "
+              "these fields, or rerun_rules.py output, which doesn't carry "
+              "them through yet -- reprocess to get this figure)")
+        return
+
+    video_level = df.dropna(subset=["video_url"]).drop_duplicates("video_url")
+    grouped = video_level.groupby("channel").agg(
+        total_words=("video_word_count", "sum"),
+        cs_words=("video_codeswitch_word_count", "sum"),
+    ).reset_index()
+    grouped = grouped[grouped["total_words"] > 0]
+    grouped["cs_rate"] = grouped["cs_words"] / grouped["total_words"]
+    grouped = grouped.sort_values("cs_rate", ascending=True)
 
     if grouped.empty:
         print("  [skip] codeswitch_by_channel -- insufficient data")
@@ -692,9 +704,11 @@ def fig_codeswitch_by_channel(df):
 
     fig, ax = plt.subplots(figsize=(8, max(3, len(grouped) * 0.6)))
     _bar_with_counts(ax, grouped["channel"], grouped["cs_rate"] * 100,
-                     grouped["total"], color=MUTATION_COLORS["code_switch"])
+                     grouped["total_words"], color=MUTATION_COLORS["code_switch"],
+                     fmt="{:.2f}%")
     ax.set_title("Code-Switching Rate by Channel\n"
-                 "(proportion of mutation trigger contexts followed by English token)",
+                 "(% of all words spoken that are English, whole transcript;\n"
+                 "n = total words)",
                  fontweight="bold", pad=12)
     ax.set_xlabel("Code-Switch Rate (%)")
     ax.set_ylabel("Channel")
@@ -704,38 +718,67 @@ def fig_codeswitch_by_channel(df):
 
 def fig_status_distribution(df):
     """
-    Stacked horizontal bar chart: full status breakdown per channel.
+    Stacked horizontal bar chart: evaluable mutation-outcome breakdown per
+    channel (Correct / Erosion (radical) / Erosion (wrong type) only).
+
+    PATCH: previously stacked all 9 statuses together (including
+    phantom_mutation, code_switch, selective_invariancy, colloquial_variant,
+    mutation_mismatch), which mixed genuinely-evaluable erosion outcomes
+    with structurally different categories into one 100%-stacked bar.
+    Now restricted to the 3 statuses where an erosion outcome was actually
+    possible:
+      - phantom_mutation is dropped entirely, not merged into "Correct" --
+        it's a different detection path (no trigger word at all) that can
+        only ever represent a correctly-produced mutation by construction,
+        so it carries no erosion-risk information for this chart.
+      - mutation_mismatch (tagger disagreement) is dropped from the bar
+        too, but not discarded -- it's still real data about whether the
+        classification itself is trustworthy, just a different kind of
+        signal than "did erosion happen." Shown instead as a separate
+        per-channel annotation to the right of each bar.
+      - code_switch, selective_invariancy, colloquial_variant,
+        mutation_absent_expected_none stay excluded, same as before (none
+        of these were ever includable erosion outcomes).
     Draws bars via mpatches.Rectangle to avoid a matplotlib/numpy linewidth
     scalar bug that affects ax.barh in some version combinations.
     """
-    if "status_label" not in df.columns or "channel" not in df.columns:
+    if "status" not in df.columns or "channel" not in df.columns:
         print("  [skip] status_distribution -- missing columns")
         return
 
-    pivot = df.groupby(["channel", "status_label"]).size().unstack(fill_value=0)
-    # Collapse any duplicate channel rows
+    BAR_STATUSES = ["correct_mutation", "erosion", "wrong_mutation_type"]
+    bar_df = df[df["status"].isin(BAR_STATUSES)]
+    if bar_df.empty:
+        print("  [skip] status_distribution -- no evaluable bar-eligible rows")
+        return
+
+    pivot = bar_df.groupby(["channel", "status"]).size().unstack(fill_value=0)
     pivot = pivot.groupby(level=0).sum()
+    for s in BAR_STATUSES:
+        if s not in pivot.columns:
+            pivot[s] = 0
+    pivot     = pivot[BAR_STATUSES]
     pivot_pct = pivot.div(pivot.sum(axis=1), axis=0) * 100
 
-    # dict.fromkeys preserves insertion order and deduplicates -- important
-    # because STATUS_LABELS may map multiple raw statuses to the same display
-    # label (e.g. if selective_invariancy is merged with correct_mutation),
-    # which would otherwise produce duplicate entries in all_cols.
-    ordered_statuses = [s for s in dict.fromkeys(STATUS_LABELS.values())
-                        if s in pivot_pct.columns]
-    other_cols       = [c for c in pivot_pct.columns if c not in ordered_statuses]
-    all_cols         = ordered_statuses + other_cols
-    pivot_pct        = pivot_pct[all_cols]
+    # Mismatch shown separately: rate against the full "classification
+    # attempted" universe (bar statuses + mismatch), i.e. EVALUABLE_STATUSES
+    # -- consistent with how mismatch is treated as an evaluable outcome
+    # everywhere else in the pipeline, just not as a bar segment here.
+    mismatch_eligible = df[df["status"].isin(EVALUABLE_STATUSES)]
+    mismatch_n     = mismatch_eligible.groupby("channel")["status"] \
+        .apply(lambda s: (s == "mutation_mismatch").sum())
+    mismatch_total = mismatch_eligible.groupby("channel").size()
+    mismatch_rate  = (mismatch_n / mismatch_total * 100).reindex(pivot.index).fillna(0)
 
+    all_cols = BAR_STATUSES
     channels = list(pivot_pct.index)
     n        = len(channels)
     bar_h    = 0.6
     fig, ax  = plt.subplots(figsize=(12, max(3, n * 0.9)))
 
-    legend_handles = []
-    for status in all_cols:
-        color = STATUS_COLORS.get(status, "#CCCCCC")
-        legend_handles.append(mpatches.Patch(facecolor=color, label=status))
+    legend_handles = [mpatches.Patch(facecolor=STATUS_COLORS.get(STATUS_LABELS[s], "#CCCCCC"),
+                                      label=STATUS_LABELS[s])
+                       for s in all_cols]
 
     for row_idx in range(n):
         left = 0.0
@@ -744,13 +787,17 @@ def fig_status_distribution(df):
             # immune to duplicate index/column issues that cause .at/.loc to
             # return a Series instead of a scalar.
             val   = float(pivot_pct.iat[row_idx, col_idx])
-            color = STATUS_COLORS.get(status, "#CCCCCC")
+            color = STATUS_COLORS.get(STATUS_LABELS[status], "#CCCCCC")
             rect  = mpatches.Rectangle(
                 (left, row_idx - bar_h / 2), val, bar_h,
                 facecolor=color, edgecolor="white", linewidth=0.3
             )
             ax.add_patch(rect)
             left += val
+        # Mismatch credibility annotation, outside the 100%-stacked area.
+        ch = channels[row_idx]
+        ax.text(102, row_idx, f"mismatch: {mismatch_rate.get(ch, 0):.1f}%",
+                va="center", ha="left", fontsize=8, color="#555555")
 
     ax.set_xlim(0, 100)
     ax.set_ylim(-0.5, n - 0.5)
@@ -758,19 +805,10 @@ def fig_status_distribution(df):
     ax.set_yticklabels(channels)
     ax.invert_yaxis()
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
-    ax.set_xlabel("% of analysed contexts")
-    ax.set_title("Full Status Distribution by Channel", fontweight="bold", pad=12)
-    ax.legend(handles=legend_handles, bbox_to_anchor=(1.01, 1),
-              loc="upper left", fontsize=8)
-    fig.tight_layout()
-    _save(fig, "status_distribution.png")
-    ax.set_yticks(range(n))
-    ax.set_yticklabels(channels)
-    ax.invert_yaxis()
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
-    ax.set_xlabel("% of analysed contexts")
-    ax.set_title("Full Status Distribution by Channel\n"
-                 "('Correct' includes selective invariance contexts where no mutation is expected)",
+    ax.set_xlabel("% of evaluable mutation outcomes (Correct / Erosion / Wrong type)")
+    ax.set_title("Evaluable Mutation Outcome Distribution by Channel\n"
+                 "(phantom omissions excluded -- correct by construction; "
+                 "tagger mismatch shown separately, right of each bar)",
                  fontweight="bold", pad=12)
     ax.legend(handles=legend_handles, bbox_to_anchor=(1.01, 1),
               loc="upper left", fontsize=8)

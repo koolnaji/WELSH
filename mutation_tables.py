@@ -309,3 +309,38 @@ SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS = {
     "llai", "lleiaf",       # bach (small) -> smaller, smallest
     "nes", "nesaf",         # agos (near) -> nearer, nearest
 }
+
+# Statuses where erosion is genuinely evaluable -- i.e. a mutation was
+# expected and it's possible to determine whether it occurred or not.
+# Excluded:
+#   phantom_mutation     -- no trigger word, different detection logic;
+#                            can only ever represent a correctly-produced
+#                            mutation by construction (there's no "erosion"
+#                            outcome possible for a phantom row)
+#   selective_invariancy -- mutation not expected for this initial, can't erode
+#   code_switch           -- English target, not applicable
+#   erosion_unverified    -- both taggers absent, too noisy
+#   colloquial_variant    -- documented variant, not plain erosion
+#
+# PATCH: single source of truth. This used to be defined independently in
+# corpus_analyzer.py (correctly, as this same 4-status set) while
+# corpus_ops.py's generate_research_summary() computed its headline
+# "evaluable" denominator a different way (non-code-switch minus
+# erosion_unverified only -- still including phantom_mutation and
+# selective_invariancy rows), and three other spots inside corpus_ops.py's
+# own email builder hardcoded this same 4-status list inline, separately,
+# a second and third time. Result: the headline erosion-rate number at the
+# top of every completion email was computed on a different, looser
+# denominator than every breakdown below it in that same email, and than
+# every figure corpus_analyzer.py produces -- confirmed live on a real
+# run (357 total contexts, 83 phantom rows folded into a reported
+# "evaluable" count of 290 that should have excluded them, understating
+# the true erosion rate by ~18 points). Both files now import this
+# constant instead of each maintaining -- and inevitably drifting from --
+# their own copy.
+EVALUABLE_STATUSES = frozenset({
+    "correct_mutation",
+    "erosion",
+    "wrong_mutation_type",
+    "mutation_mismatch",
+})
