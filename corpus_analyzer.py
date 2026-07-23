@@ -110,7 +110,7 @@ STATUS_COLORS = {
 # mutation_tables.py, the single source of truth (see that file for the
 # full rationale and exclusion list). Previously defined independently
 # here and had drifted from corpus_ops.py's own separate copy.
-from mutation_tables import EVALUABLE_STATUSES
+from mutation_tables import EVALUABLE_STATUSES, SPACY_MUTATION_MAP
 
 # Single source of truth for channel label mapping.
 # Each entry is (full_url_substring, short_slug, display_name).
@@ -716,6 +716,51 @@ def fig_codeswitch_by_channel(df):
     _save(fig, "codeswitch_by_channel.png")
 
 
+def _cohens_kappa(cat_a, cat_b):
+    """
+    Cohen's Kappa: chance-corrected inter-rater agreement between two
+    independent categorical raters on the same items.
+
+        kappa = (p_o - p_e) / (1 - p_e)
+
+    p_o = observed proportion of agreement (raw % of rows where both
+          taggers assigned the same category).
+    p_e = proportion of agreement expected by chance alone, computed from
+          each rater's own marginal label distribution -- i.e. how often
+          they'd agree if each were independently guessing according to
+          how often it uses each label, with no actual signal between
+          them.
+
+    A plain agreement percentage can look high just because one category
+    (e.g. "no mutation") dominates and both taggers default to it often --
+    that's not evidence of real corroboration. Kappa corrects for exactly
+    that: kappa=1 is perfect agreement, kappa=0 is no better than the
+    chance level implied by their own label frequencies, negative is
+    worse than chance (systematic disagreement).
+
+    cat_a, cat_b: paired sequences (same length, same row order) of
+    category labels, one entry per item both raters scored.
+    Returns (kappa, n) -- n is the number of paired observations kappa
+    was computed over, since kappa on a small n is a noisy estimate and
+    the caller should show it alongside the number, not alone.
+    """
+    n = len(cat_a)
+    if n == 0:
+        return None, 0
+    cat_a = list(cat_a)
+    cat_b = list(cat_b)
+    labels = set(cat_a) | set(cat_b)
+    po = sum(a == b for a, b in zip(cat_a, cat_b)) / n
+    freq_a = {l: cat_a.count(l) / n for l in labels}
+    freq_b = {l: cat_b.count(l) / n for l in labels}
+    pe = sum(freq_a[l] * freq_b[l] for l in labels)
+    if pe >= 1.0:
+        # Every rater used exactly one label between them, in lockstep --
+        # no variance to correct for; observed agreement IS the answer.
+        return (1.0 if po == 1.0 else 0.0), n
+    return (po - pe) / (1 - pe), n
+
+
 def fig_status_distribution(df):
     """
     Stacked horizontal bar chart: evaluable mutation-outcome breakdown per
@@ -735,7 +780,9 @@ def fig_status_distribution(df):
         too, but not discarded -- it's still real data about whether the
         classification itself is trustworthy, just a different kind of
         signal than "did erosion happen." Shown instead as a separate
-        per-channel annotation to the right of each bar.
+        per-channel Cohen's Kappa annotation (spaCy vs Cysill agreement,
+        chance-corrected -- see _cohens_kappa()) to the right of each bar,
+        purple, rather than folded into the bar as a raw percentage.
       - code_switch, selective_invariancy, colloquial_variant,
         mutation_absent_expected_none stay excluded, same as before (none
         of these were ever includable erosion outcomes).
@@ -760,15 +807,33 @@ def fig_status_distribution(df):
     pivot     = pivot[BAR_STATUSES]
     pivot_pct = pivot.div(pivot.sum(axis=1), axis=0) * 100
 
-    # Mismatch shown separately: rate against the full "classification
-    # attempted" universe (bar statuses + mismatch), i.e. EVALUABLE_STATUSES
-    # -- consistent with how mismatch is treated as an evaluable outcome
-    # everywhere else in the pipeline, just not as a bar segment here.
-    mismatch_eligible = df[df["status"].isin(EVALUABLE_STATUSES)]
-    mismatch_n     = mismatch_eligible.groupby("channel")["status"] \
-        .apply(lambda s: (s == "mutation_mismatch").sum())
-    mismatch_total = mismatch_eligible.groupby("channel").size()
-    mismatch_rate  = (mismatch_n / mismatch_total * 100).reindex(pivot.index).fillna(0)
+    # PATCH: was a plain mismatch-rate percentage (mismatch count / total
+    # classification-attempted count). That's not a real credibility
+    # measure -- it doesn't correct for the fact that two taggers can
+    # agree (or "disagree" via one dominant label) by chance alone. Now
+    # uses Cohen's Kappa between spaCy and Cysill directly (see
+    # _cohens_kappa() docstring for the formula and rationale) --
+    # normalizes each tagger's raw mutation-type column (spacy_mutation:
+    # SM/NM/AM morph tags via SPACY_MUTATION_MAP; cysill_mutation_type:
+    # already plain-text soft/nasal/aspirate/none) onto the same category
+    # space, restricted to rows where BOTH taggers were actually
+    # consulted (cysill_pos and spacy_pos both present -- rows where one
+    # tagger never weighed in aren't a disagreement, they're missing
+    # data, and including them would understate agreement for the wrong
+    # reason) and to EVALUABLE_STATUSES, same universe as the bar itself.
+    kappa_eligible = df[
+        df["status"].isin(EVALUABLE_STATUSES)
+        & df.get("cysill_pos", pd.Series(dtype=object)).notna()
+        & ~df.get("cysill_pos", pd.Series(dtype=object)).isin(["none", "n/a"])
+        & df.get("spacy_pos", pd.Series(dtype=object)).notna()
+        & ~df.get("spacy_pos", pd.Series(dtype=object)).isin(["none", "n/a"])
+    ] if {"cysill_pos", "spacy_pos", "cysill_mutation_type", "spacy_mutation"} <= set(df.columns) else df.iloc[0:0]
+
+    channel_kappa = {}
+    for ch, g in kappa_eligible.groupby("channel"):
+        cysill_cat = g["cysill_mutation_type"].fillna("none").replace({"n/a": "none"})
+        spacy_cat  = g["spacy_mutation"].map(lambda m: SPACY_MUTATION_MAP.get(m, "none"))
+        channel_kappa[ch] = _cohens_kappa(cysill_cat.tolist(), spacy_cat.tolist())
 
     all_cols = BAR_STATUSES
     channels = list(pivot_pct.index)
@@ -794,10 +859,13 @@ def fig_status_distribution(df):
             )
             ax.add_patch(rect)
             left += val
-        # Mismatch credibility annotation, outside the 100%-stacked area.
+        # Credibility annotation, outside the 100%-stacked area: Cohen's
+        # Kappa between spaCy and Cysill, not a stacked segment.
         ch = channels[row_idx]
-        ax.text(102, row_idx, f"mismatch: {mismatch_rate.get(ch, 0):.1f}%",
-                va="center", ha="left", fontsize=8, color="#555555")
+        kappa, kappa_n = channel_kappa.get(ch, (None, 0))
+        label = f"κ = {kappa:.2f} (n={kappa_n})" if kappa is not None else "κ = n/a"
+        ax.text(102, row_idx, label,
+                va="center", ha="left", fontsize=8, color="#8E44AD", fontweight="bold")
 
     ax.set_xlim(0, 100)
     ax.set_ylim(-0.5, n - 0.5)
@@ -808,7 +876,7 @@ def fig_status_distribution(df):
     ax.set_xlabel("% of evaluable mutation outcomes (Correct / Erosion / Wrong type)")
     ax.set_title("Evaluable Mutation Outcome Distribution by Channel\n"
                  "(phantom omissions excluded -- correct by construction; "
-                 "tagger mismatch shown separately, right of each bar)",
+                 "\u03ba = Cohen's Kappa, spaCy vs Cysill, shown separately, right of each bar)",
                  fontweight="bold", pad=12)
     ax.legend(handles=legend_handles, bbox_to_anchor=(1.01, 1),
               loc="upper left", fontsize=8)

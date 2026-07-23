@@ -80,10 +80,25 @@ JOIN_KEY_COLUMNS = ["video_title", "timestamp", "trigger_word", "following_word"
 
 
 def _mutations_dir_for(mutations_csv_path):
-    """The transcriptions/<stamp>_<slug>/ folder matching a given
-    mutations/<stamp>_<slug>/mutations_<stamp>_<slug>.csv path."""
-    slug_folder = mutations_csv_path.parent.name
-    return TRANS_DIR / slug_folder
+    """The transcriptions/<stamp>/<slug>/ folder matching a given
+    mutations/<stamp>/<slug>/mutations_<stamp>_<slug>.csv path.
+
+    # PATCH: updated for _video_slug()'s restored run-then-video nesting --
+    # mutations_csv_path now has two parent levels to read off (slug, then
+    # stamp above it), not one flat <stamp>_<slug> folder. Falls back to a
+    # BASE_DIR-rooted rglob for anything from before this fix (older flat
+    # layout, or the layout before that), same pattern as
+    # fetch_captions.py/manual_editing.py's find_segments_csv.
+    """
+    slug  = mutations_csv_path.parent.name
+    stamp = mutations_csv_path.parent.parent.name
+    candidate = TRANS_DIR / stamp / slug
+    if candidate.exists():
+        return candidate
+
+    folder_name = mutations_csv_path.stem[len("mutations_"):]
+    matches = list(BASE_DIR.rglob(f"pos_{folder_name}.csv"))
+    return matches[0].parent if matches else candidate
 
 
 def rebuild_words_only(pos_df):

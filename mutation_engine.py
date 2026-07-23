@@ -190,34 +190,39 @@ def run_paths(stamp):
 def _video_slug(meta, stamp):
     """
     Build a filesystem-safe filename slug for a single video, and organise
-    that video's output CSVs into their own per-video subfolder rather than
-    dumping everything flat into TRANS_DIR / MUT_DIR alongside every other
-    video ever processed.
+    that video's output CSVs into a run-then-video nested folder structure.
 
     Layout:
-        transcriptions/<stamp>_<slug>/segments_<stamp>_<slug>.csv
-        transcriptions/<stamp>_<slug>/words_<stamp>_<slug>.csv
-        transcriptions/<stamp>_<slug>/lemmas_<stamp>_<slug>.csv
-        transcriptions/<stamp>_<slug>/pos_<stamp>_<slug>.csv
-        mutations/<stamp>_<slug>/mutations_<stamp>_<slug>.csv
+        transcriptions/<stamp>/<slug>/segments_<stamp>_<slug>.csv
+        transcriptions/<stamp>/<slug>/words_<stamp>_<slug>.csv
+        transcriptions/<stamp>/<slug>/lemmas_<stamp>_<slug>.csv
+        transcriptions/<stamp>/<slug>/pos_<stamp>_<slug>.csv
+        mutations/<stamp>/<slug>/mutations_<stamp>_<slug>.csv
 
-    Filenames keep the stamp/slug (not just simplified to e.g. "words.csv")
-    so corpus_analyzer.py's existing filename-based batch parsing keeps
-    working unchanged even though the files now live one level deeper.
-    Falls back to the video id, then the run stamp if neither is available.
+    `stamp` is generated once per menu-loop iteration in welsh_pipeline.py
+    (see run_stamp()) and reused for every video processed in that single
+    run, so every video from the same option-1 or option-3 invocation
+    lands under the same <stamp> parent folder -- browsing by run, then by
+    video within it, same as before a previous session flattened this.
+    Filenames still carry both stamp and slug (not simplified to e.g.
+    "words.csv") so corpus_analyzer.py's existing filename-based parsing,
+    and every *.rglob("mutations_*.csv")-style discovery call elsewhere,
+    keep working unchanged regardless of nesting depth.
+    Falls back to the video id, then the run stamp, if neither is available
+    for the slug itself.
 
-    # PATCH: this previously nested transcripts an extra level deep
-    # (TRANS_DIR / stamp / folder_name, i.e. two levels) while mutations
-    # got NO per-video subfolder at all (MUT_DIR / stamp, shared flat
-    # across every video processed in that run, distinguished only by
-    # filename) -- neither matched this docstring's own stated layout, and
-    # the two output types ended up in structurally different places for
-    # the same video. corpus_analyzer.py's MUT_DIR.rglob("mutations_*.csv")
-    # still found the files regardless of depth, so aggregation kept
-    # working -- but a video's own mutations file was never actually
-    # sitting alongside its own transcript files the way the docstring
-    # (and anyone browsing the folders by hand) would expect. Fixed so
-    # both use the single per-video folder_name subfolder described above.
+    # PATCH: a previous fix collapsed both transcripts (which used to
+    # nest two levels deep, TRANS_DIR / stamp / folder_name) AND mutations
+    # (which had no per-video subfolder at all, flat under MUT_DIR / stamp)
+    # down to a single flat <stamp>_<slug> folder for both -- solving the
+    # transcript/mutation inconsistency, but as a side effect also
+    # removing the ability to browse a run's videos grouped together under
+    # one folder, which turned out to be wanted behavior, not a bug.
+    # Restored here the other direction: both output types now nest
+    # run-then-video symmetrically, rather than collapsing to flat.
+    # find_segments_csv() in fetch_captions.py/manual_editing.py and
+    # _mutations_dir_for() in rerun_rules.py all had fast-path candidates
+    # hardcoded to the old flat layout -- updated alongside this change.
     """
     import re
     title = meta.get("title") or meta.get("id") or stamp
@@ -227,17 +232,17 @@ def _video_slug(meta, stamp):
     slug = slug or "untitled"
 
     folder_name = f"{stamp}_{slug}"
-    video_trans_dir = TRANS_DIR / folder_name
-    video_mut_dir   = MUT_DIR / folder_name
+    video_trans_dir = TRANS_DIR / stamp / slug
+    video_mut_dir   = MUT_DIR / stamp / slug
     video_trans_dir.mkdir(parents=True, exist_ok=True)
     video_mut_dir.mkdir(parents=True, exist_ok=True)
 
     return {
-        "segments": video_trans_dir / f"segments_{stamp}_{slug}.csv",
-        "words":    video_trans_dir / f"words_{stamp}_{slug}.csv",
-        "lemmas":   video_trans_dir / f"lemmas_{stamp}_{slug}.csv",
-        "pos":      video_trans_dir / f"pos_{stamp}_{slug}.csv",
-        "mutations":video_mut_dir   / f"mutations_{stamp}_{slug}.csv",
+        "segments": video_trans_dir / f"segments_{folder_name}.csv",
+        "words":    video_trans_dir / f"words_{folder_name}.csv",
+        "lemmas":   video_trans_dir / f"lemmas_{folder_name}.csv",
+        "pos":      video_trans_dir / f"pos_{folder_name}.csv",
+        "mutations":video_mut_dir   / f"mutations_{folder_name}.csv",
     }
 
 def normalize_word(word):

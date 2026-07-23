@@ -302,27 +302,29 @@ def find_segments_csv(mutations_csv_path):
     """Mirrors manual_editing.py's / scan_dom_verbnoun_impact.py's
     find_segments_csv -- same layout, same fallback search.
 
-    # PATCH: the fast-path candidate here was hardcoded to
-    # TRANS_DIR/<stamp>/<folder_name>/segments_<folder_name>.csv, matching
-    # _video_slug()'s old (buggy) two-level transcript nesting. _video_slug
-    # now puts both transcripts and mutations in the same single
-    # TRANS_DIR/<folder_name>/ and MUT_DIR/<folder_name>/ subfolders, so
-    # mutations_csv_path.parent.name IS folder_name directly -- no separate
-    # "stamp" folder to read off the parent. Updated to match; the rglob
-    # fallback below still covers anything from before this fix.
+    # PATCH: fast-path candidate updated for _video_slug()'s restored
+    # run-then-video nesting (mutations/<stamp>/<slug>/, matching
+    # transcriptions/<stamp>/<slug>/ symmetrically) -- mutations_csv_path
+    # now has TWO parent levels to read off (slug, then stamp), not one.
+    # Also switched the rglob fallback's search root from a fixed
+    # mutations_csv_path.parents[N] hop count to BASE_DIR directly -- that
+    # fixed-depth assumption broke the first time folder nesting changed
+    # (this is the second time), since it silently resolves to the wrong
+    # directory instead of erroring when depth shifts.
     """
     stem = mutations_csv_path.stem
     if not stem.startswith("mutations_"):
         return None
     folder_name = stem[len("mutations_"):]
 
-    candidate = TRANS_DIR / folder_name / f"segments_{folder_name}.csv"
+    slug  = mutations_csv_path.parent.name
+    stamp = mutations_csv_path.parent.parent.name
+    candidate = TRANS_DIR / stamp / slug / f"segments_{folder_name}.csv"
     if candidate.exists():
         return candidate
 
     target_name = f"segments_{folder_name}.csv"
-    search_root = mutations_csv_path.parents[2] if len(mutations_csv_path.parents) >= 3 else BASE_DIR
-    matches = list(search_root.rglob(target_name))
+    matches = list(BASE_DIR.rglob(target_name))
     return matches[0] if matches else None
 
 
@@ -337,13 +339,14 @@ def find_words_csv(mutations_csv_path):
         return None
     folder_name = stem[len("mutations_"):]
 
-    candidate = TRANS_DIR / folder_name / f"words_{folder_name}.csv"
+    slug  = mutations_csv_path.parent.name
+    stamp = mutations_csv_path.parent.parent.name
+    candidate = TRANS_DIR / stamp / slug / f"words_{folder_name}.csv"
     if candidate.exists():
         return candidate
 
     target_name = f"words_{folder_name}.csv"
-    search_root = mutations_csv_path.parents[2] if len(mutations_csv_path.parents) >= 3 else BASE_DIR
-    matches = list(search_root.rglob(target_name))
+    matches = list(BASE_DIR.rglob(target_name))
     return matches[0] if matches else None
 
 
@@ -507,6 +510,19 @@ def local_window_text(tokens, center_idx, window=6):
     return " ".join(tokens[lo:hi])
 
 
+def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
+    """The actual reinforcement pass: applies rules 1-3 to every row of a
+    mutations_*.csv against the matching captions CSV (from a prior
+    fetch_captions.py run) and the video's own words_*.csv, and writes
+    the result back with new columns added.
+
+    Deliberately additive-only: NEVER touches status/is_erosion/
+    mutation_found/expected_mutation -- those are the pipeline's actual
+    classification and shouldn't be silently rewritten by a second-opinion
+    pass. Rows worth a second look get flagged=True (the existing
+    pipeline mechanism) so they route into manual_editing.py's queue for
+    a human decision, same as everything else that needs one.
+    """
 def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=None):
     """The actual reinforcement pass: applies rules 1-3 to every row of a
     mutations_*.csv against the matching captions CSV (from a prior

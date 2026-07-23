@@ -285,36 +285,37 @@ def pick_files_interactively(csv_paths):
 def find_segments_csv(mutations_csv_path):
     """
     Mirrors _video_slug()'s layout in mutation_engine.py:
-        mutations/<stamp>_<slug>/mutations_<stamp>_<slug>.csv
-        transcriptions/<stamp>_<slug>/segments_<stamp>_<slug>.csv
+        mutations/<stamp>/<slug>/mutations_<stamp>_<slug>.csv
+        transcriptions/<stamp>/<slug>/segments_<stamp>_<slug>.csv
     Falls back to a recursive filename search if that exact path doesn't
-    exist (older files, or a layout that predates migrate_files.py).
+    exist (older files, or a layout that predates this fix).
     Returns None if nothing is found -- context just won't be available
     for that file, rather than crashing the whole review session over it.
 
-    # PATCH: this was hardcoded to _video_slug()'s old two-level transcript
-    # nesting (TRANS_DIR/<stamp>/<folder_name>/...) with mutations sitting
-    # in a bare TRANS_DIR/<stamp>/ that had no slug subfolder at all --
-    # matching what _video_slug() used to do, but not what its own
-    # docstring said. Both output types now share one per-video
-    # <stamp>_<slug> subfolder, so folder_name (read straight off the
-    # mutations filename) is also the transcript subfolder name directly --
-    # no separate "stamp" parent folder to read off mutations_csv_path.
+    # PATCH: fast-path candidate updated for _video_slug()'s restored
+    # run-then-video nesting -- mutations_csv_path now has two parent
+    # levels to read off (slug, then stamp above it), not one flat
+    # <stamp>_<slug> folder. Also switched the rglob fallback's search
+    # root from a fixed mutations_csv_path.parents[N] hop count to
+    # BASE_DIR directly -- a fixed-depth assumption silently resolves to
+    # the wrong directory (rather than erroring) every time folder
+    # nesting changes, which it has twice now.
     """
     stem = mutations_csv_path.stem  # "mutations_<stamp>_<slug>"
     if not stem.startswith("mutations_"):
         return None
     folder_name = stem[len("mutations_"):]  # "<stamp>_<slug>"
 
-    candidate = TRANS_DIR / folder_name / f"segments_{folder_name}.csv"
+    slug  = mutations_csv_path.parent.name
+    stamp = mutations_csv_path.parent.parent.name
+    candidate = TRANS_DIR / stamp / slug / f"segments_{folder_name}.csv"
     if candidate.exists():
         return candidate
 
     # Fallback: search from the corpus root for a same-named segments file
     # anywhere under it (older files, or a layout that predates this fix).
     target_name = f"segments_{folder_name}.csv"
-    search_root = mutations_csv_path.parents[2] if len(mutations_csv_path.parents) >= 3 else BASE_DIR
-    matches = list(search_root.rglob(target_name))
+    matches = list(BASE_DIR.rglob(target_name))
     return matches[0] if matches else None
 
 
