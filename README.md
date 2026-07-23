@@ -162,23 +162,29 @@ option:
 WELSH_ANALYSIS_DIR/
 ├── audio/                                  downloaded/local MP3s
 ├── test_audio/                             drop local MP3s here for option 1
-├── captions/                               downloaded .vtt + parsed .csv caption files
-├── transcriptions/<stamp>_<video-title>/
-│   ├── segments_<stamp>_<video-title>.csv  Whisper's segment-level transcript
-│   ├── words_<stamp>_<video-title>.csv     word-level transcript + POS tags + per-word
+├── captions/<stamp>/<slug>/                downloaded .vtt + parsed .csv caption files --
+│                                              nested per-run/per-video, same as transcriptions/
+│                                              and mutations/ below
+├── transcriptions/<stamp>/<slug>/
+│   ├── segments_<stamp>_<slug>.csv         Whisper's segment-level transcript
+│   ├── words_<stamp>_<slug>.csv            word-level transcript + POS tags + per-word
 │   │                                        timestamps (what caption corroboration aligns against)
-│   ├── lemmas_<stamp>_<video-title>.csv
-│   └── pos_<stamp>_<video-title>.csv
-├── mutations/<stamp>_<video-title>/
-│   ├── mutations_<stamp>_<video-title>.csv        the actual findings -- this is what
-│   │                                               manual_editing.py and corpus_analyzer.py read
-│   └── mutations_..._precaption_backup.csv        only present if captions were fetched --
-│                                                    a one-time pre-corroboration safety copy
+│   ├── lemmas_<stamp>_<slug>.csv
+│   └── pos_<stamp>_<slug>.csv
+├── mutations/<stamp>/<slug>/
+│   ├── mutations_<stamp>_<slug>.csv        the actual findings -- this is what
+│   │                                        manual_editing.py and corpus_analyzer.py read
+│   └── mutations_..._precaption_backup.csv only present if captions were fetched --
+│                                              a one-time pre-corroboration safety copy
 ├── summaries/                              per-run CSV summaries written by option 3 itself
 │                                              (research_summary/, erosion_by_trigger_type/,
 │                                              erosion_by_rule/), not option 6
 ├── analysis/                               option 6's output: merged_mutations.csv,
 │   └── figures/                              utterance_export.csv, and chart images
+├── phrase_tests/                           menu option 4's ad-hoc "test a Welsh phrase"
+│                                              output -- deliberately kept outside mutations/
+│                                              and transcriptions/ so it never gets swept into
+│                                              the real corpus by option 6 or rerun_rules.py
 ├── video_queue.json                        pending videos (option 2 adds, option 3 consumes)
 ├── processed_videos.json                   videos already handled by option 3
 ├── processed_local_mp3s.json               local files already handled by option 1
@@ -187,6 +193,20 @@ WELSH_ANALYSIS_DIR/
                                               repeat words (very common in Welsh function words)
                                               don't re-hit the Cysill API or simplemma every time
 ```
+
+`captions/`, `transcriptions/`, and `mutations/` all share the exact same
+`<stamp>/<slug>/` nesting, generated once per video by `_video_slug()` --
+browsing any one of the three by run, then by video, lands you on the
+same folder name in the other two. The caption `.vtt`/`.csv` filenames
+themselves are still named by video ID + language (yt-dlp's own
+convention, e.g. `abc123.cy.vtt`), not by stamp/slug, since that naming
+comes from yt-dlp internally -- only the *directory* they land in follows
+the shared per-video layout.
+
+Running `fetch_captions.py` directly from the command line (rather than
+through the main pipeline) has no run/video context to nest into, so it
+still saves flat into `captions/` at the top level -- that's expected for
+ad-hoc standalone use, not a bug.
 
 If you see a `_precaption_backup.csv` next to a video's main mutations
 file, that's expected and safe to leave alone -- it's a one-time snapshot

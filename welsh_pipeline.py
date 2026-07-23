@@ -467,6 +467,17 @@ def main():
                     # scrolling log. Mirrors the "done in Xs" line that
                     # already closes each video.
                     tqdm.write(f"\n▶ {video.get('title', video['id'])}")
+                    # PATCH: vpaths computed here now, BEFORE caption fetch
+                    # (previously computed after, once mp3/analyze were
+                    # done) -- captions now nest per-run/per-video the same
+                    # way transcriptions and mutations do (captions_dir),
+                    # so download_captions() below needs vpaths to exist
+                    # first to know where to write. _video_slug() is safe
+                    # to call this early: it only derives a slug from
+                    # already-available video metadata and creates
+                    # directories, it doesn't depend on anything analyze()
+                    # produces.
+                    vpaths = _video_slug(video, stamp)
                     # PATCH: fetch captions FIRST, before transcription --
                     # this is "getting transcription data and validating
                     # it" as one step, not transcribe-now/validate-later.
@@ -482,7 +493,8 @@ def main():
                     try:
                         manual_cy, auto_cy, _ = fetch_captions.list_available_tracks(video["url"])
                         if manual_cy or auto_cy:
-                            vtt_path, cap_lang, cap_kind, _ = fetch_captions.download_captions(video["url"])
+                            vtt_path, cap_lang, cap_kind, _ = fetch_captions.download_captions(
+                                video["url"], out_dir=vpaths["captions_dir"])
                             if vtt_path is not None:
                                 cap_segments = fetch_captions.parse_vtt(vtt_path)
                                 captions_csv_path = vtt_path.with_suffix(".csv")
@@ -504,7 +516,6 @@ def main():
                     with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
                         segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub)
                     all_mutation_rows.extend(muts)
-                    vpaths = _video_slug(video, stamp)
                     h = [True] * 5   # fresh header flags per video (new file each time)
                     any_written = False
                     for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):

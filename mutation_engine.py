@@ -82,6 +82,23 @@ FIG_DIR      = OUT_DIR / "figures"
 # PATCH: persistent lemma cache path
 LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
 
+# BUGFIX: dedicated home for ad-hoc "test a Welsh phrase" output (menu
+# option 4, via run_paths() below). This used to write straight into
+# TRANS_DIR/MUT_DIR using flat filenames (mutations_<stamp>.csv, no
+# per-video subfolder). Because corpus_analyzer.py and rerun_rules.py both
+# aggregate the real corpus via MUT_DIR.rglob("mutations_*.csv") --
+# recursive, so nesting alone doesn't help -- a throwaway typed-phrase
+# test (explicitly documented as being for "checking a linguistic rule
+# against a specific example", not corpus contribution) would silently
+# get swept into the real erosion-rate research figures alongside genuine
+# video data. interactive_batch_selection() in corpus_analyzer.py does
+# let you spot and exclude it by hand at load time, but nothing stops it
+# from being missed, especially once there are many real batches to skim.
+# Giving phrase-test output its own directory entirely outside MUT_DIR's/
+# TRANS_DIR's tree means the glob simply never sees it -- no reliance on
+# a human catching it later.
+PHRASE_TEST_DIR = BASE_DIR / "phrase_tests"
+
 # PATCH: explicit imports instead of `import *` -- a star import makes
 # every name "maybe defined" to any linter/IDE, which is what generated
 # the wall of false-positive "possibly undefined" warnings after the
@@ -149,7 +166,7 @@ from mutation_tables import (
     NASAL_NUMERAL_VALID_TARGETS, MIXED_MUTATION_TRIGGERS,
     PREPOSED_ADJECTIVE_LEXICON, COMPOUND_NOUN_SECOND_ELEMENT,
     OBJ_DEPS, PHANTOM_CONTEXT_TAGS, KNOWN_HOMOGRAPH_COLLISIONS,
-    PREP_TAG_PREFIXES, PREDYN_TAGS, REL_INT_TAGS,
+    PREP_TAG_PREFIXES, PREDYN_TAGS, REL_INT_TAGS, VOCAT_DEPS,
     DIGRAPHS, WELSH_FILLERS, WELSH_VOWELS,
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
@@ -171,19 +188,35 @@ def ensure_dirs():
     # front makes the whole output layout visible from the very first
     # run, regardless of which menu options get used afterward.
     for p in [BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR,
-              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR]:
+              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR, PHRASE_TEST_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 def run_stamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def run_paths(stamp):
+    """
+    BUGFIX: this used to point "mutations" at
+    MUT_DIR / f"mutations_{stamp}.csv" -- a flat filename living directly
+    in MUT_DIR, matching the exact glob (mutations_*.csv) that
+    corpus_analyzer.py and rerun_rules.py both use to aggregate the real
+    per-video corpus. run_paths() is only ever called for menu option 4's
+    ad-hoc "test a Welsh phrase" output (see save_analysis_outputs in
+    corpus_ops.py) -- explicitly documented as being for checking a rule
+    against one example, not for contributing to the research corpus. Left
+    as-is, every phrase you tested via option 4 would silently become part
+    of the real erosion-rate figures the next time you ran option 6.
+    Redirected to PHRASE_TEST_DIR (a sibling of MUT_DIR/TRANS_DIR, outside
+    either directory's tree) so the aggregating globs -- which are
+    recursive and would still find it even nested deeper inside MUT_DIR --
+    never see it at all, regardless of filename.
+    """
     return {
-        "segments": TRANS_DIR / f"segments_{stamp}.csv",
-        "words":    TRANS_DIR / f"words_{stamp}.csv",
-        "lemmas":   TRANS_DIR / f"lemmas_{stamp}.csv",
-        "pos":      TRANS_DIR / f"pos_{stamp}.csv",
-        "mutations":MUT_DIR   / f"mutations_{stamp}.csv",
+        "segments": PHRASE_TEST_DIR / f"segments_{stamp}.csv",
+        "words":    PHRASE_TEST_DIR / f"words_{stamp}.csv",
+        "lemmas":   PHRASE_TEST_DIR / f"lemmas_{stamp}.csv",
+        "pos":      PHRASE_TEST_DIR / f"pos_{stamp}.csv",
+        "mutations":PHRASE_TEST_DIR / f"mutations_{stamp}.csv",
     }
 
 
@@ -198,6 +231,8 @@ def _video_slug(meta, stamp):
         transcriptions/<stamp>/<slug>/lemmas_<stamp>_<slug>.csv
         transcriptions/<stamp>/<slug>/pos_<stamp>_<slug>.csv
         mutations/<stamp>/<slug>/mutations_<stamp>_<slug>.csv
+        captions/<stamp>/<slug>/<video_id>.<lang>.vtt
+        captions/<stamp>/<slug>/<video_id>.<lang>.csv
 
     `stamp` is generated once per menu-loop iteration in welsh_pipeline.py
     (see run_stamp()) and reused for every video processed in that single
@@ -223,6 +258,17 @@ def _video_slug(meta, stamp):
     # find_segments_csv() in fetch_captions.py/manual_editing.py and
     # _mutations_dir_for() in rerun_rules.py all had fast-path candidates
     # hardcoded to the old flat layout -- updated alongside this change.
+    #
+    # PATCH: added "captions_dir" so caption data (.vtt + the parsed
+    # captions CSV) nests the same run-then-video way as transcriptions
+    # and mutations, instead of landing flat in CAPTIONS_DIR alongside
+    # every other video's captions ever fetched. Unlike the other keys
+    # above, this deliberately returns a DIRECTORY, not a filename --
+    # download_captions() derives the actual .vtt filename itself from
+    # the video ID (yt-dlp's own outtmpl convention), so the caller just
+    # needs somewhere to point out_dir at. welsh_pipeline.py's caption-
+    # fetch block now runs _video_slug() before fetching captions (it
+    # used to run after) specifically so this directory exists in time.
     """
     import re
     title = meta.get("title") or meta.get("id") or stamp
@@ -232,10 +278,12 @@ def _video_slug(meta, stamp):
     slug = slug or "untitled"
 
     folder_name = f"{stamp}_{slug}"
-    video_trans_dir = TRANS_DIR / stamp / slug
-    video_mut_dir   = MUT_DIR / stamp / slug
+    video_trans_dir    = TRANS_DIR / stamp / slug
+    video_mut_dir      = MUT_DIR / stamp / slug
+    video_captions_dir = CAPTIONS_DIR / stamp / slug
     video_trans_dir.mkdir(parents=True, exist_ok=True)
     video_mut_dir.mkdir(parents=True, exist_ok=True)
+    video_captions_dir.mkdir(parents=True, exist_ok=True)
 
     return {
         "segments": video_trans_dir / f"segments_{folder_name}.csv",
@@ -243,6 +291,7 @@ def _video_slug(meta, stamp):
         "lemmas":   video_trans_dir / f"lemmas_{folder_name}.csv",
         "pos":      video_trans_dir / f"pos_{folder_name}.csv",
         "mutations":video_mut_dir   / f"mutations_{folder_name}.csv",
+        "captions_dir": video_captions_dir,
     }
 
 def normalize_word(word):
@@ -2335,8 +2384,18 @@ def process_comprehensive_mutations(words_list):
                     i += 1
                     continue
 
-        # ---- Layer 1I: spaCy vocative → soft ----
-        if spacy_tok and spacy_tok.get("dep") == "vocative":
+        # ---- Layer 1I: spaCy vocative -> soft ----
+        # BUGFIX: was `spacy_tok.get("dep") == "vocative"` -- a hardcoded
+        # string duplicating VOCAT_DEPS from mutation_tables.py instead of
+        # importing and using it (VOCAT_DEPS previously wasn't imported
+        # into this file at all, so it sat there unused/orphaned -- easy to
+        # mistake for dead code, per this file's own stated philosophy
+        # that mutation_tables.py should be the single source of truth for
+        # exactly this kind of dependency-role set). Switched to `in
+        # VOCAT_DEPS` to match how OBJ_DEPS is used just above, and so a
+        # future second vocative-marking dep label only needs adding in
+        # one place.
+        if spacy_tok and spacy_tok.get("dep") in VOCAT_DEPS:
             t2 = layer_2_lemma_analysis(
                 current_node["word"],
                 cysill_pos=cysill_pos,
