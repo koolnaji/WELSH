@@ -510,19 +510,6 @@ def local_window_text(tokens, center_idx, window=6):
     return " ".join(tokens[lo:hi])
 
 
-def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None):
-    """The actual reinforcement pass: applies rules 1-3 to every row of a
-    mutations_*.csv against the matching captions CSV (from a prior
-    fetch_captions.py run) and the video's own words_*.csv, and writes
-    the result back with new columns added.
-
-    Deliberately additive-only: NEVER touches status/is_erosion/
-    mutation_found/expected_mutation -- those are the pipeline's actual
-    classification and shouldn't be silently rewritten by a second-opinion
-    pass. Rows worth a second look get flagged=True (the existing
-    pipeline mechanism) so they route into manual_editing.py's queue for
-    a human decision, same as everything else that needs one.
-    """
 def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=None):
     """The actual reinforcement pass: applies rules 1-3 to every row of a
     mutations_*.csv against the matching captions CSV (from a prior
