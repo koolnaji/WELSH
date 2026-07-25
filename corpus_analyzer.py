@@ -1127,6 +1127,28 @@ def print_corpus_summary(df, batch_log):
                 else:
                     print(f"    {reg:<12} {reg_n:>4} videos")
 
+    # PATCH: unfiltered row counts (every status -- correct, erosion,
+    # phantom, code-switch, mismatch, everything) per channel and per
+    # video. Every other count in this function (evaluable_n, the
+    # erosion-rate breakdowns below, every figure in the corresponding
+    # PNGs) is scoped to EVALUABLE_STATUSES or narrower -- there was
+    # previously no single place that answered the plain question
+    # "how many rows exist for X, full stop", which meant answering it
+    # required a one-off manual query against merged_mutations.csv.
+    if "channel" in df.columns:
+        print("\nRows per channel (UNFILTERED -- every status, incl. "
+              "phantom/code-switch/mismatch/etc.):")
+        for ch, n in df["channel"].value_counts().items():
+            print(f"  {ch:<24} {n:>6,}")
+
+    if "video_title" in df.columns:
+        print("\nRows per video (UNFILTERED -- every status):")
+        video_row_counts = df.groupby("video_title", sort=False).size() \
+            .sort_values(ascending=False)
+        for title, n in video_row_counts.items():
+            short_title = (title[:58] + "...") if isinstance(title, str) and len(title) > 61 else title
+            print(f"  {short_title:<61} {n:>6,}")
+
     print(f"\nTotal mutation contexts           : {total:,}")
     print(f"Code-switch cases                  : {cs_cases:,} ({cs_cases/total:.1%})"
           if total > 0 else f"Code-switch cases                  : {cs_cases:,}")

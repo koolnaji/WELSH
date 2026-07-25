@@ -148,6 +148,38 @@ CURATED_CHANNELS = [
     {"url": "https://www.youtube.com/@BBCRadio_Cymru/videos", "channel_register": "formal"},
     {"url": "https://www.youtube.com/channel/UCNH53DFjL1OBl3oWNxMmC_Q/videos",
      "channel_register": "unverified"},  # BBC Cymru Wales -- bilingual, spot-check before use
+    # PATCH: casual-register additions (not YouTube channels -- see
+    # corpus_ops.py's _resolve_entry_url()/_discover_ypod_json() for how
+    # discover_new_videos() handles non-YouTube sources).
+    #
+    # Haclediad -- long-running (since 2010), fully spontaneous unscripted
+    # peer conversation between three friends, once a month. Direct
+    # podcast RSS feed, confirmed via haclediad.cymru/subscribe.
+    {"url": "https://haclediad.cymru/rss", "channel_register": "casual"},
+    # Colli'r Plot (Y Pod) -- four novelists chatting about books and
+    # whatever else, unscripted. RSS feed via its Spreaker host.
+    {"url": "https://www.spreaker.com/show/5059223/episodes/feed",
+     "channel_register": "casual"},
+    # Pryd ar Dafod (Y Pod) -- casual food-and-chat interview podcast.
+    # Confirmed working: Anchor/Spotify-for-Podcasters publishes a
+    # standard public RSS feed for this show, so it goes through the
+    # normal yt-dlp path like Haclediad/Colli'r Plot -- no need for
+    # the _discover_ypod_json cache adapter after all. That adapter is
+    # left in corpus_ops.py in case a future Y Pod-only show turns out
+    # not to have a real feed the way this one did.
+    {"url": "https://anchor.fm/s/1064d88dc/podcast/rss",
+     "channel_register": "casual"},
+    # Siarad Siop efo Mari a Meilir (Y Pod) -- casual celebrity/pop-culture
+    # banter between two friends, unscripted. Confirmed: this show's Y Pod
+    # cache ID is "cwins" (a legacy name from when it started in 2023 as a
+    # RuPaul's Drag Race UK recap podcast, before broadening into general
+    # pop-culture chat) -- goes through the same ypod_json adapter as Pryd
+    # ar Dafod's cache did. Episode audio URLs here are already direct
+    # content.rss.com links (no Anchor-style play/redirect wrapper), so
+    # _extract_direct_media_url() passes them through unchanged -- verified
+    # working against this show's actual cache response, not guessed.
+    {"url": "https://ypod.cymru/beta/s/cache/podcast-cwins.json?v=1",
+     "channel_register": "casual", "type": "ypod_json"},
 ]
 
 # ========================= MUTATION TABLES =========================

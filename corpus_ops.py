@@ -14,7 +14,9 @@ import smtplib
 import subprocess
 import time
 from email.mime.text import MIMEText
+from urllib.parse import unquote, urlparse
 import pandas as pd
+import requests
 import yt_dlp
 from tqdm import tqdm
 
@@ -569,6 +571,12 @@ def _channel_short_name(url):
     # e.g. "https://www.youtube.com/c/HanshS4C/videos" -> "HanshS4C"
     parts = url.rstrip("/").split("/")
     name  = parts[-2] if parts[-1] == "videos" else parts[-1]
+    # PATCH: non-YouTube feed URLs often end in a generic filename
+    # (rss/feed/episodes/a cache .json) that tells you nothing about
+    # the show -- fall back to the domain in that case instead of
+    # printing e.g. "rss" in the channel picker.
+    if name.lower() in ("rss", "feed", "episodes") or name.lower().endswith(".json"):
+        name = urlparse(url).netloc
     return name.lstrip("@")
 
 def prompt_channel_selection():
@@ -590,6 +598,72 @@ def prompt_channel_selection():
         return None
     return picks
 
+def _resolve_entry_url(entry, channel_url):
+    """
+    extract_flat entries vary by extractor: YouTube's flat channel
+    listing only gives a bare video id (no scheme) in "url", so that
+    case needs reconstructing into a real watch URL. Podcast RSS
+    entries, on the other hand, already carry a fully-qualified
+    url/webpage_url pointing at the actual episode -- reconstructing
+    anything for those would silently point every episode at a bogus
+    youtube.com/watch link instead.
+    """
+    candidate = entry.get("webpage_url") or entry.get("url")
+    if candidate and candidate.startswith("http"):
+        return candidate
+    vid_id = entry.get("id")
+    if vid_id and "youtube.com" in channel_url:
+        return f"https://www.youtube.com/watch?v={vid_id}"
+    return candidate  # may be None -- caller skips if so
+
+
+def _extract_direct_media_url(anchor_play_url):
+    """
+    Anchor/Spotify-for-Podcasters wraps each episode's real media URL
+    in a tracking redirect:
+    https://anchor.fm/s/<show_id>/podcast/play/<ep_id>/<urlencoded-real-url>
+    yt-dlp can usually follow this redirect on its own, but pulling the
+    real CDN URL out directly is more robust -- it doesn't depend on
+    yt-dlp recognizing Anchor's specific redirect scheme, just a plain
+    HTTP(S) media file, which the generic downloader always handles.
+    """
+    m = re.search(r'/play/\d+/(https?%3A.*)$', anchor_play_url, re.IGNORECASE)
+    return unquote(m.group(1)) if m else anchor_play_url
+
+
+def _discover_ypod_json(source_url, channel_register, processed, queue_ids):
+    """
+    Y Pod hosts some shows (e.g. Pryd Ar Dafod) via an internal cache
+    JSON rather than exposing a plain RSS feed -- reverse-engineered
+    from the site's own Network requests, not a documented public API,
+    so this may need adjusting if Y Pod changes their cache format.
+    Returns a list of queue-entry dicts in the same shape yt-dlp-backed
+    discovery produces, so the rest of discover_new_videos() doesn't
+    need to know which path a given source came through.
+    """
+    out = []
+    try:
+        resp = requests.get(source_url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f" 💥 Failed collecting {source_url}: {e}")
+        return out
+    for ep in data.get("Episodes", []):
+        audio_url = ep.get("audio")
+        if not audio_url:
+            continue
+        direct_url = _extract_direct_media_url(audio_url)
+        m = re.search(r'/play/(\d+)/', audio_url)
+        ep_id = m.group(1) if m else direct_url
+        if ep_id in processed or ep_id in queue_ids:
+            continue
+        out.append({"id": ep_id, "url": direct_url,
+                    "title": ep.get("title", "unknown"),
+                    "source": source_url, "channel_register": channel_register})
+    return out
+
+
 def discover_new_videos(limit, channels=None):
     out = []
     opts = {"quiet": True, "extract_flat": True, "no_warnings": True}
@@ -601,14 +675,28 @@ def discover_new_videos(limit, channels=None):
         channel_url = ch["url"]
         channel_register = ch["channel_register"]
         print(f"Collecting from: {channel_url} [{channel_register}]")
+        # PATCH: Y Pod's internal cache JSON isn't RSS/Atom, so yt-dlp's
+        # generic extractor can't enumerate it as a playlist -- branch
+        # to a dedicated adapter instead of forcing it through yt-dlp.
+        if ch.get("type") == "ypod_json":
+            out.extend(_discover_ypod_json(channel_url, channel_register,
+                                            processed, queue_ids))
+            continue
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
                 for entry in info.get("entries", []):
-                    vid_id = entry.get("id")
-                    if vid_id and vid_id not in processed and vid_id not in queue_ids:
+                    # PATCH: was hardcoded to reconstruct a
+                    # youtube.com/watch?v=<id> URL regardless of
+                    # source -- silently wrong for any non-YouTube
+                    # feed (e.g. podcast RSS), which already carries
+                    # its own real episode URL. See
+                    # _resolve_entry_url()'s docstring.
+                    vid_id    = entry.get("id") or entry.get("url")
+                    entry_url = _resolve_entry_url(entry, channel_url)
+                    if vid_id and entry_url and vid_id not in processed and vid_id not in queue_ids:
                         out.append({"id": vid_id,
-                                    "url": f"https://www.youtube.com/watch?v={vid_id}",
+                                    "url": entry_url,
                                     "title": entry.get("title", "unknown"),
                                     "source": channel_url,
                                     "channel_register": channel_register})
