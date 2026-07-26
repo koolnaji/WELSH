@@ -572,19 +572,46 @@ def _channel_short_name(url):
     parts = url.rstrip("/").split("/")
     name  = parts[-2] if parts[-1] == "videos" else parts[-1]
     # PATCH: non-YouTube feed URLs often end in a generic filename
-    # (rss/feed/episodes/a cache .json) that tells you nothing about
+    # (rss/feed/episodes/a cache .json, sometimes with a trailing
+    # ?v=... cache-busting query string) that tells you nothing about
     # the show -- fall back to the domain in that case instead of
-    # printing e.g. "rss" in the channel picker.
-    if name.lower() in ("rss", "feed", "episodes") or name.lower().endswith(".json"):
+    # printing e.g. "rss" or "podcast-cwins.json?v=1" in the channel
+    # picker. This is now only a fallback for entries with no explicit
+    # "name" -- see channel_display_name() below, which every current
+    # non-YouTube CURATED_CHANNELS entry actually has.
+    bare = name.split("?")[0].lower()
+    if bare in ("rss", "feed", "episodes") or bare.endswith(".json"):
         name = urlparse(url).netloc
     return name.lstrip("@")
+
+def channel_display_name(ch_or_url):
+    """
+    Human-readable name for a CURATED_CHANNELS entry (or a bare source
+    URL, e.g. one already stored on a queue entry). Prefers the explicit
+    "name" field -- added specifically because non-YouTube feed/cache
+    URLs are opaque to a human (an RSS path or cache filename says
+    nothing about the show) -- falling back to _channel_short_name()'s
+    URL-derived slug for entries that don't define one (the existing
+    YouTube channels, whose slug already reads fine, e.g. "HanshS4C").
+    Accepts either a CURATED_CHANNELS dict directly, or a bare URL
+    string (looked up against CURATED_CHANNELS by exact URL match) --
+    the latter covers queue entries, which only persist "source", not
+    the full channel dict that produced them.
+    """
+    if isinstance(ch_or_url, dict):
+        name = ch_or_url.get("name")
+        return name if name else _channel_short_name(ch_or_url["url"])
+    for ch in CURATED_CHANNELS:
+        if ch["url"] == ch_or_url:
+            return ch.get("name") or _channel_short_name(ch_or_url)
+    return _channel_short_name(ch_or_url)
 
 def prompt_channel_selection():
     """Returns a list of CURATED_CHANNELS dicts ({"url", "channel_register"}),
     or None to mean "use all" (discover_new_videos default)."""
     print("\nAvailable channels:")
     for i, ch in enumerate(CURATED_CHANNELS, 1):
-        print(f"  {i} = {_channel_short_name(ch['url']):<20} [{ch['channel_register']}]")
+        print(f"  {i} = {channel_display_name(ch):<30} [{ch['channel_register']}]")
     print(f"  a = All channels")
     raw = input("Select channel(s) [a]: ").strip().lower() or "a"
     if raw == "a":

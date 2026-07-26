@@ -44,7 +44,7 @@ figures.
 |---|---|---|
 | `WELSH_ANALYSIS_DIR` | No | Where all output lives (audio, transcripts, mutations, summaries, queue/cache files). Defaults to `~/welsh_analysis` if unset. |
 | `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. |
-| `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after menu options 1 and 3 finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
+| `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after Queue & Processing -> b (Process queue) or Testing -> b (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
 
 Never commit real values for any of these -- keep them in your actual
 environment/shell profile/`.env`, not in source files.
@@ -90,65 +90,26 @@ automatically at the right point in the main workflow):**
 
 ## Workflow
 
-The usual path through a Welsh channel looks like: **2** (find videos) ->
-**3** (transcribe + analyze + auto-corroborate) -> **7** (review by hand) ->
-**6** (generate figures once you're happy with the data). Everything below
-is a menu option in `welsh_pipeline.py`; entering `q` at any sub-prompt
-cancels back to this menu without losing anything already done.
+`welsh_pipeline.py`'s menu has three categories -- pick a number, then a
+letter. `q` at either level cancels back without losing anything already
+done.
 
-**1 -- Analyze local MP3 files.** Point it at a folder of Welsh MP3s (no
-YouTube involved, so no captions to corroborate against). Transcribes and
-analyzes each one exactly like option 3 does, then writes the same output
-files. Remembers which files it's already processed (by filename + size)
-in `processed_local_mp3s.json`, so re-running after adding new files to
-the folder only processes the new ones -- and if a file changes size, it's
-treated as new and reprocessed.
+The usual path: **1a** (discover) -> **1b** (process queue) -> **1d**
+(review by hand) -> **2a** (generate figures).
 
-**2 -- Discover new videos.** Scans the channels configured in
-`CURATED_CHANNELS` (inside `mutation_engine.py`) for videos not already in
-your queue or already processed, and adds them to `video_queue.json` for
-option 3 to work through later. Doesn't download or transcribe anything
-itself.
+**1 -- Queue & Processing**
+- **a** Discover new videos -- scans `CURATED_CHANNELS` (in `mutation_engine.py`) for anything new, adds it to `video_queue.json`. Doesn't download or transcribe.
+- **b** Process queue -- transcribes, analyzes, and (YouTube sources only) caption-corroborates. Failed videos retry up to 3x (`failed_videos.json`) before being given up on. Sends a completion email if configured.
+- **c** Manage queue -- view, filter, or remove queued videos.
+- **d** Manually review mutations -- launches `manual_editing.py` (`--help` for its filtering options).
+- **e** Re-run mutation rule(s) -- launches `rerun_rules.py` to re-evaluate already-transcribed videos after a rule change, without re-transcribing or re-hitting Cysill.
 
-**3 -- Process queue.** The main event. Pulls videos off the queue (you
-choose how many) and, for each one: fetches its YouTube captions first (if
-available), transcribes the audio with Whisper, runs the full mutation
-analysis, saves everything to its own subfolder, then immediately
-cross-checks the mutation findings against the captions it fetched at the
-start. A video that fails doesn't stop the batch -- it's retried up to 3
-times across future runs (`failed_videos.json`) before being given up on
-and marked processed anyway, so one bad video can't block the queue
-forever. Sends a completion email if you've set up notifications.
+**2 -- Analysis**
+- **a** Run corpus analyzer -- merges every mutations file ever produced into corpus-wide figures + a summary. Read-only; also runnable directly as `python corpus_analyzer.py`.
 
-**4 -- Test a Welsh phrase.** Type or paste a short phrase directly (no
-audio) and see how the engine analyzes it. Useful for checking a
-linguistic rule against a specific example without waiting on
-transcription.
-
-**5 -- Manage queue.** View, reorder, or remove videos sitting in the
-queue before they're processed.
-
-**6 -- Run corpus analyzer.** Runs `corpus_analyzer.py` over every
-mutations file you've produced so far (across every past run, not just
-the most recent one), merges them into one dataset, and generates figures
-plus a text summary. This is a read-only reporting step -- it never
-changes your underlying mutation data, and you can also run
-`python corpus_analyzer.py` directly from the command line for the same
-result.
-
-**7 -- Manually review mutations.** Launches `manual_editing.py`, which
-walks you through mutation rows one at a time so you can confirm or
-correct each `is_erosion` call by hand. At each row: `[y]es`/`[n]o` records
-your decision and moves on, `[s]kip` leaves it untouched, `[f]lag` marks it
-for later with an optional note, `[j]ump` goes straight to a row number,
-`[/]` searches the whole queue, `[` `]` jump to the previous/next file's
-first row, `[c]` clears a row's review history, `[p]revious` steps back,
-`[q]uit` saves and exits. Rows you've already reviewed are skipped on the
-next run by default (pass `--review-all` to see them again); flagged and
-skipped rows always reappear until you decide on them. Run
-`python manual_editing.py --help` to see every filtering option
-(`--status`, `--trigger`, `--rule`, `--flagged-only`, `--sample N`, and
-more) for narrowing the queue before you start.
+**3 -- Testing**
+- **a** Test a Welsh phrase -- no audio, no transcription wait.
+- **b** Analyze local MP3 files -- point it at a folder of MP3s (no captions to corroborate against). Asks **save** (real corpus, same as 1b) or **preview** (writes to `mp3_previews/` instead, never marked processed) -- use preview to sanity-check an unfamiliar audio source before committing it.
 
 ## Where your data ends up
 
@@ -161,7 +122,7 @@ option:
 ```
 WELSH_ANALYSIS_DIR/
 ├── audio/                                  downloaded/local MP3s
-├── test_audio/                             drop local MP3s here for option 1
+├── test_audio/                             drop local MP3s here for Testing -> b
 ├── captions/<stamp>/<slug>/                downloaded .vtt + parsed .csv caption files --
 │                                              nested per-run/per-video, same as transcriptions/
 │                                              and mutations/ below
@@ -176,18 +137,21 @@ WELSH_ANALYSIS_DIR/
 │   │                                        manual_editing.py and corpus_analyzer.py read
 │   └── mutations_..._precaption_backup.csv only present if captions were fetched --
 │                                              a one-time pre-corroboration safety copy
-├── summaries/                              per-run CSV summaries written by option 3 itself
-│                                              (research_summary/, erosion_by_trigger_type/,
-│                                              erosion_by_rule/), not option 6
-├── analysis/                               option 6's output: merged_mutations.csv,
+├── summaries/                              per-run CSV summaries written by Queue & Processing -> b
+│                                              itself (research_summary/, erosion_by_trigger_type/,
+│                                              erosion_by_rule/), not Analysis -> a
+├── analysis/                               Analysis -> a's output: merged_mutations.csv,
 │   └── figures/                              utterance_export.csv, and chart images
-├── phrase_tests/                           menu option 4's ad-hoc "test a Welsh phrase"
+├── phrase_tests/                           Testing -> a's ad-hoc "test a Welsh phrase"
 │                                              output -- deliberately kept outside mutations/
 │                                              and transcriptions/ so it never gets swept into
-│                                              the real corpus by option 6 or rerun_rules.py
-├── video_queue.json                        pending videos (option 2 adds, option 3 consumes)
-├── processed_videos.json                   videos already handled by option 3
-├── processed_local_mp3s.json               local files already handled by option 1
+│                                              the real corpus by Analysis -> a or rerun_rules.py
+├── mp3_previews/                           Testing -> b's output when you choose "preview" instead
+│                                              of "save" -- same quarantine idea as phrase_tests/,
+│                                              never marked processed, never swept into the corpus
+├── video_queue.json                        pending videos (Queue & Processing -> a adds, -> b consumes)
+├── processed_videos.json                   videos already handled by Queue & Processing -> b
+├── processed_local_mp3s.json               local files already saved via Testing -> b
 ├── failed_videos.json                      videos that errored, with retry count
 └── lemma_cache.json                        word -> lemma lookups, cached across every run so
                                               repeat words (very common in Welsh function words)

@@ -99,6 +99,16 @@ LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
 # a human catching it later.
 PHRASE_TEST_DIR = BASE_DIR / "phrase_tests"
 
+# PATCH: dedicated home for local-MP3 "preview, don't save" output --
+# the Testing menu's save-or-preview toggle (see welsh_pipeline.py).
+# Same rationale as PHRASE_TEST_DIR just above: a sibling of MUT_DIR/
+# TRANS_DIR, outside either directory's tree, so a preview run (e.g.
+# sanity-checking a new/unfamiliar audio source before trusting it) is
+# never picked up by option 6's or rerun_rules.py's *.rglob("mutations_*.csv")
+# discovery -- something you haven't decided to keep shouldn't silently
+# become part of your erosion-rate figures.
+PREVIEW_DIR = BASE_DIR / "mp3_previews"
+
 # PATCH: explicit imports instead of `import *` -- a star import makes
 # every name "maybe defined" to any linter/IDE, which is what generated
 # the wall of false-positive "possibly undefined" warnings after the
@@ -146,20 +156,35 @@ CURATED_CHANNELS = [
     {"url": "https://www.youtube.com/@RowndaRownd/videos", "channel_register": "informal"},
     {"url": "https://www.youtube.com/@S4C/videos",         "channel_register": "informal"},
     {"url": "https://www.youtube.com/@BBCRadio_Cymru/videos", "channel_register": "formal"},
-    {"url": "https://www.youtube.com/channel/UCNH53DFjL1OBl3oWNxMmC_Q/videos",
-     "channel_register": "unverified"},  # BBC Cymru Wales -- bilingual, spot-check before use
+    # PATCH: BBC Cymru Wales (UCNH53DFjL1OBl3oWNxMmC_Q) removed -- it
+    # sat as "unverified" since it was added (general bilingual channel,
+    # never actually spot-checked as Welsh-medium) and was never going to
+    # be usable in a formal/informal/casual comparison in that state.
+    # Re-add with a real "name" and a decided register if it's ever
+    # verified.
+    #
     # PATCH: casual-register additions (not YouTube channels -- see
     # corpus_ops.py's _resolve_entry_url()/_discover_ypod_json() for how
-    # discover_new_videos() handles non-YouTube sources).
+    # discover_new_videos() handles non-YouTube sources). Each carries an
+    # explicit "name" -- unlike a YouTube channel URL (where the slug in
+    # the URL itself, e.g. "HanshS4C", already reads fine), an RSS path
+    # or cache filename ("rss", "podcast-cwins.json?v=1") tells a human
+    # nothing about the show. prompt_channel_selection() in corpus_ops.py
+    # prefers this field when present.
     #
     # Haclediad -- long-running (since 2010), fully spontaneous unscripted
     # peer conversation between three friends, once a month. Direct
     # podcast RSS feed, confirmed via haclediad.cymru/subscribe.
-    {"url": "https://haclediad.cymru/rss", "channel_register": "casual"},
+    # PATCH: haclediad.cymru/rss (what /subscribe pointed at) wasn't
+    # actually resolving through yt-dlp -- confirmed via search index that
+    # the real canonical feed is hosted directly on Fireside, not served
+    # reliably at the custom-domain path. Swapped to the confirmed URL.
+    {"url": "https://feeds.fireside.fm/haclediad/rss", "name": "Haclediad",
+     "channel_register": "casual"},
     # Colli'r Plot (Y Pod) -- four novelists chatting about books and
     # whatever else, unscripted. RSS feed via its Spreaker host.
     {"url": "https://www.spreaker.com/show/5059223/episodes/feed",
-     "channel_register": "casual"},
+     "name": "Colli'r Plot", "channel_register": "casual"},
     # Pryd ar Dafod (Y Pod) -- casual food-and-chat interview podcast.
     # Confirmed working: Anchor/Spotify-for-Podcasters publishes a
     # standard public RSS feed for this show, so it goes through the
@@ -168,7 +193,7 @@ CURATED_CHANNELS = [
     # left in corpus_ops.py in case a future Y Pod-only show turns out
     # not to have a real feed the way this one did.
     {"url": "https://anchor.fm/s/1064d88dc/podcast/rss",
-     "channel_register": "casual"},
+     "name": "Pryd ar Dafod", "channel_register": "casual"},
     # Siarad Siop efo Mari a Meilir (Y Pod) -- casual celebrity/pop-culture
     # banter between two friends, unscripted. Confirmed: this show's Y Pod
     # cache ID is "cwins" (a legacy name from when it started in 2023 as a
@@ -179,6 +204,7 @@ CURATED_CHANNELS = [
     # _extract_direct_media_url() passes them through unchanged -- verified
     # working against this show's actual cache response, not guessed.
     {"url": "https://ypod.cymru/beta/s/cache/podcast-cwins.json?v=1",
+     "name": "Siarad Siop efo Mari a Meilir",
      "channel_register": "casual", "type": "ypod_json"},
 ]
 
@@ -220,7 +246,8 @@ def ensure_dirs():
     # front makes the whole output layout visible from the very first
     # run, regardless of which menu options get used afterward.
     for p in [BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR,
-              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR, PHRASE_TEST_DIR]:
+              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR, PHRASE_TEST_DIR,
+              PREVIEW_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 def run_stamp():
@@ -324,6 +351,37 @@ def _video_slug(meta, stamp):
         "pos":      video_trans_dir / f"pos_{folder_name}.csv",
         "mutations":video_mut_dir   / f"mutations_{folder_name}.csv",
         "captions_dir": video_captions_dir,
+    }
+
+def _preview_video_slug(meta, stamp):
+    """
+    Mirrors _video_slug() above but writes under PREVIEW_DIR instead of
+    TRANS_DIR/MUT_DIR -- used by the Testing menu's "preview, don't save"
+    choice for local MP3 analysis (see welsh_pipeline.py). Deliberately a
+    separate small function rather than parameterizing _video_slug() with
+    a base-dir argument: _video_slug() is also called from the queue-
+    processing path, where "preview" isn't a concept at all (queue videos
+    are always real corpus data) -- keeping this separate avoids threading
+    an always-unused parameter through that call site too.
+
+    No captions_dir here -- local MP3s never fetch captions regardless of
+    preview/save, same as the real path.
+    """
+    title = meta.get("title") or meta.get("id") or stamp
+    slug = re.sub(r"[^\w\s-]", "", str(title), flags=re.UNICODE)
+    slug = re.sub(r"[\s]+", "_", slug.strip())[:60]
+    slug = slug or "untitled"
+
+    folder_name = f"{stamp}_{slug}"
+    video_dir = PREVIEW_DIR / stamp / slug
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "segments": video_dir / f"segments_{folder_name}.csv",
+        "words":    video_dir / f"words_{folder_name}.csv",
+        "lemmas":   video_dir / f"lemmas_{folder_name}.csv",
+        "pos":      video_dir / f"pos_{folder_name}.csv",
+        "mutations":video_dir / f"mutations_{folder_name}.csv",
     }
 
 def normalize_word(word):
