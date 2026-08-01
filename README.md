@@ -32,10 +32,20 @@ figures.
    version. The pipeline continues without it, but parser-based validation
    (dependency-aware mutation rules, caption corroboration's POS check)
    will be unavailable.
-5. Copy `.env.example` to your preferred environment-variable setup and
+5. Optionally, download Techiaith's Bangor lexicon
+   (`lecsicon_cc0.zip` from
+   [techiaith/lecsicon-cymraeg-bangor](https://github.com/techiaith/lecsicon-cymraeg-bangor),
+   CC0), unzip it, and place `lecsicon_cc0.txt` somewhere on disk (or set
+   `BANGOR_LEXICON_PATH` to point at it -- see **Environment variables**
+   below). This is a local, offline lookup used to resolve lemmas and
+   unambiguous POS/mutation/gender info without hitting the Cysill API,
+   cutting down on the 429 rate-limiting that endpoint runs into on real
+   corpus-sized runs. The pipeline continues without it, falling back to
+   Cysill/spaCy/simplemma exactly as before.
+6. Copy `.env.example` to your preferred environment-variable setup and
    fill in what you need (see **Environment variables** below). Only
    `WELSH_ANALYSIS_DIR` affects core functionality; the rest are optional.
-6. Run `python welsh_pipeline.py`. This opens the main interactive menu
+7. Run `python welsh_pipeline.py`. This opens the main interactive menu
    (see **Workflow** below).
 
 ### Environment variables
@@ -44,6 +54,7 @@ figures.
 |---|---|---|
 | `WELSH_ANALYSIS_DIR` | No | Where all output lives (audio, transcripts, mutations, summaries, queue/cache files). Defaults to `~/welsh_analysis` if unset. |
 | `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. |
+| `BANGOR_LEXICON_PATH` | No | Path to the downloaded `lecsicon_cc0.txt` file (see **Setup** step 5). Without it, lemma/POS/mutation-type/gender lookups go straight to Cysill/spaCy/simplemma, same as before this existed. Defaults to `bangor_lexicon/lecsicon_cc0.txt` (relative to wherever you run the pipeline from) if unset. |
 | `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after Queue & Processing -> b (Process queue) or Testing -> b (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
 
 Never commit real values for any of these -- keep them in your actual
@@ -71,9 +82,17 @@ run on its own from the command line.
 - `corpus_ops.py` -- file I/O: the video queue, processed/failed logs,
   audio download, the `analyze()` function that runs one video end to end,
   and the completion email.
+- `bangor_lexicon.py` -- optional, local, offline lookup against
+  Techiaith's own Bangor lexicon (~830k wordforms). Loaded once at
+  startup if available (see **Setup** step 5); resolves most lemmas, and
+  a smaller set of unambiguous POS/mutation/gender readings, without
+  going through the Cysill API at all. Never populates `cysill_pos`
+  itself (different tag scheme, no published mapping) -- only the
+  translated `cysill_mutation_type`/`cysill_gender` fields, and lemmas.
 
-**Standalone companions (each also runs directly, and each is called
-automatically at the right point in the main workflow):**
+**Standalone companions (each also runs directly; most are called
+automatically at the right point in the main workflow -- exceptions
+noted below):**
 
 - `fetch_captions.py` -- downloads a video's YouTube captions and checks
   them against a mutations CSV already produced for that video. Aligns
@@ -87,6 +106,17 @@ automatically at the right point in the main workflow):**
   anything uncertain, leave notes, search, or just skim a summary.
 - `corpus_analyzer.py` -- reads every mutations CSV you've ever produced,
   merges them, and generates corpus-wide figures and a text summary.
+- `validate_against_chat.py` -- **not** wired into the main menu, run by
+  hand. Compares Whisper's own transcript for a Bangor Siarad corpus
+  recording against that recording's human-made CHAT-format (`.cha`)
+  ground-truth transcript, using the same whole-video alignment engine as
+  `fetch_captions.py`. Useful as a spot-check on genuinely spontaneous,
+  overlapping, multi-speaker audio -- the one place in this project with
+  a real ground-truth transcript to measure Whisper against, rather than
+  assuming it degrades gracefully the way it does on scripted/produced
+  sources. Always run with `--dump-clean` on a new file first (its CHAT
+  annotation cleanup hasn't been validated against a real downloaded
+  Bangor Siarad file yet -- see the script's own docstring).
 
 ## Workflow
 

@@ -472,6 +472,35 @@ def _resolve_suppletive_comparative_radical(raw):
             return radical
     return None
 
+def load_bangor_lexicon():
+    """
+    Thin wrapper around bangor_lexicon.load() that degrades gracefully
+    instead of crashing pipeline startup -- the lexicon is a traffic-
+    reduction optimization, not a hard dependency. Every consumer
+    (get_welsh_lemma below, enrich_words) already checks
+    bangor_lexicon.is_loaded() and falls through to the live
+    Cysill/simplemma path when it's False, so a missing/not-yet-
+    downloaded lexicon file should mean "run exactly as before", not
+    "pipeline won't start". Same print-and-continue convention as
+    load_spacy() in spacy_tagging.py.
+
+    Call this once at pipeline startup (see welsh_pipeline.py's main(),
+    right next to load_spacy()) -- NOT automatically on import, and NOT
+    lazily inside get_welsh_lemma()/enrich_words() themselves, so a
+    missing file produces one clear message at startup instead of a
+    silent per-call no-op that's easy to not notice for an entire run.
+    """
+    try:
+        bangor_lexicon.load()
+        print(f"✅ Bangor lexicon loaded ({bangor_lexicon.wordform_count():,} wordforms).")
+        return True
+    except FileNotFoundError as e:
+        print(f"⚠️  {e}")
+        print("   Continuing without it -- lemma/POS lookups will go through "
+              "Cysill/simplemma only, same as before this existed.")
+        return False
+
+
 def get_welsh_lemma(word):
     w = normalize_word(word)
     if not w:

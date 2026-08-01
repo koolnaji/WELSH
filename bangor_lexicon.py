@@ -147,6 +147,14 @@ def is_loaded():
     return _lexicon is not None
 
 
+def wordform_count():
+    """0 if not loaded, else the number of unique wordforms -- exists so
+    callers (load_bangor_lexicon() in mutation_engine.py) can print a
+    real confirmation number without reaching into the private
+    _lexicon module variable directly."""
+    return len(_lexicon) if _lexicon is not None else 0
+
+
 def lookup(word):
     """
     Returns the list of lexicon entries for this EXACT wordform. Empty

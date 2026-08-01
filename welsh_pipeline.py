@@ -28,6 +28,7 @@ from mutation_engine import (
     BASE_DIR, LOCAL_MP3_DIR, PREVIEW_DIR,
     ensure_dirs, run_stamp, _video_slug, _preview_video_slug, load_spacy,
     reset_cysill_circuit_breaker, load_lemma_cache, save_lemma_cache,
+    load_bangor_lexicon,
 )
 from corpus_ops import (
     load_queue, save_queue, load_processed, save_processed,
@@ -253,6 +254,11 @@ def main():
     load_lemma_cache()
     print("Loading Welsh dependency parser...")
     load_spacy()
+    # PATCH: optional offline lookup that reduces live Cysill traffic --
+    # see load_bangor_lexicon()'s own docstring for why this is called
+    # once here rather than lazily. A missing file just means "run
+    # exactly as before this existed", not a startup failure.
+    load_bangor_lexicon()
 
     # PATCH: model is now session-scoped (loaded lazily, cached across menu
     # loops) instead of being re-prompted/re-loaded every single choice.
