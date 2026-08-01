@@ -27,6 +27,7 @@ from tqdm import tqdm
 # SPACY_NLP/SPACY_AVAILABLE/load_spacy/parse_spacy_doc). load_spacy is
 # re-exported here for welsh_pipeline.py, which imports it from this module.
 from spacy_tagging import load_spacy, parse_spacy_doc
+import bangor_lexicon
 
 
 try:
@@ -228,7 +229,7 @@ from mutation_tables import (
     DIGRAPHS, WELSH_FILLERS, WELSH_VOWELS,
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
-    _COMBINING_LEGAL,
+    _LEGAL_BASE_MARK_PAIRS,
 )
 
 
@@ -499,6 +500,24 @@ def get_welsh_lemma(word):
         return None
     if w in LEMMA_CACHE:
         return LEMMA_CACHE[w]
+    # PATCH: Bangor lexicon lookup BEFORE hitting the live Cysill
+    # lemmatizer endpoint -- same "cache-first, network as fallback"
+    # shape as the LEMMA_CACHE check just above, just pre-seeded with
+    # ~497k wordforms instead of only whatever this run has already
+    # looked up. Deliberately uses the lemma-unambiguous check (96.3%
+    # coverage, measured against the real file), not a full-entry
+    # lookup -- see bangor_lexicon.lemma_if_unambiguous()'s own
+    # docstring for why picking among genuinely ambiguous readings here
+    # would be a guess, not a lookup. is_loaded() is checked rather than
+    # calling load() here, so a missing/not-yet-downloaded lexicon file
+    # degrades to "skip this step" rather than crashing every lemma
+    # lookup in the pipeline -- see bangor_lexicon.load()'s own error
+    # message for how to fetch and place the file.
+    if bangor_lexicon.is_loaded():
+        bangor_lemma = bangor_lexicon.lemma_if_unambiguous(w)
+        if bangor_lemma:
+            LEMMA_CACHE[w] = bangor_lemma
+            return bangor_lemma
     lemma = None
     cysill_call_failed = False
     # PATCH: route through fetch_lemma so retry/reconnect logic applies
@@ -955,9 +974,67 @@ def enrich_words(all_preprocessed_words):
     for chunk in chunks:
         chunk_text = " ".join(w["word"] for w in chunk)
 
-        # ---- Cysill ----
-        cysill_tokens  = fetch_pos_for_chunk(chunk_text) or []
-        cysill_aligned = align_with_gap_tolerance(cysill_tokens, chunk)
+        # PATCH: Bangor-lexicon whole-chunk skip. If EVERY word in this
+        # chunk has exactly one reading in the offline lexicon, the
+        # entire chunk is resolved locally and fetch_pos_for_chunk() is
+        # never called for it -- this is what actually reduces traffic
+        # to the endpoint hitting the 429/3600s rate limit.
+        #
+        # Deliberately all-or-nothing PER CHUNK, not per word: chunks
+        # are already segment-bounded (chunk_words_for_pos() breaks at
+        # _seg_id changes), so skipping only SOME words out of a chunk's
+        # text before sending the rest to Cysill would hand the live
+        # tagger a span with words silently missing -- degrading
+        # Cysill's own accuracy on the words that still need it, since
+        # its tagging can use surrounding context. Requiring the WHOLE
+        # chunk to be lexicon-resolvable avoids that: a chunk still
+        # reaches Cysill with full, untouched context whenever it
+        # contains even one ambiguous or OOV word.
+        lexicon_tags = None
+        if bangor_lexicon.is_loaded():
+            candidate_tags = [bangor_lexicon.resolved_tag_if_unambiguous(
+                                  normalize_word(w["word"])) for w in chunk]
+            if all(candidate_tags):
+                lexicon_tags = candidate_tags
+
+        if lexicon_tags is not None:
+            # Every word resolved locally -- skip the live call entirely.
+            # cysill_pos is intentionally left None (see bangor_lexicon.py's
+            # module docstring for why -- different tag scheme, no safe
+            # mapping), same value it would already have if Cysill had
+            # simply failed or been disabled for this word; every
+            # downstream consumer already tolerates that by design.
+            cysill_aligned = [
+                (w, {"pos": None,
+                     "tagger_mutation_type": tag["mutation_type"],
+                     "gender": tag["gender"],
+                     "number": tag["number"]})
+                for w, tag in zip(chunk, lexicon_tags)
+            ]
+        else:
+            # ---- Cysill (unchanged path) ----
+            # PATCH-NOT-TAKEN: an earlier draft of this also opportunistically
+            # filled individual words from the lexicon here, whenever
+            # Cysill's OWN per-word alignment came back None for just
+            # that word (not the whole chunk). Deliberately cut before
+            # shipping: cysill_aligned (below) becomes True for a
+            # non-None cysill_tok regardless of WHERE that token came
+            # from, and corpus_analyzer.py's tagger-agreement / corroboration
+            # bucketing (all_three / cysill+heuristic / disputed) reads
+            # cysill_aligned as "Cysill genuinely corroborated this row" --
+            # exactly the kind of two-fields-that-look-comparable-but-
+            # aren't mismatch this project has already been bitten by
+            # (tagger_agreement, DOM/Vnoun conflation). A per-word fallback
+            # with no matching provenance flag would silently inflate
+            # those corroboration numbers. The whole-chunk skip above
+            # avoids this because it has its own lexicon_resolved flag
+            # (see below) -- but that flag still needs corpus_analyzer.py
+            # updated to actually branch on it before treating a
+            # lexicon-resolved row as "cysill corroborated" for Kappa/
+            # bucket purposes. Worth doing as a deliberate follow-up, not
+            # smuggled in here as a side effect.
+            cysill_tokens  = fetch_pos_for_chunk(chunk_text) or []
+            cysill_aligned = align_with_gap_tolerance(cysill_tokens, chunk)
 
         # ---- spaCy ----
         # PATCH: was `if SPACY_NLP else []` -- SPACY_NLP is now module-level
@@ -996,7 +1073,21 @@ def enrich_words(all_preprocessed_words):
             # this is just None and the spaCy-side check (confirmed via
             # UD morph features) carries the plural gate on its own.
             entry["cysill_number"]        = cysill_tok.get("number") if cysill_tok else None
+            # NOTE: True for lexicon-resolved rows too (cysill_tok is the
+            # synthetic dict built above, not None) -- check
+            # entry["lexicon_resolved"] alongside this wherever "did the
+            # live Cysill API actually corroborate this row" matters
+            # (corroboration buckets, tagger-agreement Kappa), not this
+            # flag alone.
             entry["cysill_aligned"]       = cysill_tok is not None
+            # PATCH: True only when this chunk was skipped wholesale via
+            # the Bangor lexicon (lexicon_tags is not None, set once for
+            # the whole chunk above) -- lets any downstream analysis
+            # (or a future audit) tell "Cysill answered this" apart from
+            # "the offline lexicon answered this instead", since the two
+            # sources have different failure characteristics even though
+            # they share the same output vocabulary.
+            entry["lexicon_resolved"]     = lexicon_tags is not None
             # spaCy fields
             entry["spacy_token"]          = spacy_tok  # full dict or None
             entry["spacy_aligned"]        = spacy_tok is not None
@@ -1171,40 +1262,60 @@ _KNOWN_WELSH_CLUSTERS  = frozenset({
 
 def _is_plausible_welsh_token(word: str) -> bool:
     """
-    Returns False if the token contains any diacritic combining mark that
-    cannot appear in genuine Welsh orthography.
+    Returns False if the token contains a (base vowel, combining mark)
+    pair that cannot occur in genuine Welsh orthography.
 
-    Strategy: NFD-decompose each character. If it carries a combining mark
-    that is not circumflex (U+0302), acute (U+0301), or grave (U+0300), the
-    token is orthographically impossible in Welsh -- umlaut, tilde, breve,
-    caron, cedilla, ring, ogonek, etc. all fail.
+    Strategy: NFD-decompose each character into its base letter plus any
+    combining mark(s). Each (base, mark) pair is checked against
+    _LEGAL_BASE_MARK_PAIRS -- deliberately more specific than "is this
+    mark ever legal in Welsh", since some marks (diaeresis in particular)
+    are legal on some vowels and not others. Circumflex is legal on any
+    of the seven long vowels; acute/grave are tolerated on vowels in
+    loanwords/poetry; diaeresis is legal ONLY on i/e, where it marks
+    hiatus (a vowel forming its own syllable rather than gliding into a
+    neighbour as part of a diphthong).
 
     Catches hallucinations such as:
-        töii   (umlaut-o,   U+0308 combining diaeresis)
-        tõii   (tilde-o,    U+0303 combining tilde)
-        děkuji (caron-e,    U+030C combining caron)
-        ţară   (cedilla-t,  U+0326 combining cedilla below)
+        töii   (diaeresis-o, U+0308 on 'o' -- not a legal pair)
+        tõii   (tilde-o,     U+0303 -- not in the legal set at all)
+        děkuji (caron-e,     U+030C -- not in the legal set at all)
+        ţară   (cedilla-t,   U+0326 -- not in the legal set at all)
 
     Does NOT reject:
-        tŷ     (circumflex-y -- legal Welsh)
-        llên   (circumflex-e -- legal Welsh)
-        café   (acute-e     -- tolerated loanword)
+        tŷ       (circumflex-y -- legal Welsh)
+        llên     (circumflex-e -- legal Welsh)
+        café     (acute-e     -- tolerated loanword)
+        cwmnïau  (diaeresis-i -- legal Welsh, hiatus-marking)
 
-    # PATCH: this function (and its two constants, WELSH_LEGAL_DIACRITIC_CHARS
-    # and _COMBINING_LEGAL) went missing entirely during the module split --
-    # dropped along with the mutation-tables block it happened to sit next to
-    # in the original file, leaving three call sites silently calling an
-    # undefined name. Caught by pyflakes, not by the earlier import smoke
-    # test, since a NameError here only fires the first time a caller
-    # actually executes this code path at runtime. Restored here; its two
-    # constants now live in mutation_tables.py since they're pure data.
+    # PATCH (base-vowel-aware diacritic check): the previous version of
+    # this function checked mark identity alone (any diaeresis anywhere
+    # = illegal), which meant it correctly rejected "töii" but ALSO
+    # incorrectly rejected genuine Welsh words carrying a native ï/ë,
+    # such as "cwmnïau" -- confirmed live: a real, well-formed segment
+    # logged as an "Orthographic hallucination" and dropped, purely
+    # because it happened to contain a diaeresis at all rather than a
+    # diaeresis on a vowel where Welsh doesn't use one. Fixed by
+    # checking (base, mark) pairs instead of marks alone -- see
+    # _LEGAL_BASE_MARK_PAIRS in mutation_tables.py for the full table
+    # and reasoning.
+
+    # PATCH: this function (and its supporting table, now
+    # _LEGAL_BASE_MARK_PAIRS) went missing entirely during the module
+    # split -- dropped along with the mutation-tables block it happened
+    # to sit next to in the original file, leaving three call sites
+    # silently calling an undefined name. Caught by pyflakes, not by the
+    # earlier import smoke test, since a NameError here only fires the
+    # first time a caller actually executes this code path at runtime.
+    # Restored here; its table lives in mutation_tables.py since it's
+    # pure data.
     """
     for ch in unicodedata.normalize("NFC", word.lower()):
         nfd = unicodedata.normalize("NFD", ch)
         if len(nfd) == 1:
             continue  # plain character, no combining marks
+        base = nfd[0]
         for mark in nfd[1:]:
-            if mark not in _COMBINING_LEGAL:
+            if (base, mark) not in _LEGAL_BASE_MARK_PAIRS:
                 return False
     return True
 

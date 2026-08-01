@@ -192,28 +192,51 @@ WELSH_ENGLISH_HOMOGRAPHS = frozenset({
     "a", "am", "i", "in", "mi", "no", "un",
 })
 
-# PATCH: Welsh orthography only uses combining marks for a closed set of
-# seven vowels â ê î ô û ŵ ŷ. Acute accents appear in a small number of
-# loanwords (café, acíwt) and grave accents in a handful of poetry conventions.
-# All other combining marks -- umlaut/diaeresis (ö ü), tilde (õ ã), breve,
-# caron, cedilla, ring, ogonek -- are completely absent from native Welsh.
+# PATCH: Welsh orthography's combining-mark inventory is NOT "any of
+# these three marks, on any vowel" -- it's mark-AND-base-vowel specific.
+# Circumflex (to bach) is legal on any of the seven long vowels; acute/
+# grave are tolerated on vowels in loanwords/poetry. Diaeresis (trema) is
+# real, native Welsh -- but its one function is marking hiatus (that a
+# vowel forms its own syllable instead of gliding into a neighbour as
+# part of a diphthong, e.g. cwmnïau "companies"), and that only ever
+# happens on i or e. It does NOT occur on a/o/u/w/y -- a diaeresis on one
+# of those is still the exact "Whisper forced into cy mode hallucinates a
+# foreign-looking token" signal this filter exists to catch (see the
+# ö/õ examples below). The OLD version of this table checked mark
+# identity alone (any diaeresis = illegal), which correctly caught
+# "töii" but ALSO incorrectly rejected real words like "cwmnïau" --
+# confirmed live: a genuine "cwmnïau" segment logged as an orthographic
+# hallucination and dropped. Checking (base vowel, mark) pairs together
+# is what lets "ï" and "ö" get different verdicts instead of one verdict
+# for "does this token contain a diaeresis at all".
 #
 # When Whisper is forced into cy mode on low-energy or non-Welsh audio it
-# hallucinates tokens containing these foreign diacritics (e.g. töii, tõii).
-# This table lets us reject those tokens orthographically rather than relying
-# on confidence scores, which are unreliable for hallucinated tokens.
+# hallucinates tokens containing genuinely foreign diacritics (e.g. töii,
+# tõii) -- this table lets us reject those orthographically rather than
+# relying on confidence scores, which are unreliable for hallucinated
+# tokens, while still accepting real Welsh diaeresis usage.
 WELSH_LEGAL_DIACRITIC_CHARS = frozenset(
-    "âêîôûŵŷ"   # circumflex (to bach) -- canonical Welsh diacritic
+    "âêîôûŵŷ"   # circumflex (to bach) -- canonical Welsh diacritic, any of the 7 long vowels
     "áéíóú"     # acute -- attested in loanwords, tolerated
     "àèìòù"     # grave -- rare but attested in poetry / some loanword spellings
+    "ïë"        # diaeresis (trema) -- native, but ONLY legal on i/e (hiatus-marking);
+                # ö/ü/ä/ã/õ etc. remain illegal, see _LEGAL_BASE_MARK_PAIRS below
 )
 
-# The combining marks that correspond to the legal diacritics above.
-# Any other combining mark signals a non-Welsh character.
-_COMBINING_LEGAL = frozenset({
-    "\u0302",   # combining circumflex  (â ê î ô û ŵ ŷ)
-    "\u0301",   # combining acute       (á é í ó ú)
-    "\u0300",   # combining grave       (à è ì ò ù)
+# (base vowel, combining mark) pairs legal in Welsh orthography -- the
+# actual check _is_plausible_welsh_token() runs, one level more specific
+# than "which marks exist" (WELSH_LEGAL_DIACRITIC_CHARS above is the
+# human-readable summary of the same rule, kept for documentation/quick
+# reference -- it doesn't preserve the base+mark pairing, so it isn't
+# itself used in the character-by-character check).
+_LEGAL_BASE_MARK_PAIRS = frozenset({
+    ("a", "\u0302"), ("e", "\u0302"), ("i", "\u0302"), ("o", "\u0302"),
+    ("u", "\u0302"), ("w", "\u0302"), ("y", "\u0302"),   # circumflex -- any of the 7 long vowels
+    ("a", "\u0301"), ("e", "\u0301"), ("i", "\u0301"),
+    ("o", "\u0301"), ("u", "\u0301"),                    # acute -- loanwords
+    ("a", "\u0300"), ("e", "\u0300"), ("i", "\u0300"),
+    ("o", "\u0300"), ("u", "\u0300"),                    # grave -- rare poetry usage
+    ("i", "\u0308"), ("e", "\u0308"),                    # diaeresis -- ONLY i/e, hiatus-marking
 })
 
 # ========================= BOD SUPPRESSION =========================
