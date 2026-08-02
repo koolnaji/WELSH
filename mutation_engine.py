@@ -1003,36 +1003,64 @@ def enrich_words(all_preprocessed_words):
     for chunk in chunks:
         chunk_text = " ".join(w["word"] for w in chunk)
 
-        # PATCH: Bangor-lexicon whole-chunk skip. If EVERY word in this
-        # chunk has exactly one reading in the offline lexicon, the
+        # PATCH: whole-chunk skip. If EVERY word in this chunk is either
+        # (a) a single unambiguous reading in the offline Bangor lexicon,
+        # or (b) recognized as an English code-switch word by
+        # is_english_code_switch() -- the SAME function get_welsh_lemma()
+        # already uses to avoid Welshifying English lemmas, just not
+        # previously consulted anywhere in THIS chunking path -- the
         # entire chunk is resolved locally and fetch_pos_for_chunk() is
-        # never called for it -- this is what actually reduces traffic
-        # to the endpoint hitting the 429/3600s rate limit.
+        # never called for it.
         #
-        # Deliberately all-or-nothing PER CHUNK, not per word: chunks
-        # are already segment-bounded (chunk_words_for_pos() breaks at
+        # The English-code-switch half of this matters on its own, not
+        # just for call-volume: confirmed live (real Cysill traffic) that
+        # plain English words like "Hunger Games" were being sent to
+        # Cysill's POS endpoint with no gate at all -- burning rate-limit
+        # budget on words Cysill can't meaningfully tag as Welsh AND
+        # risking the same "Welshified" mis-tag failure mode already
+        # observed for get_welsh_lemma() (English "the"/"for" coming back
+        # as bogus Welsh lemmas "te"/"mor"). A code-switch word gets
+        # every cysill_* field left None here -- deliberately NOT sent to
+        # Cysill at all, not even nominally, and NOT run through the
+        # Bangor lexicon either (that lexicon is Welsh-only; looking an
+        # English word up in it would just be a different flavour of the
+        # same mistake).
+        #
+        # Still all-or-nothing PER CHUNK, not per word: chunks are
+        # already segment-bounded (chunk_words_for_pos() breaks at
         # _seg_id changes), so skipping only SOME words out of a chunk's
         # text before sending the rest to Cysill would hand the live
         # tagger a span with words silently missing -- degrading
-        # Cysill's own accuracy on the words that still need it, since
-        # its tagging can use surrounding context. Requiring the WHOLE
-        # chunk to be lexicon-resolvable avoids that: a chunk still
-        # reaches Cysill with full, untouched context whenever it
-        # contains even one ambiguous or OOV word.
+        # Cysill's own accuracy on the Welsh words that still need it,
+        # since its tagging can use surrounding context. Requiring the
+        # WHOLE chunk to be resolved (by lexicon or code-switch status)
+        # avoids that: a chunk still reaches Cysill with full, untouched
+        # context whenever it contains even one genuinely ambiguous or
+        # OOV Welsh word.
         lexicon_tags = None
         if bangor_lexicon.is_loaded():
-            candidate_tags = [bangor_lexicon.resolved_tag_if_unambiguous(
-                                  normalize_word(w["word"])) for w in chunk]
-            if all(candidate_tags):
+            candidate_tags = []
+            for w in chunk:
+                norm = normalize_word(w["word"])
+                if is_english_code_switch(w["word"], None):
+                    candidate_tags.append(
+                        {"mutation_type": None, "gender": None, "number": None})
+                else:
+                    candidate_tags.append(
+                        bangor_lexicon.resolved_tag_if_unambiguous(norm))
+            if all(t is not None for t in candidate_tags):
                 lexicon_tags = candidate_tags
 
         if lexicon_tags is not None:
-            # Every word resolved locally -- skip the live call entirely.
-            # cysill_pos is intentionally left None (see bangor_lexicon.py's
-            # module docstring for why -- different tag scheme, no safe
-            # mapping), same value it would already have if Cysill had
-            # simply failed or been disabled for this word; every
-            # downstream consumer already tolerates that by design.
+            # Every word resolved locally (lexicon hit or recognized
+            # English) -- skip the live call entirely. cysill_pos is
+            # intentionally left None (see bangor_lexicon.py's module
+            # docstring for why -- different tag scheme, no safe mapping
+            # -- and for code-switch words, because Cysill has no
+            # meaningful Welsh POS to give an English word anyway), same
+            # value it would already have if Cysill had simply failed or
+            # been disabled for this word; every downstream consumer
+            # already tolerates that by design.
             cysill_aligned = [
                 (w, {"pos": None,
                      "tagger_mutation_type": tag["mutation_type"],
@@ -1056,7 +1084,7 @@ def enrich_words(all_preprocessed_words):
             # (tagger_agreement, DOM/Vnoun conflation). A per-word fallback
             # with no matching provenance flag would silently inflate
             # those corroboration numbers. The whole-chunk skip above
-            # avoids this because it has its own lexicon_resolved flag
+            # avoids this because it has its own locally_resolved flag
             # (see below) -- but that flag still needs corpus_analyzer.py
             # updated to actually branch on it before treating a
             # lexicon-resolved row as "cysill corroborated" for Kappa/
@@ -1104,19 +1132,20 @@ def enrich_words(all_preprocessed_words):
             entry["cysill_number"]        = cysill_tok.get("number") if cysill_tok else None
             # NOTE: True for lexicon-resolved rows too (cysill_tok is the
             # synthetic dict built above, not None) -- check
-            # entry["lexicon_resolved"] alongside this wherever "did the
+            # entry["locally_resolved"] alongside this wherever "did the
             # live Cysill API actually corroborate this row" matters
             # (corroboration buckets, tagger-agreement Kappa), not this
             # flag alone.
             entry["cysill_aligned"]       = cysill_tok is not None
-            # PATCH: True only when this chunk was skipped wholesale via
-            # the Bangor lexicon (lexicon_tags is not None, set once for
-            # the whole chunk above) -- lets any downstream analysis
-            # (or a future audit) tell "Cysill answered this" apart from
-            # "the offline lexicon answered this instead", since the two
-            # sources have different failure characteristics even though
-            # they share the same output vocabulary.
-            entry["lexicon_resolved"]     = lexicon_tags is not None
+            # PATCH: True only when this chunk was skipped wholesale --
+            # either via the Bangor lexicon or via recognized English
+            # code-switch words (lexicon_tags is not None, set once for
+            # the whole chunk above) -- lets any downstream analysis (or
+            # a future audit) tell "Cysill answered this" apart from
+            # "this was resolved locally instead", since those sources
+            # have different failure characteristics even though they
+            # share the same output vocabulary.
+            entry["locally_resolved"]     = lexicon_tags is not None
             # spaCy fields
             entry["spacy_token"]          = spacy_tok  # full dict or None
             entry["spacy_aligned"]        = spacy_tok is not None
