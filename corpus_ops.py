@@ -759,6 +759,40 @@ class _YtdlpTqdmLogger:
         tqdm.write(f"  ⚠️ yt-dlp: {msg}")
 
 
+# PATCH: getaddrinfo failed / "Failed to resolve" (Windows errno 11001,
+# WSAHOST_NOT_FOUND -- confirmed via nslookup on 2026-08-03 that this was
+# a transient resolver blip, not a blocked/misconfigured domain: the same
+# host resolved cleanly seconds later through the normal system resolver)
+# is a DIFFERENT failure shape than the other things download_audio()
+# retries for. A read-timeout or a 5xx means the server was reachable but
+# slow/unhappy -- 3s/6s/9s is a reasonable amount of patience for that.
+# A DNS resolution failure means the resolver never got an answer at all,
+# and the previous incident showed the existing schedule burns all 3
+# attempts back-to-back before the blip has any real chance to clear.
+# DNS_BACKOFF_SECONDS is deliberately longer and used ONLY for this error
+# shape; every other exception still uses the original 3*attempt schedule
+# below, unchanged.
+DNS_BACKOFF_SECONDS = (5, 15, 30)
+
+
+def _is_dns_resolution_error(exc):
+    """
+    True if this exception is (or was caused by) a DNS resolution
+    failure specifically -- checked by substring on str(exc) rather than
+    exception type, since yt-dlp wraps the underlying
+    socket.gaierror/urllib3 NewConnectionError in its own
+    DownloadError/ExtractorError, so the original exception type doesn't
+    survive to this level, but its message text does (confirmed against
+    the actual error text in the 2026-08-03 log: "Failed to resolve
+    'media24.fireside.fm' ([Errno 11001] getaddrinfo failed)").
+    Covers both the Windows-specific errno text and the generic
+    "getaddrinfo failed" phrasing Linux/Mac raise instead, so this isn't
+    tied to one OS.
+    """
+    msg = str(exc).lower()
+    return "getaddrinfo failed" in msg or "failed to resolve" in msg
+
+
 def download_audio(video, max_retries=3):
     safe_title = clean_title_for_file(video["title"])
     raw_path   = AUDIO_DIR / f"{safe_title}.mp3"
@@ -780,7 +814,14 @@ def download_audio(video, max_retries=3):
         except Exception as e:
             tqdm.write(f" ⚠️ Download attempt {attempt} failed: {e}")
             if attempt < max_retries:
-                time.sleep(3 * attempt)
+                if _is_dns_resolution_error(e):
+                    wait = DNS_BACKOFF_SECONDS[min(attempt - 1, len(DNS_BACKOFF_SECONDS) - 1)]
+                    tqdm.write(f"    (DNS resolution failure -- waiting {wait}s "
+                               f"for resolver to recover, longer than the usual "
+                               f"backoff)")
+                else:
+                    wait = 3 * attempt
+                time.sleep(wait)
             else:
                 raise
     tqdm.write(" Normalizing audio...")
