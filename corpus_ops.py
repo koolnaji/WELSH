@@ -883,7 +883,21 @@ def analyze(audio_path, model, video_meta, substeps=None):
 
     # Enrich: Cysill + spaCy via unified gap-tolerant alignment
     _step("Tagging + aligning (Cysill + spaCy)")
-    enriched = enrich_words(all_preprocessed)
+    # PATCH: stable per-video key for enrich_words()'s chunk-level
+    # checkpointing (see that function's own docstring for why this
+    # matters -- an interrupted run inside "Tagging + aligning" used to
+    # lose ALL of a video's tagging progress, not just the stuck chunk).
+    # Preference order: video id (queue videos always have one) -> url
+    # (queue videos' actual source URL, or the local mp3 path for local
+    # files, per the meta dict welsh_pipeline.py builds for that branch)
+    # -> audio_path itself as a last resort so checkpointing degrades
+    # gracefully instead of silently disabling itself if video_meta ever
+    # arrives without either field. Whichever key is used, re-running the
+    # SAME video (same id/url/path) on a later run is what makes
+    # resumption find its checkpoint again -- a genuinely different video
+    # naturally gets a different key and starts fresh.
+    checkpoint_key = str(video_meta.get("id") or video_meta.get("url") or audio_path)
+    enriched = enrich_words(all_preprocessed, checkpoint_key=checkpoint_key)
 
     # Build output rows
     segment_rows, word_rows, lemma_rows, pos_rows, words_only = [], [], [], [], []
@@ -979,6 +993,14 @@ def analyze(audio_path, model, video_meta, substeps=None):
                 "word_end":             w.get("end"),
                 "confidence":           conf,
                 "language":             info.language,
+                # PATCH: carries enrich_words()'s locally_resolved flag into
+                # the cache file so rerun_rules.py (and any future re-analysis)
+                # can tell a genuine Cysill answer apart from a Bangor-lexicon/
+                # code-switch substitute -- see mutation_engine.py's
+                # compute_confidence()/_build_row() for why that distinction
+                # matters for corroboration-metric correctness, not just
+                # bookkeeping.
+                "locally_resolved":     bool(w.get("locally_resolved")),
             })
             words_only.append(w)
 
@@ -1035,6 +1057,7 @@ def analyze_phrase(phrase):
             "spacy_coarse_pos":     spacy_coarse_pos(spacy_tok),
             "pos_compatible":       pos_compatible(cysill_pos, spacy_tok),
             "spacy_mutation":       spacy_tok["mutation"] if spacy_tok else None,
+            "locally_resolved":     bool(w.get("locally_resolved")),
         })
 
     mutation_rows = process_comprehensive_mutations(enriched)

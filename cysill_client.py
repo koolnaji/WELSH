@@ -39,6 +39,21 @@ POS_CHUNK_MAX_CHARS = 2700
 # real API response value.
 CYSILL_CALL_FAILED = object()
 
+# PATCH: how long a single Retry-After we'll actually sleep for. Cysill
+# has been observed handing back Retry-After: 3600 (a full hour) during
+# real outages/quota exhaustion. Honoring that literally inside the
+# retry loop is what defeats the circuit breaker below: with
+# max_retries=3, ONE call can block for up to 3 hours before it even
+# counts as a failure, and if any later attempt happens to succeed after
+# one of those waits, _cysill_consecutive_failures resets to 0 and the
+# breaker gets no credit at all toward tripping. A Retry-After this long
+# is the server telling us it isn't coming back soon -- past this cap we
+# stop waiting and fail the attempt immediately instead, so repeated
+# long-Retry-After chunks accumulate real failures and the breaker can
+# actually open and fall back to spaCy + heuristics within seconds,
+# not hours.
+MAX_RESPECTED_RETRY_AFTER = 300
+
 http_session = requests.Session()
 
 # PATCH: circuit breaker state for Cysill API
@@ -62,6 +77,29 @@ def reset_cysill_circuit_breaker():
     global _cysill_consecutive_failures, _cysill_disabled_for_run
     _cysill_consecutive_failures = 0
     _cysill_disabled_for_run     = False
+
+
+def is_cysill_disabled():
+    """
+    True once the circuit breaker has tripped for this run. Exists so
+    CALLERS (enrich_words() in mutation_engine.py, in particular) can
+    check this BEFORE even attempting fetch_pos_for_chunk()/fetch_lemma(),
+    not just react to a None come back afterward.
+
+    PATCH: added because fetch_pos_for_chunk() was printing "POS API
+    permanently failed for this chunk" on EVERY chunk for the remainder
+    of a run once the breaker opened -- _cysill_get() already short-
+    circuits to None instantly once _cysill_disabled_for_run is True (no
+    network call, no wait), so nothing was actually failing or slow at
+    that point, but the per-chunk print made it look like an infinite
+    failure loop rather than "correctly declining, very fast, over and
+    over." Confirmed live: this is exactly what a long run's tail looked
+    like once the breaker tripped. Giving callers a way to check the
+    state up front means they can skip the call (and the misleading
+    print) entirely once Cysill is known-dead for the run, instead of
+    re-discovering that on every single chunk.
+    """
+    return _cysill_disabled_for_run
 
 
 def extract_gender_from_pos(pos_tag):
@@ -124,6 +162,19 @@ def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
                             retry_after = None  # e.g. an HTTP-date -- not parsed, use default below
                 if retry_after is None:
                     retry_after = int(base_delay * attempt * 2)
+
+                if retry_after > MAX_RESPECTED_RETRY_AFTER:
+                    # PATCH: don't sleep out a long Retry-After -- fail this
+                    # attempt fast instead, so a run of these actually
+                    # accumulates toward the circuit breaker rather than
+                    # silently costing hours per chunk (see
+                    # MAX_RESPECTED_RETRY_AFTER's comment above).
+                    tqdm.write(f" ⚠️ Cysill rate-limited (429) -- server asked to wait "
+                          f"{retry_after}s, longer than this pipeline will honor "
+                          f"({MAX_RESPECTED_RETRY_AFTER}s cap). Treating as a failed "
+                          f"attempt instead of waiting (attempt {attempt}/{max_retries}).")
+                    break
+
                 tqdm.write(f" ⚠️ Cysill rate-limited (429) -- waiting {retry_after}s "
                       f"(attempt {attempt}/{max_retries})")
                 time.sleep(retry_after)
@@ -189,6 +240,13 @@ def parse_pos_result_extended(result):
 def fetch_pos_for_chunk(chunk_text, max_retries=3, base_delay=1.5):
     if not TECHIAITH_API_KEY:
         return None
+    if _cysill_disabled_for_run:
+        # PATCH: silent, instant no-op once the breaker's open -- see
+        # is_cysill_disabled()'s docstring. "Disabled by design" isn't
+        # "just failed"; only print for an attempt that actually ran and
+        # lost, not for the (correct, fast) no-op that follows it for
+        # the rest of the run.
+        return None
     resp = _cysill_get(WELSH_POS_ENDPOINT,
                        {"text": chunk_text, "api_key": TECHIAITH_API_KEY},
                        max_retries=max_retries, base_delay=base_delay)
@@ -208,6 +266,14 @@ def fetch_pos_for_chunk(chunk_text, max_retries=3, base_delay=1.5):
 def fetch_lemma(word, max_retries=2, base_delay=1.0):
     if not TECHIAITH_API_KEY:
         return None
+    if _cysill_disabled_for_run:
+        # PATCH: same silent no-op as fetch_pos_for_chunk() -- see
+        # is_cysill_disabled()'s docstring. Still returns
+        # CYSILL_CALL_FAILED, not None: this is a genuine "we never
+        # asked" (breaker open), not "the API confirmed no lemma", and
+        # get_welsh_lemma() already relies on that distinction to decide
+        # what's safe to cache permanently.
+        return CYSILL_CALL_FAILED
     resp = _cysill_get(WELSH_LEMMATIZER_ENDPOINT,
                        {"text": word, "api_key": TECHIAITH_API_KEY},
                        max_retries=max_retries, base_delay=base_delay)

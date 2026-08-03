@@ -17,6 +17,7 @@ import unicodedata
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
@@ -68,6 +69,17 @@ LOCAL_PROCESSED_LOG = BASE_DIR / "processed_local_mp3s.json"
 # retrying a permanently broken video or silently dropping a good one.
 FAILED_LOG           = BASE_DIR / "failed_videos.json"
 FAILED_MAX_RETRIES    = 3
+# PATCH: LOCAL_PROCESSED_LOG/FAILED_LOG above give resume at the WHOLE-VIDEO
+# level -- a crash means reprocess this video from scratch, which is fine
+# for a video that fails fast, but not for one that got hours into the
+# expensive Cysill/spaCy tagging pass in enrich_words() before dying (an
+# interrupted Cysill run genuinely lost 8 hours of work with nothing on
+# disk to show for it -- see enrich_words()'s own checkpoint comments).
+# CHECKPOINT_DIR holds CHUNK-level progress within a single video's
+# enrich_words() call, one JSON file per in-progress video, so a kill/crash
+# partway through tagging resumes from the last completed chunk instead of
+# re-tagging (and re-hitting Cysill's rate limit for) everything again.
+CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 
 # PATCH: previously only defined locally inside fetch_captions.py and
 # corpus_analyzer.py respectively -- redefined here too (same value, same
@@ -983,7 +995,115 @@ def align_with_gap_tolerance(tagger_tokens, whisper_words, window=GAP_ALIGN_WIND
 # available here via the `from cysill_client import *` above.
 
 
-def enrich_words(all_preprocessed_words):
+# ==================== ENRICH_WORDS CHECKPOINTING ====================
+# Lives here, not its own module (unlike cysill_client.py/spacy_tagging.py,
+# which wrap genuinely external systems) -- this is tightly coupled to
+# chunk_words_for_pos()'s exact chunking and enrich_words()'s own merge
+# logic, not a separable concern. A small atomic-JSON-write helper is
+# duplicated from corpus_ops.py's _write_json() rather than imported --
+# corpus_ops.py imports FROM mutation_engine.py, so the reverse import
+# would be circular. Deliberate, acknowledged duplication of ~4 stable
+# lines, not an oversight (see corpus_ops.py's _write_json for the twin).
+
+def _write_json_atomic(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(value, ensure_ascii=False,
+                                    default=lambda o: float(o) if hasattr(o, "__float__") else str(o)),
+                         encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _checkpoint_fingerprint(all_preprocessed_words):
+    """
+    Cheap fingerprint of the exact word sequence enrich_words() was given,
+    so a checkpoint can be verified to still match the input before
+    resuming from it -- NOT just trusted because a file happens to exist
+    with the right name. Guards against the one way resuming could
+    silently corrupt data: if this video gets re-transcribed with
+    different Whisper settings (or Whisper's own non-determinism) between
+    the interrupted attempt and this one, the word list -- and therefore
+    chunk_words_for_pos()'s chunk boundaries -- could differ, and splicing
+    "chunks 1-17 from the OLD word list" onto "chunks 18+ freshly computed
+    from the NEW word list" would misalign every word after the resume
+    point. Hashing every word (not just count) catches a same-length but
+    reordered/changed transcript, not just a shorter/longer one.
+    """
+    h = hashlib.sha256()
+    for w in all_preprocessed_words:
+        h.update(w["word"].encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _checkpoint_path_for(checkpoint_key):
+    """
+    Filename is a hash of checkpoint_key (video url/id/audio path -- may
+    contain characters that aren't filesystem-safe on every OS this
+    project runs on, per the Windows-path issues already hit elsewhere in
+    this project) rather than a slugified version of it. The original key
+    is still stored INSIDE the checkpoint JSON for anyone grepping
+    CHECKPOINT_DIR by hand to figure out which file belongs to which
+    video, without needing the filename itself to be readable.
+    """
+    digest = hashlib.sha256(checkpoint_key.encode("utf-8")).hexdigest()[:24]
+    return CHECKPOINT_DIR / f"{digest}.json"
+
+
+def _load_enrich_checkpoint(checkpoint_path, checkpoint_key, expected_fingerprint, total_chunks):
+    """
+    Returns {"completed_chunk_count": int, "enriched_words": [...]} if a
+    valid, matching checkpoint exists, else None. "Valid" means: the file
+    parses, AND its fingerprint matches the CURRENT input words, AND its
+    completed_chunk_count is sanely within [0, total_chunks]. Any mismatch
+    is treated as "this checkpoint doesn't apply anymore" and logged, not
+    silently discarded -- so a fingerprint mismatch (see
+    _checkpoint_fingerprint()'s docstring) is visible instead of just
+    quietly re-tagging everything with no explanation of why the resume
+    didn't happen.
+    """
+    if not checkpoint_path.exists():
+        return None
+    try:
+        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        tqdm.write(f" ⚠️ Checkpoint file unreadable ({e}) -- starting this video fresh.")
+        return None
+
+    if data.get("fingerprint") != expected_fingerprint:
+        tqdm.write(" ⚠️ Found a checkpoint for this video, but its fingerprint doesn't "
+                   "match the current transcription (re-transcribed with different "
+                   "settings, or Whisper produced a different result this time) -- "
+                   "discarding it and starting this video's tagging fresh, rather than "
+                   "risk misaligning words to the wrong chunk.")
+        return None
+
+    completed = data.get("completed_chunk_count", 0)
+    enriched  = data.get("enriched_words", [])
+    if not isinstance(completed, int) or not (0 <= completed <= total_chunks):
+        tqdm.write(" ⚠️ Checkpoint's completed_chunk_count is invalid for this video's "
+                   "current chunk count -- starting fresh.")
+        return None
+
+    return {"completed_chunk_count": completed, "enriched_words": enriched}
+
+
+def _save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
+                             total_chunks, completed_chunk_count, enriched_words):
+    _write_json_atomic(checkpoint_path, {
+        "source_key":            checkpoint_key,
+        "fingerprint":           fingerprint,
+        "total_chunks":          total_chunks,
+        "completed_chunk_count": completed_chunk_count,
+        "enriched_words":        enriched_words,
+    })
+
+
+def _delete_enrich_checkpoint(checkpoint_path):
+    checkpoint_path.unlink(missing_ok=True)
+
+
+def enrich_words(all_preprocessed_words, checkpoint_key=None):
     """
     Master enrichment function. Takes the full flat list of preprocessed
     words across all segments, chunks them, calls both Cysill and spaCy
@@ -996,11 +1116,40 @@ def enrich_words(all_preprocessed_words):
     PATCH: alignment length assertions guard against silent mismatches
     where Cysill failure returns [] while spaCy succeeds, causing the
     zip to truncate results without warning.
+
+    checkpoint_key: a stable per-video identifier (analyze() passes
+    video url/id, or the audio path as a last resort) -- when given,
+    progress is saved to CHECKPOINT_DIR after every completed chunk, so a
+    kill/crash/interrupt partway through this video's tagging can resume
+    from the last completed chunk on a future run instead of re-tagging
+    (and re-hitting Cysill's rate limit for) the whole video again. This
+    is exactly the "8 hours, zero output" failure mode: previously this
+    entire function had to return before ANYTHING was written to disk for
+    the video, so one stuck chunk anywhere meant losing every chunk's
+    work, not just that one. None (the default) disables checkpointing
+    entirely -- used by analyze_phrase()'s ad hoc test-phrase path, where
+    there's nothing worth resuming.
     """
     chunks   = chunk_words_for_pos(all_preprocessed_words)
     enriched = []
+    start_chunk_idx = 0
 
-    for chunk in chunks:
+    checkpoint_path = None
+    if checkpoint_key:
+        fingerprint     = _checkpoint_fingerprint(all_preprocessed_words)
+        checkpoint_path = _checkpoint_path_for(checkpoint_key)
+        loaded = _load_enrich_checkpoint(checkpoint_path, checkpoint_key,
+                                          fingerprint, len(chunks))
+        if loaded is not None and loaded["completed_chunk_count"] > 0:
+            enriched        = loaded["enriched_words"]
+            start_chunk_idx = loaded["completed_chunk_count"]
+            tqdm.write(f" ⏩ Resuming from checkpoint: {start_chunk_idx}/{len(chunks)} "
+                       f"chunk(s) already tagged from a previous interrupted run "
+                       f"-- skipping straight to chunk {start_chunk_idx + 1}.")
+
+    for chunk_idx, chunk in enumerate(chunks):
+        if chunk_idx < start_chunk_idx:
+            continue
         chunk_text = " ".join(w["word"] for w in chunk)
 
         # PATCH: whole-chunk skip. If EVERY word in this chunk is either
@@ -1037,19 +1186,38 @@ def enrich_words(all_preprocessed_words):
         # avoids that: a chunk still reaches Cysill with full, untouched
         # context whenever it contains even one genuinely ambiguous or
         # OOV Welsh word.
-        lexicon_tags = None
-        if bangor_lexicon.is_loaded():
-            candidate_tags = []
-            for w in chunk:
-                norm = normalize_word(w["word"])
-                if is_english_code_switch(w["word"], None):
-                    candidate_tags.append(
-                        {"mutation_type": None, "gender": None, "number": None})
-                else:
-                    candidate_tags.append(
-                        bangor_lexicon.resolved_tag_if_unambiguous(norm))
-            if all(t is not None for t in candidate_tags):
-                lexicon_tags = candidate_tags
+        #
+        # BUGFIX: is_english_code_switch() used to only get consulted
+        # inside `if bangor_lexicon.is_loaded():` -- meaning on any run
+        # where the lexicon file wasn't present (missing download, wrong
+        # BANGOR_LEXICON_PATH, a machine that just never had it placed),
+        # the English-code-switch skip didn't fire AT ALL, for any word,
+        # lexicon or no lexicon. Confirmed live: chunks that were pure
+        # English ("Hunger Games") were still going straight to Cysill's
+        # POS endpoint on a run where the lexicon genuinely was loaded,
+        # which traced back to this coupling -- the two checks have no
+        # real dependency on each other (is_english_code_switch() never
+        # touches bangor_lexicon at all), so tying English resolution to
+        # the lexicon's load state was accidental, not intentional.
+        # Restructured so each word tries is_english_code_switch() FIRST,
+        # unconditionally, and only falls through to the lexicon lookup
+        # (still gated on is_loaded(), since THAT part genuinely does
+        # need the file) for words that aren't English. A chunk that's
+        # entirely English code-switching now skips Cysill even with no
+        # lexicon loaded at all; a chunk with genuine Welsh words still
+        # needs the lexicon (or Cysill) for those.
+        candidate_tags = []
+        for w in chunk:
+            norm = normalize_word(w["word"])
+            if is_english_code_switch(w["word"], None):
+                candidate_tags.append(
+                    {"mutation_type": None, "gender": None, "number": None})
+            elif bangor_lexicon.is_loaded():
+                candidate_tags.append(
+                    bangor_lexicon.resolved_tag_if_unambiguous(norm))
+            else:
+                candidate_tags.append(None)
+        lexicon_tags = candidate_tags if all(t is not None for t in candidate_tags) else None
 
         if lexicon_tags is not None:
             # Every word resolved locally (lexicon hit or recognized
@@ -1157,12 +1325,54 @@ def enrich_words(all_preprocessed_words):
                 normalize_word(w["word"]))
             enriched.append(entry)
 
+        if checkpoint_path is not None:
+            _save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
+                                     len(chunks), chunk_idx + 1, enriched)
+
+    if checkpoint_path is not None:
+        # Every chunk made it through -- the checkpoint has done its job for
+        # this video, and leaving it on disk would just mean a *future*,
+        # unrelated interrupted run either wastefully overwriting it chunk
+        # by chunk from scratch, or (if this exact video is ever queued
+        # again for some reason) misleadingly claiming to resume a run
+        # that already fully completed.
+        _delete_enrich_checkpoint(checkpoint_path)
+
     return enriched
 
 
 # ========================= CONFIDENCE SCORING =========================
 def compute_confidence(status, is_erosion, spacy_tok, cysill_mutation_type,
-                        heuristic_expected, heuristic_surface):
+                        heuristic_expected, heuristic_surface,
+                        cysill_genuinely_aligned=True):
+    """
+    PATCH: cysill_genuinely_aligned distinguishes "Cysill itself actually
+    answered for this word" from "cysill_mutation_type happens to be
+    populated". The latter is ALSO true for Bangor-lexicon-resolved words
+    (see enrich_words()'s locally_resolved flag) -- a real, useful value,
+    just not an independent second tagger opinion. Confirmed live: 6 rows
+    in one run were stamped "all_three"/"cysill+heuristic" off a lexicon
+    hit with cysill_pos completely empty, before this parameter existed --
+    a lexicon-plus-heuristic agreement counted as three-way corroboration.
+
+    IMPORTANT: this gates the two boolean checks below (cysill_c,
+    cysill_rad), it does NOT null out cysill_mutation_type itself before
+    use. That distinction matters: in the erosion branch, `cysill_rad =
+    cysill_mutation_type is None` treats "no mutation reported" as
+    Cysill POSITIVELY confirming a radical form -- real corroboration
+    evidence. Nulling the raw value for a not-genuinely-aligned row would
+    make `is None` trivially true and credit EVERY locally-resolved or
+    never-consulted row with false "Cysill confirmed radical" evidence --
+    the exact opposite of what this parameter exists to prevent. Gating
+    the boolean directly (`cysill_genuinely_aligned and cysill_mutation_type
+    is None`) avoids that trap: not-genuinely-aligned means no Cysill
+    evidence either way, not evidence for radical.
+
+    Defaults to True so any call site that hasn't been updated keeps its
+    prior behavior rather than silently losing all Cysill credit; both
+    current call sites (_build_row(), _evaluate_h_mutation()) pass it
+    explicitly.
+    """
     has_parser      = spacy_tok is not None
     parser_mut      = spacy_tok["mutation"] if has_parser else None
     parser_mut_type = SPACY_MUTATION_MAP.get(parser_mut) if parser_mut else None
@@ -1170,7 +1380,8 @@ def compute_confidence(status, is_erosion, spacy_tok, cysill_mutation_type,
     if not is_erosion:
         parser_c   = parser_mut_type and (parser_mut_type == heuristic_surface or
                       parser_mut_type in (heuristic_expected or []))
-        cysill_c   = cysill_mutation_type and (cysill_mutation_type == heuristic_surface or
+        cysill_c   = cysill_genuinely_aligned and cysill_mutation_type and (
+                      cysill_mutation_type == heuristic_surface or
                       cysill_mutation_type in (heuristic_expected or []))
         heuristic_c = heuristic_surface is not None
         if parser_c and cysill_c and heuristic_c: return 1.00, "all_three"
@@ -1183,7 +1394,7 @@ def compute_confidence(status, is_erosion, spacy_tok, cysill_mutation_type,
     else:
         parser_ctx = has_parser and spacy_tok.get("dep") in {
             "obj", "iobj", "nsubj", "obl", "vocative", "amod", "nmod", "xcomp"}
-        cysill_rad = cysill_mutation_type is None
+        cysill_rad = cysill_genuinely_aligned and (cysill_mutation_type is None)
         heuristic_f = heuristic_surface is None and heuristic_expected is not None
         if parser_ctx and cysill_rad and heuristic_f: return 0.90, "parser+cysill+heuristic"
         if cysill_rad and heuristic_f:                return 0.75, "cysill+heuristic"
@@ -1630,7 +1841,11 @@ def raw_has_radical_evidence(target_node, t2):
 
     # Evidence 1: Cysill-confirmed lemma match
     lemma = normalize_word(t2.get("lemma") or "")
-    if lemma and target_node.get("cysill_aligned"):
+    # PATCH: same fix as _build_row()'s cysill_has_signal -- cysill_aligned
+    # is True for locally-resolved rows too, but this comment specifically
+    # says "Cysill-confirmed", so it should mean Cysill, not a Bangor-
+    # lexicon substitute answering in its place.
+    if lemma and target_node.get("cysill_aligned") and not target_node.get("locally_resolved"):
         if raw == lemma:
             return True
         # Evidence 2: same initial cluster despite differing elsewhere
@@ -1884,9 +2099,28 @@ def _build_row(current_node, target_node, expected, outcome,
     spos_coarse = spacy_coarse_pos(spacy_tok)
     pos_ok      = pos_compatible(cysill_pos, spacy_tok)
 
+    # PATCH: cysill_has_signal used to be `bool(target_node.get("cysill_aligned"))`
+    # alone, computed further down and used only for tagger_agreement.
+    # cysill_aligned is True for locally-resolved rows too (Bangor lexicon
+    # hits / recognized code-switch words -- see enrich_words()), since
+    # those get a synthetic, non-None cysill_tok. That let a lexicon-only
+    # answer masquerade as genuine live Cysill corroboration. Confirmed
+    # live (real run, 2026-08-02): 6 rows stamped "all_three"/
+    # "cysill+heuristic" with cysill_pos completely empty. cysill_pos is
+    # deliberately left None for every locally-resolved row (see
+    # bangor_lexicon.py's module docstring), so excluding locally_resolved
+    # rows here is the direct fix, not a proxy. Computed BEFORE the
+    # compute_confidence() call below (moved up from where it used to
+    # live, further down this function) so tagger_agreement and
+    # detection_source/confidence_score are driven by the exact same
+    # signal instead of two independently-computed approximations of it.
+    cysill_has_signal = (bool(target_node.get("cysill_aligned"))
+                          and not target_node.get("locally_resolved"))
+
     confidence, detection_source = compute_confidence(
         outcome["status"], is_erosion, spacy_tok,
-        cysill_mut, expected, surface_mut)
+        cysill_mut, expected, surface_mut,
+        cysill_genuinely_aligned=cysill_has_signal)
 
     parser_mut_type = SPACY_MUTATION_MAP.get(
         spacy_tok["mutation"]) if spacy_tok and spacy_tok.get("mutation") else None
@@ -1914,7 +2148,6 @@ def _build_row(current_node, target_node, expected, outcome,
     # False/missing) -- not merely when its answer happens to be None,
     # since None from an aligned tagger legitimately means "confirmed no
     # mutation" and should compare equal to a None surface_mut.
-    cysill_has_signal = bool(target_node.get("cysill_aligned"))
     parser_has_signal = spacy_tok is not None
     cysill_agrees = (cysill_mut == surface_mut) if cysill_has_signal else None
     parser_agrees = (parser_mut_type == surface_mut) if parser_has_signal else None
@@ -1962,6 +2195,11 @@ def _build_row(current_node, target_node, expected, outcome,
         "radical_candidates":    outcome.get("radical_candidates"),
         "matched_radical":       outcome.get("matched_radical"),
         "expected_surface_forms":outcome.get("expected_surface_forms"),
+        # PATCH: exposes the same signal cysill_has_signal above is built
+        # from, directly on the output row -- lets corpus_analyzer.py (or
+        # a manual spot-check) filter/audit locally-resolved rows without
+        # having to infer them from cysill_pos being empty.
+        "locally_resolved":      bool(target_node.get("locally_resolved")),
     }
 
 
@@ -2002,6 +2240,7 @@ def _build_cs_row(current_node, target_node, t1, norm_current, conf_current,
         "radical_candidates":   None,
         "matched_radical":      None,
         "expected_surface_forms": None,
+        "locally_resolved":     bool(target_node.get("locally_resolved")),
     }
 
 
@@ -2060,6 +2299,13 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
     spacy_tok  = target_node.get("spacy_token")
     cysill_mut = target_node.get("cysill_mutation_type")
     cysill_pos = target_node.get("cysill_pos")
+    # PATCH: same fix as _build_row() -- see its comment for the full
+    # story (confirmed live: locally-resolved rows getting credited as
+    # genuine Cysill corroboration). This rule builds its row differently
+    # from _build_row() and has its own compute_confidence() call, so it
+    # needed the same fix applied independently rather than inheriting it.
+    cysill_has_signal = (bool(target_node.get("cysill_aligned"))
+                          and not target_node.get("locally_resolved"))
 
     status, is_erosion = ("correct_mutation", False) if h_applied else ("erosion", True)
     note = "h-mutation correctly applied." if h_applied else \
@@ -2067,7 +2313,8 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
     surface_mut = "h-mutation" if h_applied else None
 
     confidence, detection_source = compute_confidence(
-        status, is_erosion, spacy_tok, cysill_mut, ["h-mutation"], surface_mut)
+        status, is_erosion, spacy_tok, cysill_mut, ["h-mutation"], surface_mut,
+        cysill_genuinely_aligned=cysill_has_signal)
 
     return {
         "timestamp":            f"{current_node['start']}s - {target_node['end']}s",
@@ -2101,6 +2348,7 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
         "radical_candidates":   None,
         "matched_radical":      None,
         "expected_surface_forms": None,
+        "locally_resolved":     bool(target_node.get("locally_resolved")),
     }
 
 

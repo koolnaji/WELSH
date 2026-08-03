@@ -136,6 +136,33 @@ def rebuild_words_only(pos_df):
                 "gender":               r.get("gender_unified"),
                 "spacy_token":          spacy_tok,
                 "synthetic":            False,
+                # PATCH: carried through from the cached pos_*.csv (see
+                # corpus_ops.py's pos_rows construction) so a rerun still
+                # correctly excludes Bangor-lexicon/code-switch-resolved
+                # words from Cysill corroboration credit in
+                # compute_confidence()/_build_row() -- without this, a
+                # rerun would silently default every row to "not locally
+                # resolved" (r.get() on a missing/older-cache column
+                # returns None), which happens to be the SAFE direction
+                # (undercounts corroboration rather than overcounts it)
+                # but still loses real signal that's available and
+                # should be used when the cache actually has it.
+                "locally_resolved":    bool(r.get("locally_resolved")),
+                # PATCH: pos_*.csv never stored a raw "cysill_aligned"
+                # flag at all -- without this, EVERY rerun (regardless of
+                # the locally_resolved fix above) would see
+                # target_node.get("cysill_aligned") come back None for
+                # every row, collapsing all_three/cysill+heuristic credit
+                # to near-zero across the board, not just for locally-
+                # resolved rows. cysill_pos is the right proxy to
+                # reconstruct it from: parse_pos_result_extended() always
+                # populates "pos" for a genuine live Cysill answer, and
+                # it's left None for every locally-resolved row by
+                # design -- so "cysill_pos is not None" reproduces the
+                # original cysill_aligned semantics exactly, with the
+                # locally-resolved contamination already excluded rather
+                # than needing a second check.
+                "cysill_aligned":      r.get("cysill_pos") is not None,
             })
 
     return words_only
