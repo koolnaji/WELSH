@@ -18,6 +18,7 @@ to fetch captions against.
 A Gmail notification email is sent when video processing (options 1 and 3
 only) finishes -- see corpus_ops.send_notification_email for setup.
 """
+import os
 import torch
 import yt_dlp
 from tqdm import tqdm
@@ -37,6 +38,7 @@ from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
     send_notification_email, build_email_body, channel_display_name,
+    TRANSCRIBE_PRESETS, DEFAULT_TRANSCRIBE_PRESET,
 )
 import corpus_analyzer
 # PATCH: fetch_captions is now a normal top-level import rather than
@@ -248,8 +250,19 @@ def manage_queue():
         else:
             print("  Unknown command.")
 
-def main():
+def main(preset=None):
     ensure_dirs()
+    # PATCH: resolves and confirms the transcription preset once, up front,
+    # rather than silently inside analyze() on the first call. preset=None
+    # (no CLI arg given) falls back to DEFAULT_TRANSCRIBE_PRESET, which is
+    # "accurate" -- byte-identical to the settings that were hardcoded here
+    # before presets existed, so not passing a preset changes nothing.
+    active_preset = preset or DEFAULT_TRANSCRIBE_PRESET
+    if active_preset not in TRANSCRIBE_PRESETS:
+        print(f"⚠️  Unknown preset {active_preset!r} -- using {DEFAULT_TRANSCRIBE_PRESET!r}. "
+              f"Valid presets: {', '.join(TRANSCRIBE_PRESETS)}")
+        active_preset = DEFAULT_TRANSCRIBE_PRESET
+    print(f"Transcription preset: {active_preset}")
     # PATCH: load persisted lemma cache so prior API calls aren't repeated
     load_lemma_cache()
     print("Loading Welsh dependency parser...")
@@ -284,7 +297,14 @@ def main():
         print(f"Loading {model_size} model...")
         device       = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        # PATCH: CTranslate2 was left to pick its own cpu_threads default
+        # instead of being told this machine's actual logical core count.
+        # Zero accuracy tradeoff (unlike beam_size/temperature) -- pure
+        # parallelism. 0 on the CUDA path leaves GPU thread management to
+        # CTranslate2 as before; this only changes CPU behavior.
+        cpu_threads = os.cpu_count() or 4
+        model = WhisperModel(model_size, device=device, compute_type=compute_type,
+                              cpu_threads=cpu_threads if device == "cpu" else 0)
         current_model_size = model_size
         print("✅ Whisper model loaded!\n")
         return model
@@ -502,7 +522,7 @@ def main():
                             "channel_register": local_reg}
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub)
+                            segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset)
                         all_mutation_rows.extend(muts)
                         vpaths = _video_slug(meta, stamp) if save_results else _preview_video_slug(meta, stamp)
                         h = [True] * 5   # fresh header flags per video (new file each time)
@@ -673,7 +693,7 @@ def main():
 
                         mp3_path = download_audio(video)
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub)
+                            segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset)
                         all_mutation_rows.extend(muts)
                         h = [True] * 5   # fresh header flags per video (new file each time)
                         any_written = False
@@ -853,7 +873,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    _ap = argparse.ArgumentParser(
+        description="Welsh mutation-erosion pipeline.",
+        epilog="Examples:\n"
+               "  python welsh_pipeline.py            # accurate (default, unchanged behavior)\n"
+               "  python welsh_pipeline.py fast       # beam_size 5, no temperature fallback\n"
+               "  python welsh_pipeline.py balanced   # beam_size 5, limited fallback\n"
+               "  python welsh_pipeline.py accurate   # beam_size 7, full fallback (old default)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _ap.add_argument(
+        "preset", nargs="?", default=None, choices=sorted(TRANSCRIBE_PRESETS),
+        help="Transcription speed/quality preset -- see corpus_ops.TRANSCRIBE_PRESETS "
+             "for exactly what each one sets and why."
+    )
+    _args = _ap.parse_args()
+    main(preset=_args.preset)
 
 # ================================================================
 # Dedicated to a language that refused to disappear

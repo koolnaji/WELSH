@@ -45,8 +45,42 @@ figures.
 6. Copy `.env.example` to your preferred environment-variable setup and
    fill in what you need (see **Environment variables** below). Only
    `WELSH_ANALYSIS_DIR` affects core functionality; the rest are optional.
-7. Run `python welsh_pipeline.py`. This opens the main interactive menu
-   (see **Workflow** below).
+7. Run `python welsh_pipeline.py`, optionally followed by a transcription
+   preset (`fast`, `balanced`, or `accurate` -- see **Transcription
+   presets** below). This opens the main interactive menu (see
+   **Workflow** below).
+
+### Transcription presets
+
+`python welsh_pipeline.py [fast|balanced|accurate]`. Controls Whisper's
+`beam_size`/`best_of`/`temperature` decoding settings -- the knobs that
+actually drive transcription time. Omitting this argument (or running
+`accurate` explicitly) reproduces the pipeline's original hardcoded
+behavior exactly; nothing changes unless you deliberately pick something
+else.
+
+| Preset | `beam_size` | `temperature` fallback | Use when |
+|---|---|---|---|
+| `fast` | 5 | none (`[0.0]` only) | You want the fastest turnaround and trust the hallucination filter to catch what fallback would have caught |
+| `balanced` | 5 | one retry (`[0.0, 0.2]`) | A middle ground |
+| `accurate` (default) | 7 | full fallback (`[0.0, 0.2, 0.4]`) | Original behavior; slowest, most thorough |
+
+The `temperature` list isn't "try three temperatures and blend them" --
+it's sequential fallback. Whisper decodes at the first value; only if
+that decode fails quality checks does it re-decode the *entire segment
+from scratch* at the next value, paying the full `beam_size`/`best_of`
+cost again each time. On messy or code-switching audio this can trigger
+often enough to multiply decode time substantially on the affected
+segments -- likely the single biggest lever if a run feels slower than
+it should. Cutting fallback (`fast`) is safe to experiment with on this
+project specifically because `filter_hallucinated_segments()` already
+exists downstream to catch garbled output that fallback would otherwise
+have tried to fix -- you're not removing your only safety net, just the
+expensive one. See `TRANSCRIBE_PRESETS` in `corpus_ops.py` for the exact
+values and full reasoning.
+
+Worth spot-checking a known video's output against a prior `accurate`
+run before trusting `fast`/`balanced` for the rest of your corpus.
 
 ### Environment variables
 
@@ -76,12 +110,16 @@ run on its own from the command line.
   adding a linguistic rule, this is the file to open.
 - `cysill_client.py` -- talks to the Cysill API (POS tags, lemmas), with
   retries and a circuit breaker that falls back to spaCy-only if Cysill is
-  down for a whole run.
+  down for a whole run. Once tripped, later calls return instantly and
+  silently rather than re-attempting or re-announcing failure -- a long
+  run doesn't get slower or noisier just because Cysill went down early
+  in it.
 - `spacy_tagging.py` -- loads the Welsh spaCy model and turns its output
   into plain data the rest of the pipeline uses.
 - `corpus_ops.py` -- file I/O: the video queue, processed/failed logs,
   audio download, the `analyze()` function that runs one video end to end,
-  and the completion email.
+  and the completion email. Also owns `TRANSCRIBE_PRESETS` -- see
+  **Transcription presets** above.
 - `bangor_lexicon.py` -- optional, local, offline lookup against
   Techiaith's own Bangor lexicon (~830k wordforms). Loaded once at
   startup if available (see **Setup** step 5); resolves most lemmas, and
@@ -89,6 +127,18 @@ run on its own from the command line.
   going through the Cysill API at all. Never populates `cysill_pos`
   itself (different tag scheme, no published mapping) -- only the
   translated `cysill_mutation_type`/`cysill_gender` fields, and lemmas.
+  Also recognizes English code-switch words and skips sending them to
+  Cysill at all, rather than letting a Welsh-only tagger guess at them.
+
+  **A row resolved this way (or via a recognized code-switch word)
+  carries `locally_resolved=True` in the mutations CSV, and always has an
+  empty `cysill_pos`** -- it never counts toward genuine Cysill
+  corroboration in `tagger_agreement`/`detection_source`/
+  `confidence_score`, even though `cysill_mutation_type`/`cysill_gender`
+  are still populated and usable. Worth knowing if you're doing your own
+  analysis on top of the mutations CSVs rather than going through
+  `corpus_analyzer.py`: `cysill_pos` being empty doesn't mean "Cysill had
+  nothing to say," it can also mean "this word never needed asking."
 
 **Standalone companions (each also runs directly; most are called
 automatically at the right point in the main workflow -- exceptions
