@@ -799,12 +799,68 @@ def download_audio(video, max_retries=3):
         return str(raw_path)
 
 
+# ========================= TRANSCRIPTION PRESETS =========================
+# One source of truth for the beam_size/best_of/temperature knobs that
+# actually drive Whisper decode time -- previously hardcoded inline in
+# analyze() below, meaning "try a faster setting" meant editing this file
+# directly. "accurate" is byte-for-byte what was hardcoded before this
+# existed, so picking it (or omitting --preset) reproduces prior behavior
+# exactly -- nothing changes unless you deliberately pick "fast" or
+# "balanced".
+#
+# What each knob actually costs, so the tradeoff here is legible rather
+# than three unlabeled dials:
+#   - beam_size: search width during decoding. Cost scales roughly with
+#     this number. 5 is the standard Whisper default; 7 (the old hardcoded
+#     value) is a real step up in compute for typically modest accuracy
+#     gains on already-decent audio.
+#   - temperature: NOT "try three temperatures and blend them" -- it's
+#     SEQUENTIAL FALLBACK. Whisper decodes at the first value; only if
+#     that decode fails quality checks (compression_ratio_threshold,
+#     no_speech_threshold) does it re-decode the ENTIRE segment from
+#     scratch at the next value. Each fallback attempt pays the full
+#     beam_size/best_of cost again. On messy, code-switching, or noisy
+#     audio -- exactly this project's profile -- fallback can trigger
+#     often enough to multiply decode time by up to len(temperature) on
+#     the affected segments. This is the single most likely place a
+#     multi-hour run is actually going. "fast" cuts fallback entirely
+#     (temperature=[0.0]) -- safe to try on THIS project specifically
+#     because filter_hallucinated_segments() already exists downstream to
+#     catch and drop garbled output that fallback would otherwise have
+#     tried to fix, so you're not removing your only safety net, just the
+#     expensive one.
+#   - best_of: only relevant when temperature > 0 (it's a sampling-pass
+#     parameter, unused during the temperature=0.0 beam-search pass) --
+#     irrelevant for "fast" (single temperature=0.0 pass), included in
+#     "balanced"/"accurate" since those still fall back to temp>0 passes.
+TRANSCRIBE_PRESETS = {
+    "fast": {
+        "beam_size": 5, "best_of": None, "patience": 1.0,
+        "temperature": [0.0],
+    },
+    "balanced": {
+        "beam_size": 5, "best_of": 5, "patience": 1.0,
+        "temperature": [0.0, 0.2],
+    },
+    "accurate": {
+        "beam_size": 7, "best_of": 5, "patience": 1.0,
+        "temperature": [0.0, 0.2, 0.4],
+    },
+}
+DEFAULT_TRANSCRIBE_PRESET = "accurate"  # = old hardcoded behavior, unchanged default
+
+
 # ========================= ANALYSIS =========================
-def analyze(audio_path, model, video_meta, substeps=None):
+def analyze(audio_path, model, video_meta, substeps=None, preset=None):
     """
     substeps: optional tqdm instance with total=4 (transcribe, preprocess,
     tag+align, mutations). If given, step descriptions go there instead of
     being print()ed -- used by pipeline.py for the per-video sub-progress bar.
+
+    preset: one of TRANSCRIBE_PRESETS' keys ("fast"/"balanced"/"accurate"),
+    or None to use DEFAULT_TRANSCRIBE_PRESET. An unrecognized string falls
+    back to the default with a warning rather than raising -- a typo in a
+    CLI arg shouldn't crash a run that's already underway.
     """
     def _step(label):
         if substeps is not None:
@@ -813,20 +869,29 @@ def analyze(audio_path, model, video_meta, substeps=None):
         else:
             print(f" {label}...")
 
+    preset_name = preset or DEFAULT_TRANSCRIBE_PRESET
+    if preset_name not in TRANSCRIBE_PRESETS:
+        print(f" ⚠️ Unknown transcription preset {preset_name!r} -- "
+              f"falling back to {DEFAULT_TRANSCRIBE_PRESET!r}. "
+              f"Valid presets: {', '.join(TRANSCRIBE_PRESETS)}")
+        preset_name = DEFAULT_TRANSCRIBE_PRESET
+    preset_kwargs = dict(TRANSCRIBE_PRESETS[preset_name])
+    if preset_kwargs.get("best_of") is None:
+        preset_kwargs.pop("best_of", None)  # faster-whisper expects it omitted, not None
+
     start_time = time.time()
     _step("Transcribing")
     transcribe_kwargs = {
         "language": "cy", "word_timestamps": True,
-        "beam_size": 7, "best_of": 5, "patience": 1.0,
         "vad_filter": True,
         "vad_parameters": dict(threshold=0.6, min_silence_duration_ms=800,
                                max_speech_duration_s=20),
-        "temperature": [0.0, 0.2, 0.4],
         "no_repeat_ngram_size": 5,
         "compression_ratio_threshold": 2.0,
         "no_speech_threshold": 0.6,
         "initial_prompt": "Cymraeg. Welsh language speech from S4C, Hansh, "
                           "Rownd a Rownd or Welsh YouTube.",
+        **preset_kwargs,
     }
     segments, info = model.transcribe(audio_path, **transcribe_kwargs)
     # PATCH: info.duration is the actual audio length (seconds) faster-whisper
