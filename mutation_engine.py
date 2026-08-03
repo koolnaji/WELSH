@@ -457,10 +457,9 @@ def load_lemma_cache():
 def save_lemma_cache():
     """Persist lemma cache to disk for reuse in future runs."""
     try:
-        LEMMA_CACHE_PATH.write_text(
-            json.dumps(LEMMA_CACHE, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
+        # Match the crash-safe persistence used for queue and checkpoint
+        # state. A direct write can leave truncated JSON after an interrupt.
+        _write_json_atomic(LEMMA_CACHE_PATH, LEMMA_CACHE)
     except Exception as e:
         print(f"⚠️  Could not save lemma cache: {e}")
 
@@ -1050,12 +1049,14 @@ def _checkpoint_path_for(checkpoint_key):
     return CHECKPOINT_DIR / f"{digest}.json"
 
 
-def _load_enrich_checkpoint(checkpoint_path, checkpoint_key, expected_fingerprint, total_chunks):
+def _load_enrich_checkpoint(checkpoint_path, checkpoint_key, expected_fingerprint,
+                            chunk_word_counts):
     """
     Returns {"completed_chunk_count": int, "enriched_words": [...]} if a
     valid, matching checkpoint exists, else None. "Valid" means: the file
-    parses, AND its fingerprint matches the CURRENT input words, AND its
-    completed_chunk_count is sanely within [0, total_chunks]. Any mismatch
+    parses, its fingerprint matches the CURRENT input words, its completed
+    chunk count is in range, and its saved-word count exactly matches that
+    completed chunk prefix. Any mismatch
     is treated as "this checkpoint doesn't apply anymore" and logged, not
     silently discarded -- so a fingerprint mismatch (see
     _checkpoint_fingerprint()'s docstring) is visible instead of just
@@ -1078,11 +1079,18 @@ def _load_enrich_checkpoint(checkpoint_path, checkpoint_key, expected_fingerprin
                    "risk misaligning words to the wrong chunk.")
         return None
 
+    total_chunks = len(chunk_word_counts)
     completed = data.get("completed_chunk_count", 0)
     enriched  = data.get("enriched_words", [])
     if not isinstance(completed, int) or not (0 <= completed <= total_chunks):
         tqdm.write(" ⚠️ Checkpoint's completed_chunk_count is invalid for this video's "
                    "current chunk count -- starting fresh.")
+        return None
+
+    expected_word_count = sum(chunk_word_counts[:completed])
+    if not isinstance(enriched, list) or len(enriched) != expected_word_count:
+        tqdm.write("Checkpoint word count does not match its completed chunks; "
+                   "starting this video fresh to avoid shifted alignment.")
         return None
 
     return {"completed_chunk_count": completed, "enriched_words": enriched}
@@ -1138,8 +1146,10 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
     if checkpoint_key:
         fingerprint     = _checkpoint_fingerprint(all_preprocessed_words)
         checkpoint_path = _checkpoint_path_for(checkpoint_key)
-        loaded = _load_enrich_checkpoint(checkpoint_path, checkpoint_key,
-                                          fingerprint, len(chunks))
+        loaded = _load_enrich_checkpoint(
+            checkpoint_path, checkpoint_key, fingerprint,
+            [len(chunk) for chunk in chunks],
+        )
         if loaded is not None and loaded["completed_chunk_count"] > 0:
             enriched        = loaded["enriched_words"]
             start_chunk_idx = loaded["completed_chunk_count"]
@@ -1284,6 +1294,10 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
                 cysill_aligned.append((chunk[len(cysill_aligned)], None))
             while len(spacy_aligned) < len(chunk):
                 spacy_aligned.append((chunk[len(spacy_aligned)], None))
+            # An aligner should never emit extras, but normalize that case
+            # explicitly instead of leaving zip() to hide the mismatch.
+            cysill_aligned = cysill_aligned[:len(chunk)]
+            spacy_aligned = spacy_aligned[:len(chunk)]
 
         # ---- Merge ----
         for (w, cysill_tok), (_, spacy_tok) in zip(cysill_aligned, spacy_aligned):
