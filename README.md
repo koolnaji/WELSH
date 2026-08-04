@@ -47,8 +47,9 @@ figures.
    `WELSH_ANALYSIS_DIR` affects core functionality; the rest are optional.
 7. Run `python welsh_pipeline.py`, optionally followed by a transcription
    preset (`fast`, `balanced`, or `accurate` -- see **Transcription
-   presets** below). This opens the main interactive menu (see
-   **Workflow** below).
+   presets** below) and/or `--sample-minutes`/`--skip-minutes` (see
+   **Sampling long videos** below). This opens the main interactive menu
+   (see **Workflow** below).
 
 ### Transcription presets
 
@@ -81,6 +82,89 @@ values and full reasoning.
 
 Worth spot-checking a known video's output against a prior `accurate`
 run before trusting `fast`/`balanced` for the rest of your corpus.
+
+### Sampling long videos
+
+`python welsh_pipeline.py [preset] --sample-minutes N [--skip-minutes M]`
+
+For long recordings (2hr+ podcasts, in particular), transcribing the
+whole file isn't necessary to get a valid measurement -- every metric
+this project reports is a rate/proportion (mutation application rate,
+code-switch rate, erosion rate), not a raw count, so a fixed-length
+sample per video is a legitimate way to cut wall-clock time without
+changing what's being measured.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--sample-minutes N` | unset (full video) | Only transcribe/analyze an `N`-minute window of each video instead of the whole file. Omit entirely for unchanged, full-video behavior. |
+| `--skip-minutes M` | `5.0` | Where that window starts. Only matters if `--sample-minutes` is set. |
+
+So `--sample-minutes 18` alone samples minutes 5-23 of every video --
+skipping the first 5 minutes by default, since intros, cold opens, and
+sponsor reads aren't representative of the spontaneous speech this
+project is trying to measure, and sampling from 0:00 would
+systematically feed the pipeline the *least* representative minutes of
+every video. `--skip-minutes 0` samples from the true start if you want
+that instead.
+
+A video too short to support the requested window (i.e. `skip_minutes +
+sample_minutes` exceeds the video's actual length) falls back to
+sampling from 0:00 automatically, rather than seeking past the end of
+the file and producing an empty clip.
+
+**Sentence boundaries are respected, not just chopped.** A hard cut at
+an arbitrary timestamp doesn't know or care about grammar, and mutation
+detection needs at least sentence-level context -- a trigger/target pair
+split across an artificial cut is unusable, not just noisy. So the
+actual extraction pulls a slightly WIDER clip than requested (20s of
+padding on each side, clamped to the real file boundaries) purely so
+Whisper has complete audio for whatever sentence straddles each edge.
+After transcription, any Whisper segment that only exists because of
+that padding -- i.e. starts before, or ends after, the *true* requested
+window -- is dropped before mutation detection ever sees it. A boundary
+that happens to sit at the video's genuine 0:00 or its genuine true end
+is never treated as an artificial cut, so nothing gets dropped there.
+See `sample_audio_window()` and `_shift_and_trim_padded_segments()` in
+`corpus_ops.py` for the full mechanism.
+
+**Timestamps are corrected back to true-video time.** Whisper only ever
+sees the extracted clip and counts from 0:00 of *that file* -- without
+correction, every timestamp in the mutations/words CSVs would be off by
+however much got trimmed off the front, and caption corroboration in
+`fetch_captions.py` (which aligns against the real caption track's real
+timestamps) would silently misalign on every sampled run. Every segment
+and word timestamp is shifted back to true-video time immediately after
+transcription, before anything else touches it -- so the `timestamp`
+column in your CSVs, and caption corroboration, both work exactly the
+same whether or not a video was sampled.
+
+`video_duration_seconds` in the output CSVs reflects the TRUE (unpadded)
+sample length when sampling is active, not the length of the padded
+clip Whisper actually transcribed -- otherwise every "minutes of corpus
+covered" total in `corpus_analyzer.py` would be silently inflated by
+2x the padding on every sampled video.
+
+Mechanically, the trim itself uses the audio FILE (via `ffmpeg -ss ...
+-t ... -c copy`, a near-instant stream copy, not a re-encode) rather
+than faster-whisper's own `clip_timestamps` parameter. That's
+deliberate: per faster-whisper's own docs, passing `clip_timestamps`
+makes it silently ignore `vad_filter` -- and this pipeline's VAD
+settings are load-bearing for the hallucination defense
+(`filter_hallucinated_segments()` downstream assumes VAD already did
+its job). Trimming the file keeps VAD running exactly as it always has,
+just over a shorter (padded) file.
+
+The trimmed file is written next to the source audio as
+`<name>_sample<true_start>-<true_end>s.mp3` (e.g.
+`podcast_sample300-1380s.mp3` -- named for the TRUE requested window,
+not the padded extraction) -- see **Where your data ends up** below.
+
+This applies process-wide for the run, the same way a transcription
+preset does -- it's not a per-video or per-menu-choice setting. Both
+Queue & Processing -> b and Testing -> b respect it if set at launch.
+
+Applies only to already-downloaded/local audio -- it doesn't reduce
+what gets downloaded from YouTube first (that's still the full video).
 
 ### Environment variables
 
@@ -118,8 +202,9 @@ run on its own from the command line.
   into plain data the rest of the pipeline uses.
 - `corpus_ops.py` -- file I/O: the video queue, processed/failed logs,
   audio download, the `analyze()` function that runs one video end to end,
-  and the completion email. Also owns `TRANSCRIBE_PRESETS` -- see
-  **Transcription presets** above.
+  and the completion email. Also owns `TRANSCRIBE_PRESETS` (see
+  **Transcription presets** above) and `sample_audio_window()` (see
+  **Sampling long videos** above).
 - `bangor_lexicon.py` -- optional, local, offline lookup against
   Techiaith's own Bangor lexicon (~830k wordforms). Loaded once at
   startup if available (see **Setup** step 5); resolves most lemmas, and
@@ -201,7 +286,11 @@ option:
 
 ```
 WELSH_ANALYSIS_DIR/
-├── audio/                                  downloaded/local MP3s
+├── audio/                                  downloaded/local MP3s -- plus a
+│                                              `<name>_sample<start>-<end>s.mp3`
+│                                              next to any source file that was
+│                                              trimmed by `--sample-minutes`
+│                                              (see **Sampling long videos**)
 ├── test_audio/                             drop local MP3s here for Testing -> b
 ├── captions/<stamp>/<slug>/                downloaded .vtt + parsed .csv caption files --
 │                                              nested per-run/per-video, same as transcriptions/
