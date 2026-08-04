@@ -1,0 +1,7 @@
+# Dev-only dependencies -- needed to run tests/, not to run the pipeline
+# itself. Install with:
+#   pip install -r requirements-dev.txt
+#
+# (installs on top of requirements.txt, doesn't replace it)
+
+pytest
