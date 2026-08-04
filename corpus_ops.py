@@ -14,6 +14,7 @@ import smtplib
 import subprocess
 import time
 from email.mime.text import MIMEText
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 import pandas as pd
 import requests
@@ -891,8 +892,198 @@ TRANSCRIBE_PRESETS = {
 DEFAULT_TRANSCRIBE_PRESET = "accurate"  # = old hardcoded behavior, unchanged default
 
 
+# ========================= SAMPLING =========================
+# PATCH: added so a single long recording (2hr+ podcasts, in particular)
+# doesn't have to be transcribed/tagged in full just to get a rate
+# estimate -- this project's metrics are all proportions (mutation
+# application rate, code-switch rate, erosion rate), not raw counts, so
+# a fixed-length sample per video is a legitimate way to cut wall-clock
+# time without changing what's being measured. Deliberately does NOT use
+# faster-whisper's own `clip_timestamps` param for this: per the
+# faster-whisper docs, passing clip_timestamps makes vad_filter get
+# silently IGNORED -- and this pipeline's vad_filter + vad_parameters is
+# load-bearing for the existing 4-layer hallucination defense
+# (filter_hallucinated_segments() downstream assumes VAD already did its
+# job). That's exactly the "two things that look interchangeable but
+# aren't" shape of bug this project has been bitten by before (see
+# mutation_engine.py's tagger_agreement/DOM-Vnoun-conflation comments),
+# so instead this physically trims the audio FILE before Whisper ever
+# sees it -- vad_filter runs exactly as it always has, just over a
+# shorter file.
+#
+# PATCH: sample window now starts `skip_seconds` in rather than at 0:00.
+# Sponsor reads, cold opens, "thanks for watching" scripted intros, etc.
+# aren't representative of the casual/spontaneous speech this project is
+# actually trying to measure -- sampling from 0:00 would systematically
+# feed the pipeline the LEAST representative minutes of every video.
+# Deliberate tradeoff, by request: if a video has an ad or a musical
+# intro sitting inside the skip window, that's just lost, not detected
+# and skipped around -- this is a fixed offset, not ad-detection.
+def _probe_duration_seconds(path):
+    """
+    ffprobe-based duration lookup, used only to decide whether a video
+    is even long enough to support skip_seconds + sample_seconds.
+    Returns None on any failure (missing ffprobe, corrupt file, etc.) --
+    callers treat None the same as "unknown, don't skip", since guessing
+    wrong here means either silently sampling 0 seconds (skip stacked
+    past the end) or crashing on a bad seek, neither of which is
+    acceptable for something as unattended as a queue-processing run.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+            capture_output=True, text=True, check=True)
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except Exception:
+        return None
+
+
+def sample_audio_window(audio_path, sample_seconds, skip_seconds=300, pad_seconds=20):
+    """
+    Returns (path, bounds).
+
+    `path` is an audio file containing the TRUE sample window
+    (`sample_seconds` starting `skip_seconds` in, default 5 min -- see
+    module comment above) PLUS `pad_seconds` (default 20s) of extra
+    audio on each side, clamped to the real file boundaries. The padding
+    exists purely so Whisper sees complete sentences straddling the true
+    window's edges instead of audio cut mid-word/mid-sentence -- mutation
+    detection needs at least sentence-level context, so a segment that's
+    truncated by an arbitrary cut point is unusable, not just noisy.
+
+    `bounds` is None if sample_seconds is falsy (no sampling requested --
+    caller should treat segment/word timestamps as already true-video-
+    relative, unchanged behavior). Otherwise it's a dict describing the
+    TRUE (unpadded) window in original-video time, which the caller
+    (analyze(), via _shift_and_trim_padded_segments()) uses to (1) shift
+    Whisper's clip-relative timestamps back to true-video time -- Whisper
+    only ever sees the trimmed file and counts from 0 -- and (2) drop any
+    segment that only exists because of the padding:
+        extraction_start: where the audio was actually cut from (padded)
+        true_start / true_end: the real sample window boundaries
+        at_video_start / at_video_end: whether true_start/true_end sit at
+            the genuine edges of the video (0:00, or the file's actual
+            end) -- a segment straddling a GENUINE edge is not a padding
+            artifact and should not be dropped for it. If the file's
+            duration couldn't be probed, at_video_end is conservatively
+            False (better to drop a possibly-genuine trailing segment
+            than to keep one that might be a padding artifact).
+
+    Falls back to starting at 0:00 instead ONLY if the video is too short
+    to support the skip (i.e. skipping would leave less than
+    `sample_seconds` of material, or duration couldn't be determined at
+    all) -- a short video still gets sampled, just without the
+    intro-skipping, rather than silently producing an empty/near-empty
+    clip.
+
+    If sample_seconds is falsy, returns (audio_path, None) unchanged --
+    no pointless copy when no sampling was requested at all.
+
+    Uses `-c copy` (stream copy, no re-encode) since the input is always
+    an already-normalized mp3 by the time this is called -- this is a
+    near-instant container-level cut, not a real transcode, so it adds
+    negligible time to the run it's meant to be shortening.
+
+    Output goes next to the source file with a `_sampleSTART-ENDs`
+    suffix (true window, not the padded extraction) so repeated runs
+    with the same window reuse/overwrite predictably rather than
+    accumulating junk files.
+    """
+    if not sample_seconds:
+        return audio_path, None
+    src = Path(audio_path)
+    duration = _probe_duration_seconds(src)
+    true_start = skip_seconds
+    if duration is None or duration < skip_seconds + sample_seconds:
+        true_start = 0
+    true_end = true_start + sample_seconds
+
+    extraction_start = max(0, true_start - pad_seconds)
+    extraction_end = true_end + pad_seconds
+    if duration is not None:
+        extraction_end = min(duration, extraction_end)
+    extraction_len = extraction_end - extraction_start
+
+    out = src.with_name(
+        f"{src.stem}_sample{int(true_start)}-{int(true_end)}s{src.suffix}")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(extraction_start), "-i", str(src),
+             "-t", str(extraction_len), "-c", "copy", str(out)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        if out.exists() and out.stat().st_size > 0:
+            bounds = {
+                "extraction_start": extraction_start,
+                "true_start": true_start,
+                "true_end": true_end,
+                "at_video_start": true_start == 0,
+                "at_video_end": duration is not None and true_end >= duration - 0.5,
+            }
+            return str(out), bounds
+    except Exception as e:
+        tqdm.write(f" ⚠️ Sampling trim failed ({e}) -- using full audio file instead.")
+    return audio_path, None
+
+
+def _shift_and_trim_padded_segments(segments, sample_bounds):
+    """
+    Converts Whisper's clip-relative segment/word timestamps into true-
+    video time, and drops any segment that only exists because of the
+    padding sample_audio_window() adds around the true sample window.
+
+    Without this, two bugs ship silently: (1) every timestamp in the
+    CSVs is relative to the trimmed/padded clip rather than the real
+    video -- breaking caption corroboration in fetch_captions.py, which
+    aligns against the real caption track's real timestamps, and making
+    the timestamp columns meaningless against the actual video; and (2)
+    a sentence that only transcribed cleanly because padding gave
+    Whisper the rest of it, sitting outside the true sample window,
+    would get counted as sampled content when only the padding-covered
+    fragment of it was ever supposed to be in this sample.
+
+    faster-whisper's Segment/Word are plain (non-frozen) dataclasses, so
+    timestamps are shifted in place rather than rebuilt.
+
+    No-op (segments returned unchanged) when sample_bounds is None --
+    i.e. no sampling happened, so segments already came from the full,
+    unpadded file and are already in true-video time.
+    """
+    if sample_bounds is None:
+        return segments
+
+    offset     = sample_bounds["extraction_start"]
+    true_start = sample_bounds["true_start"]
+    true_end   = sample_bounds["true_end"]
+    at_start   = sample_bounds["at_video_start"]
+    at_end     = sample_bounds["at_video_end"]
+
+    kept = []
+    for seg in segments:
+        seg.start += offset
+        seg.end   += offset
+        for w in seg.words:
+            w.start += offset
+            w.end   += offset
+
+        # A boundary at the genuine edge of the video isn't an artifact
+        # of where we chose to cut -- don't drop a segment just for
+        # starting at 0:00 or ending at the video's real end. 0.05s
+        # tolerance absorbs float rounding, not a real grace window.
+        starts_early = seg.start < true_start - 0.05 and not at_start
+        ends_late    = seg.end   > true_end   + 0.05 and not at_end
+        if starts_early or ends_late:
+            tqdm.write(
+                f" ✂️  Dropping padding-only segment [{seg.start:.1f}s-"
+                f"{seg.end:.1f}s] -- outside true sample window "
+                f"[{true_start:.1f}s-{true_end:.1f}s]")
+            continue
+        kept.append(seg)
+    return kept
+
+
 # ========================= ANALYSIS =========================
-def analyze(audio_path, model, video_meta, substeps=None, preset=None):
+def analyze(audio_path, model, video_meta, substeps=None, preset=None,
+            sample_seconds=None, skip_seconds=300):
     """
     substeps: optional tqdm instance with total=4 (transcribe, preprocess,
     tag+align, mutations). If given, step descriptions go there instead of
@@ -902,6 +1093,16 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None):
     or None to use DEFAULT_TRANSCRIBE_PRESET. An unrecognized string falls
     back to the default with a warning rather than raising -- a typo in a
     CLI arg shouldn't crash a run that's already underway.
+
+    sample_seconds: if given, only `sample_seconds` of the audio are
+    transcribed/analyzed, starting `skip_seconds` in (see
+    sample_audio_window() above for why: skip past intros/ads, and why
+    this trims the file rather than using clip_timestamps). None (the
+    default) processes the full file -- unchanged behavior unless
+    explicitly requested.
+
+    skip_seconds: where the sample window starts, in seconds (default
+    300 = 5 min). Only matters when sample_seconds is set.
     """
     def _step(label):
         if substeps is not None:
@@ -919,6 +1120,9 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None):
     preset_kwargs = dict(TRANSCRIBE_PRESETS[preset_name])
     if preset_kwargs.get("best_of") is None:
         preset_kwargs.pop("best_of", None)  # faster-whisper expects it omitted, not None
+
+    audio_path, sample_bounds = sample_audio_window(
+        audio_path, sample_seconds, skip_seconds=skip_seconds)
 
     start_time = time.time()
     _step("Transcribing")
@@ -941,8 +1145,23 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None):
     # onto every output row below, letting corpus_analyzer.py answer "how many
     # minutes of video did this corpus actually cover?" without re-opening
     # any audio files.
-    video_duration_seconds = round(getattr(info, "duration", 0.0) or 0.0, 2)
+    # PATCH: when sampled, this must be the TRUE (unpadded) sample-window
+    # length, not info.duration -- info.duration is the length of the
+    # padded clip actually fed to Whisper, which is `pad_seconds` longer
+    # on each side than what was really sampled. Using info.duration here
+    # would silently inflate every "minutes of corpus covered" total in
+    # corpus_analyzer.py by 2*pad_seconds per sampled video.
+    if sample_bounds is not None:
+        video_duration_seconds = round(
+            sample_bounds["true_end"] - sample_bounds["true_start"], 2)
+    else:
+        video_duration_seconds = round(getattr(info, "duration", 0.0) or 0.0, 2)
     segments = list(segments)
+    # PATCH: shift clip-relative timestamps to true-video time and drop
+    # padding-only partial segments BEFORE any other filtering -- see
+    # _shift_and_trim_padded_segments()'s docstring. A no-op when this
+    # video wasn't sampled (sample_bounds is None).
+    segments = _shift_and_trim_padded_segments(segments, sample_bounds)
     segments = filter_hallucinated_segments(segments)
     segments = deduplicate_overlapping_segments(segments)
 

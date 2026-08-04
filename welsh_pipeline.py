@@ -250,7 +250,7 @@ def manage_queue():
         else:
             print("  Unknown command.")
 
-def main(preset=None):
+def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     ensure_dirs()
     # PATCH: resolves and confirms the transcription preset once, up front,
     # rather than silently inside analyze() on the first call. preset=None
@@ -263,6 +263,20 @@ def main(preset=None):
               f"Valid presets: {', '.join(TRANSCRIBE_PRESETS)}")
         active_preset = DEFAULT_TRANSCRIBE_PRESET
     print(f"Transcription preset: {active_preset}")
+    # PATCH: resolved once, same pattern as active_preset above.
+    # sample_minutes=None (no CLI arg) processes full videos -- unchanged
+    # behavior unless explicitly requested. When set, every video (both
+    # local-MP3 batches and queue processing) is trimmed to a
+    # sample_minutes-long window starting skip_minutes in -- see
+    # corpus_ops.sample_audio_window() for why the window is offset from
+    # 0:00 (skip past intros/ads) and why it trims the file rather than
+    # using clip_timestamps.
+    active_sample_seconds = int(sample_minutes * 60) if sample_minutes else None
+    active_skip_seconds = int((skip_minutes or 0) * 60)
+    if active_sample_seconds:
+        print(f"Per-video sample: {sample_minutes} min, starting {skip_minutes} min in")
+    else:
+        print("Per-video sample: full video (no limit)")
     # PATCH: load persisted lemma cache so prior API calls aren't repeated
     load_lemma_cache()
     print("Loading Welsh dependency parser...")
@@ -522,7 +536,7 @@ def main(preset=None):
                             "channel_register": local_reg}
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset)
+                            segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
                         vpaths = _video_slug(meta, stamp) if save_results else _preview_video_slug(meta, stamp)
                         h = [True] * 5   # fresh header flags per video (new file each time)
@@ -693,7 +707,7 @@ def main(preset=None):
 
                         mp3_path = download_audio(video)
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset)
+                            segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
                         h = [True] * 5   # fresh header flags per video (new file each time)
                         any_written = False
@@ -888,8 +902,24 @@ if __name__ == "__main__":
         help="Transcription speed/quality preset -- see corpus_ops.TRANSCRIBE_PRESETS "
              "for exactly what each one sets and why."
     )
+    _ap.add_argument(
+        "--sample-minutes", type=float, default=None,
+        help="Only transcribe/analyze N minutes of each video, instead "
+             "of the full file. Useful for long recordings (2hr+ "
+             "podcasts) when you're measuring rates/proportions rather "
+             "than raw totals, so a partial sample is still a valid "
+             "estimate. Omit for unchanged (full-video) behavior."
+    )
+    _ap.add_argument(
+        "--skip-minutes", type=float, default=5.0,
+        help="Where the sample window starts (default: 5.0 min in), "
+             "so intros/ads/cold-opens aren't what gets sampled. Only "
+             "matters when --sample-minutes is set. A video too short "
+             "to support the skip falls back to sampling from 0:00 "
+             "instead of producing an empty clip."
+    )
     _args = _ap.parse_args()
-    main(preset=_args.preset)
+    main(preset=_args.preset, sample_minutes=_args.sample_minutes, skip_minutes=_args.skip_minutes)
 
 # ================================================================
 # Dedicated to a language that refused to disappear
