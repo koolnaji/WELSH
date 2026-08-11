@@ -49,6 +49,7 @@ from pathlib import Path
 
 import pandas as pd
 import yt_dlp
+from tqdm import tqdm
 
 # PATCH: previously duplicated these here (Path.home() / "Documents" /
 # "welsh_analysis") per the old standalone-script pattern -- silently
