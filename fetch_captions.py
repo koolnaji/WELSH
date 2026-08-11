@@ -42,6 +42,7 @@ import difflib
 import re
 import shutil
 import sys
+import time
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -208,12 +209,63 @@ def _vtt_ts_to_seconds(ts):
     return int(h) * 3600 + int(m) * 60 + float(s)
 
 
+# PATCH: caption fetching had NO retry/backoff at all, unlike
+# download_audio() in corpus_ops.py -- a single YouTube 429 ("Too Many
+# Requests") just aborted the whole caption-corroboration step for that
+# video. Made worse by the fact that list_available_tracks() and
+# download_captions() each did their own extract_info() call, and
+# welsh_pipeline.py's queue loop called list_available_tracks() a THIRD
+# time before ever calling download_captions() -- i.e. up to 3 unpaced
+# extract_info requests per video with zero delay between videos, which
+# is exactly the request pattern YouTube's rate limiter flags. Two
+# changes here: (1) a real backoff on 429s specifically, separate from
+# the DNS-blip backoff in corpus_ops.py because a rate limit needs
+# actual cooldown time, not a quick reconnect; (2) download_captions()
+# can now reuse an already-known (manual_cy, auto_cy, title) tuple
+# instead of silently re-deriving it, so callers that already called
+# list_available_tracks() (as welsh_pipeline.py does) don't pay for that
+# request twice.
+RATE_LIMIT_BACKOFF_SECONDS = (10, 30, 60)
+
+
+def _is_rate_limit_error(exc):
+    """True if this exception is (or wraps) an HTTP 429 -- checked by
+    substring on str(exc) rather than exception type, since yt-dlp wraps
+    the underlying HTTPError in its own DownloadError/ExtractorError and
+    the specific status code only survives in the message text (confirmed
+    against the actual error text: 'HTTP Error 429: Too Many Requests')."""
+    msg = str(exc).lower()
+    return "429" in msg or "too many requests" in msg
+
+
+def _extract_info_with_backoff(url, opts, max_retries=3, download=False):
+    """extract_info() wrapped with the same attempt/backoff shape as
+    download_audio()'s retry loop, but with a longer, rate-limit-specific
+    cooldown -- a 429 means YouTube wants you to slow down, not that the
+    request was merely unlucky."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=download)
+        except Exception as e:
+            if attempt < max_retries:
+                if _is_rate_limit_error(e):
+                    wait = RATE_LIMIT_BACKOFF_SECONDS[
+                        min(attempt - 1, len(RATE_LIMIT_BACKOFF_SECONDS) - 1)]
+                    tqdm.write(f"    (rate limited (429) -- waiting {wait}s "
+                               f"before retrying)")
+                else:
+                    wait = 3 * attempt
+                time.sleep(wait)
+            else:
+                raise
+
+
 def list_available_tracks(url):
     """Returns (manual_langs, auto_langs) -- lists of Welsh-ish language
     codes found in each category, without downloading anything."""
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = _extract_info_with_backoff(url, opts, download=False)
 
     manual = info.get("subtitles") or {}
     auto   = info.get("automatic_captions") or {}
@@ -224,11 +276,19 @@ def list_available_tracks(url):
     return manual_cy, auto_cy, info.get("title", url)
 
 
-def download_captions(url, prefer_auto=False, out_dir=CAPTIONS_DIR):
+def download_captions(url, prefer_auto=False, out_dir=CAPTIONS_DIR, known_tracks=None):
     """Downloads whichever Welsh caption track is available (manual
     preferred unless prefer_auto=True) as a .vtt file. Returns the path,
-    the language code used, and whether it was 'manual' or 'automatic'."""
-    manual_cy, auto_cy, title = list_available_tracks(url)
+    the language code used, and whether it was 'manual' or 'automatic'.
+
+    known_tracks: optional (manual_cy, auto_cy, title) tuple, as returned
+    by list_available_tracks(). Pass this if the caller already called
+    list_available_tracks() itself, so this function doesn't repeat that
+    same network request."""
+    if known_tracks is not None:
+        manual_cy, auto_cy, title = known_tracks
+    else:
+        manual_cy, auto_cy, title = list_available_tracks(url)
 
     if not manual_cy and not auto_cy:
         return None, None, None, title
@@ -252,8 +312,7 @@ def download_captions(url, prefer_auto=False, out_dir=CAPTIONS_DIR):
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "quiet": True, "no_warnings": True,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = _extract_info_with_backoff(url, opts, download=True)
 
     video_id = info.get("id")
     # yt-dlp names the file <id>.<lang>.vtt

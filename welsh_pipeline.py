@@ -684,10 +684,20 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         # cross-check is not a reason to lose the data.
                         captions_csv_path = None
                         try:
-                            manual_cy, auto_cy, _ = fetch_captions.list_available_tracks(video["url"])
+                            # PATCH: pass the already-fetched track listing
+                            # straight into download_captions() via
+                            # known_tracks= instead of letting it silently
+                            # re-call list_available_tracks() -- that was a
+                            # second unpaced extract_info() request per
+                            # video for no reason, and was part of what was
+                            # tripping YouTube's 429 rate limit on caption
+                            # fetching (see fetch_captions.py PATCH comment).
+                            tracks = fetch_captions.list_available_tracks(video["url"])
+                            manual_cy, auto_cy, _ = tracks
                             if manual_cy or auto_cy:
                                 vtt_path, cap_lang, cap_kind, _ = fetch_captions.download_captions(
-                                    video["url"], out_dir=vpaths["captions_dir"])
+                                    video["url"], out_dir=vpaths["captions_dir"],
+                                    known_tracks=tracks)
                                 if vtt_path is not None:
                                     cap_segments = fetch_captions.parse_vtt(vtt_path)
                                     captions_csv_path = vtt_path.with_suffix(".csv")
