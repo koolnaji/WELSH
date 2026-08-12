@@ -173,6 +173,7 @@ what gets downloaded from YouTube first (that's still the full video).
 | `WELSH_ANALYSIS_DIR` | No | Where all output lives (audio, transcripts, mutations, summaries, queue/cache files). Defaults to `~/welsh_analysis` if unset. |
 | `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. |
 | `BANGOR_LEXICON_PATH` | No | Path to the downloaded `lecsicon_cc0.txt` file (see **Setup** step 5). Without it, lemma/POS/mutation-type/gender lookups go straight to Cysill/spaCy/simplemma, same as before this existed. Defaults to `bangor_lexicon/lecsicon_cc0.txt` (relative to wherever you run the pipeline from) if unset. |
+| `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` | No | Authenticates yt-dlp's requests (audio download, caption listing/download, channel discovery) the same way a logged-in browser tab would. YouTube rate-limits anonymous requests to its caption/timedtext endpoint hard (`HTTP Error 429: Too Many Requests`), and the resulting block has been reported to last on the order of hours -- authenticating avoids tripping it in the first place, rather than just retrying through it. `YTDLP_COOKIES_FILE` points at a `cookies.txt` (Netscape format, e.g. exported via a "Get cookies.txt LOCALLY" browser extension -- portable between machines, and the more reliable option on Windows, see below); `YTDLP_COOKIES_FROM_BROWSER` names a browser (`chrome`, `firefox`, ...) to read cookies live from instead, machine-local only. If both are set, the file wins. Leave both blank to run fully anonymous, exactly as before this existed. **Windows + Chrome-family browsers:** newer Chrome versions' "app-bound encryption" is known to break yt-dlp's live cookie decryption on Windows (see [yt-dlp#15401](https://github.com/yt-dlp/yt-dlp/issues/15401)) -- if `YTDLP_COOKIES_FROM_BROWSER=chrome` fails to decrypt, either try `firefox` instead or switch to `YTDLP_COOKIES_FILE`. |
 | `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after Queue & Processing -> b (Process queue) or Testing -> b (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
 
 Never commit real values for any of these -- keep them in your actual
@@ -235,7 +236,14 @@ noted below):**
   per-word timestamps) against the whole caption track in one pass,
   rather than comparing small time windows -- more robust to Whisper's
   and the caption track's segments being chunked completely
-  independently of each other.
+  independently of each other. Retries with backoff on YouTube 429s, and
+  trips a circuit breaker (same pattern as `cysill_client.py`'s) after a
+  few consecutive whole-video caption failures in one run, disabling
+  captions for the rest of that run rather than retrying into a block
+  that won't clear mid-run -- see `YTDLP_COOKIES_FILE`/
+  `YTDLP_COOKIES_FROM_BROWSER` above for avoiding the block in the first
+  place. Either way, transcription/mutation output for the video itself
+  is unaffected -- captions are corroboration-only.
 - `manual_editing.py` -- an interactive terminal tool for reviewing
   mutation rows one at a time: confirm or overturn each finding, flag
   anything uncertain, leave notes, search, or just skim a summary.

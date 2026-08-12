@@ -31,6 +31,13 @@ from mutation_engine import (
     normalize_word, get_welsh_lemma, is_english_code_switch,
     cysill_coarse_pos, spacy_coarse_pos, pos_compatible,
     process_comprehensive_mutations,
+    # PATCH: download_audio() below was hitting the exact same YouTube
+    # rate-limit family as the caption fetch (see fetch_captions.py /
+    # mutation_engine.py PATCH comments) but never got the cookie-auth fix
+    # that shipped for captions -- it was still going out fully anonymous.
+    # Reusing the same helper here instead of duplicating the env-var
+    # logic keeps both call sites governed by the same two env vars.
+    yt_dlp_cookie_opts,
 )
 # PATCH: single source of truth (see mutation_tables.py for rationale) --
 # was three separate inline copies of this same 4-status list in this
@@ -805,6 +812,7 @@ def download_audio(video, max_retries=3):
                             "preferredcodec": "mp3", "preferredquality": "192"}],
         "quiet": True, "no_warnings": True, "noprogress": True,
         "logger": _YtdlpTqdmLogger(), "retries": 3,
+        **yt_dlp_cookie_opts(),
     }
     for attempt in range(1, max_retries + 1):
         try:
