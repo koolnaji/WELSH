@@ -49,7 +49,6 @@ from pathlib import Path
 
 import pandas as pd
 import yt_dlp
-from tqdm import tqdm
 
 # PATCH: previously duplicated these here (Path.home() / "Documents" /
 # "welsh_analysis") per the old standalone-script pattern -- silently
@@ -58,7 +57,7 @@ from tqdm import tqdm
 # this looked for/wrote transcripts and captions in a different folder
 # than the one welsh_pipeline.py actually uses. Importing instead of
 # duplicating keeps every file in the project pointed at the same place.
-from mutation_engine import BASE_DIR, CAPTIONS_DIR, TRANS_DIR
+from mutation_engine import BASE_DIR, CAPTIONS_DIR, TRANS_DIR, yt_dlp_cookie_opts
 
 WELSH_LANG_CODES = ["cy", "cy-GB", "cy-orig"]
 
@@ -265,7 +264,8 @@ def _extract_info_with_backoff(url, opts, max_retries=3, download=False):
 def list_available_tracks(url):
     """Returns (manual_langs, auto_langs) -- lists of Welsh-ish language
     codes found in each category, without downloading anything."""
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            **yt_dlp_cookie_opts()}
     info = _extract_info_with_backoff(url, opts, download=False)
 
     manual = info.get("subtitles") or {}
@@ -312,6 +312,7 @@ def download_captions(url, prefer_auto=False, out_dir=CAPTIONS_DIR, known_tracks
         "subtitlesformat": "vtt",
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "quiet": True, "no_warnings": True,
+        **yt_dlp_cookie_opts(),
     }
     info = _extract_info_with_backoff(url, opts, download=True)
 

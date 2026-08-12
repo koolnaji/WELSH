@@ -92,6 +92,43 @@ CAPTIONS_DIR = BASE_DIR / "captions"
 OUT_DIR      = BASE_DIR / "analysis"
 FIG_DIR      = OUT_DIR / "figures"
 
+# PATCH: YouTube 429s on the caption/timedtext endpoint were assumed to be
+# a simple request-rate problem (see fetch_captions.py's backoff/circuit-
+# breaker PATCH comments) -- turns out the block that triggers is commonly
+# reported as lasting on the order of half a day, per real-world yt-dlp
+# users hitting this exact error (yt-dlp issues #7123, #13770, #13831),
+# not something any in-process backoff or breaker can wait out. The
+# consistent community fix is authenticating the request the same way a
+# logged-in browser tab would -- YouTube rate-limits anonymous requests
+# far harder than cookied ones. Two ways to supply that, either optional:
+#   YTDLP_COOKIES_FROM_BROWSER=chrome   (or firefox/edge/brave/...)
+#     Reads cookies live from an installed, logged-in browser profile.
+#     Simplest for interactive use, but doesn't travel with the repo --
+#     the PCbang machine needs its OWN logged-in browser for this to work,
+#     it won't reuse a cookie jar exported from the Windows PC.
+#   YTDLP_COOKIES_FILE=C:\path\to\cookies.txt
+#     A cookies.txt exported once (e.g. via a "Get cookies.txt" browser
+#     extension) and copied to wherever the pipeline runs -- portable
+#     across the two-machine workflow this project actually uses, unlike
+#     the browser option above.
+# If both are set, the file wins (unambiguous, doesn't depend on what's
+# installed on the current machine). Neither is required -- omit both and
+# yt-dlp runs fully anonymous, exactly as before this existed.
+YTDLP_COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+YTDLP_COOKIES_FILE         = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+
+
+def yt_dlp_cookie_opts():
+    """Returns a dict of yt-dlp opts (possibly empty) to merge into any
+    ydl_opts/opts dict in this project, so every yt-dlp call site can opt
+    into cookie auth the same way rather than each reimplementing this
+    env-var check. Empty dict (no-op) if neither env var is set."""
+    if YTDLP_COOKIES_FILE:
+        return {"cookiefile": YTDLP_COOKIES_FILE}
+    if YTDLP_COOKIES_FROM_BROWSER:
+        return {"cookiesfrombrowser": (YTDLP_COOKIES_FROM_BROWSER,)}
+    return {}
+
 # PATCH: persistent lemma cache path
 LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
 
