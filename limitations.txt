@@ -1,0 +1,241 @@
+LIMITATIONS
+Welsh Consonant Mutation Erosion Pipeline — Known Technical and
+Methodological Limitations
+
+Compiled from pipeline diagnostics, dependency audits, and code review
+conducted across the August 2026 debugging sessions. Organized so each
+item can be lifted directly into a thesis limitations section, with the
+underlying evidence noted for each claim.
+
+
+1. SOFTWARE ENVIRONMENT AND DEPENDENCY VERSION MISMATCHES
+------------------------------------------------------------
+
+1.1 Welsh dependency parser trained for an earlier spaCy version
+The Welsh dependency parser (cy_ud_cy_ccg, from techiaith/
+parsiwr-dibyniaethau) was last released as v23.03 (March 2023) and was
+explicitly built and validated against spaCy 3.5.0. The pipeline runs
+spaCy 3.8.14 — a three-minor-version gap. spaCy's own compatibility
+check flags this model as untested against the installed version
+(warning W095). This is confirmed to be the current, unmaintained
+ceiling of the tool: no newer release exists on the model's source
+repository as of this writing, independently verified via both spaCy's
+own `validate` command and the GitHub releases page. Downgrading spaCy
+to match was considered and rejected, since the rest of the dependency
+chain (torch, faster-whisper, and other pinned packages) has not been
+validated against an older spaCy version, and doing so this late risks
+destabilizing a pipeline that has already produced the bulk of the
+corpus data under the current configuration. Practical effect: some
+unknown, unquantified fraction of spaCy's tagging/parsing/morphology
+output may differ from what the model's original 3.5-era validation
+established, in ways that cannot be retroactively audited without a
+newer model release from the maintainers.
+
+1.2 Environment drift from documented requirements
+The runtime environment contains packages (whisperx, transformers,
+spacy-transformers) that are not imported anywhere in the pipeline's
+own code and are not listed in requirements.txt, most likely residue
+from earlier experimentation (e.g. evaluating whisperx as an ASR
+alternative before settling on faster-whisper). These packages carry
+unresolved version conflicts with the packages the pipeline actually
+uses (e.g. transformers 4.57.6 installed vs. spacy-transformers'
+stated requirement of <4.53.3; numpy 1.26.4 installed vs. whisperx's
+stated requirement of >=2.1.0). These conflicts are currently dormant
+— nothing in the live code path touches the affected packages — but
+their presence means requirements.txt does not fully specify the
+environment actually used to generate the corpus, which is a
+reproducibility gap: a clean install from requirements.txt alone would
+not reconstruct this exact environment, since numpy itself is
+currently unpinned.
+
+1.3 Third-party service dependency without a service-level agreement
+Two external, small-team-maintained services are load-bearing for
+tagger corroboration and lemma resolution: the Cysill API (Techiaith)
+and the offline Bangor lexicon it also publishes. Neither is operated
+under any guarantee of uptime, rate-limit stability, or continued
+maintenance. Section 3 documents the practical consequences observed
+during this project; the underlying limitation is structural — the
+pipeline's three-layer validation design assumes a live tagger that is
+not, in fact, guaranteed to be reachable at any given time.
+
+1.4 YouTube-side instability
+Both the caption-fetch and audio-download stages depend on yt-dlp
+against YouTube's undocumented, frequently-changing internal APIs.
+Both endpoints were observed issuing HTTP 429 (Too Many Requests)
+during real batch runs in this project, including at least one
+instance where the rate limit was reported (via community precedent
+for this exact error) to persist for on the order of several hours
+rather than clearing on standard exponential backoff. Cookie-based
+authentication was added as a mitigation, but this ties data collection
+to the rate-limit ceiling and session behavior of a specific Google
+account, which is not publicly documented and could change without
+notice.
+
+
+2. CORPUS_ANALYZER.PY — MUTATION EROSION RATE COMPUTATION LIMITATIONS
+------------------------------------------------------------------------
+
+2.1 Non-random missingness in three-way corroboration
+Coverage by the full three-tagger validation stack (spaCy + Cysill +
+heuristic) is not uniform across the corpus. Diagnostic review of one
+batch found dual-tagger-eligible coverage (rows where both spaCy and
+Cysill returned a usable POS reading) at approximately 100% for one
+channel (Hansh) versus approximately 7% for another (Haclediad) in
+the same run. This gap tracked directly to a single circuit-breaker
+trip early in the run, after which the rest of the batch proceeded
+with Cysill disabled. Because the circuit breaker's own reset was
+scoped per batch rather than per video at the time, whichever video
+happens to run first in a given batch disproportionately determines
+how much real corroboration the rest of that batch receives. This
+means cross-channel or cross-register erosion-rate comparisons may
+partly reflect differences in measurement reliability between
+channels rather than differences in the underlying speech.
+
+2.2 Selection bias in which words receive live Cysill corroboration
+The offline Bangor lexicon short-circuits Cysill entirely for any
+chunk where every word resolves unambiguously offline. Because common,
+regularly-inflected vocabulary is precisely what resolves cleanly in a
+static lexicon, the residual population of words that still reach the
+live Cysill endpoint is systematically skewed toward rarer, more
+irregular, or lexicon-OOV items. Three-way-corroborated confidence
+tiers in the corpus are therefore not a random sample of all mutation
+sites; they are concentrated on linguistically atypical vocabulary,
+which may not be representative of the erosion patterns present in
+the corpus as a whole.
+
+2.3 Dominant detection rule has the weakest cross-tagger agreement
+`word_trigger` is by a wide margin the most frequently firing
+detection rule in the pipeline (over 1,200 rows in a single casual-
+register batch, versus double digits for every other rule), yet it
+shows the lowest heuristic-vs-Cysill agreement rate of any rule
+category (56.3% in the same diagnostic run). Because this single rule
+supplies the large majority of all mutation observations, the overall
+erosion-rate estimate is disproportionately dependent on the
+detection rule with the least independent corroboration.
+
+2.4 "Disputed" classifications are retained in erosion-rate
+computation without a confidence discount
+Rows where the heuristic pipeline classifies a token as eroded but the
+live Cysill tagger reports a mutation type the heuristic says is
+absent are logged as "disputed" (confidence 0.10 in the pipeline's own
+scoring) rather than being excluded from analysis. In one diagnostic
+batch, disputed classifications accounted for over a third of all
+evaluable rows. These rows currently contribute to the erosion-rate
+numerator/denominator on equal footing with rows carrying full
+three-way agreement, meaning the published erosion rate does not
+currently distinguish between confidently-corroborated erosion and
+erosion asserted over an active tagger disagreement. A sensitivity
+analysis reporting erosion rates with and without disputed rows
+included would substantiate how much the headline numbers depend on
+this design choice.
+
+2.5 Register is a proxy variable, not a directly measured one, and is
+confounded with channel/source in the current dataset
+The formal/informal/casual axis is operationalized as a property of
+the source channel, not of individual utterances or speakers. In
+practice this means channel identity and register are currently
+collinear in the corpus — e.g. all Haclediad data is casual-register
+and no other source contributes casual-register data in the same
+proportion. Any erosion-rate difference attributed to register cannot
+currently be fully separated from channel-specific factors such as
+production quality, topic domain, presenter demographics, or
+recording conditions, since register and channel are not
+independently varied in the sampling design.
+
+2.6 Denominator definition has changed over the project's lifetime
+The set of statuses counted as "evaluable" for erosion-rate purposes
+(EVALUABLE_STATUSES) was centralized and corrected mid-project after
+an earlier version was found to silently include phantom-mutation
+rows, inflating apparent erosion by roughly 18 percentage points.
+Batches processed before this fix are not directly comparable to
+batches processed after it without reprocessing under the current
+definition. Any trend analysis spanning the full project timeline
+should confirm which pipeline version generated each batch before
+treating early and late erosion-rate figures as commensurable.
+
+2.7 Video-length sampling assumes proportional representativeness
+The windowed audio-sampling feature (--sample-minutes / --skip-minutes,
+introduced to control runtime) processes a fixed-length window per
+video rather than the full recording, on the assumption that a sampled
+window is proportionally representative of a video's overall erosion
+rate. This assumption has not been separately validated — it is
+possible for erosion patterns to vary systematically across a single
+recording's runtime (e.g. more formal opening segments versus looser
+later discussion in a podcast-style source), which sampling from a
+fixed offset would not detect.
+
+
+3. AUTOMATIC SPEECH RECOGNITION (ASR) LIMITATIONS
+-----------------------------------------------------
+
+3.1 Whisper's reliability on spontaneous, multi-speaker Welsh is not
+independently confirmed at scale
+faster-whisper's word-level accuracy against genuinely spontaneous,
+overlapping, multi-speaker casual Welsh speech (as opposed to
+scripted or produced broadcast audio) has only been spot-checked
+against a small number of Bangor Siarad recordings with
+validate_against_chat.py, a standalone script kept deliberately
+outside the automated pipeline specifically because this check has
+not been run at corpus scale. Any register-based erosion comparison
+implicitly assumes ASR accuracy is comparable across formal and
+casual registers; this assumption is currently unverified for the
+casual tier, which is also the register most likely to contain
+disfluent, overlapping, or code-switched speech where ASR error rates
+tend to rise.
+
+3.2 Hallucination filtering is heuristic, not guaranteed
+The pipeline applies four independent heuristics to suppress Whisper
+hallucination (word-repetition ratio, orthographic implausibility,
+no_speech_prob/avg_logprob thresholds, and spaCy POS-coherence),
+deliberately tuned toward lenient thresholds to avoid suppressing
+genuine code-switched speech. This is a precision/recall trade-off:
+some hallucinated content may still pass through undetected, and some
+genuine speech at the margins may be filtered. Neither error rate has
+been directly measured against hand-annotated ground truth.
+
+3.3 Caption and CHAT-transcript corroboration have known coverage
+gaps of their own
+Caption-based corroboration (fetch_captions.py) is unavailable for any
+video lacking Welsh-language captions, and was further reduced in
+practice by YouTube rate-limiting during collection (Section 1.4). The
+CHAT-format validation path (validate_against_chat.py) explicitly
+carries an unresolved caveat in its own documentation: its annotation-
+stripping logic has not been validated against an actual downloaded
+Bangor Siarad .cha file, only against the general CLAN/CHAT
+specification.
+
+
+4. FILE-SYSTEM AND OPERATIONAL RELIABILITY LIMITATIONS
+-----------------------------------------------------------
+
+4.1 Windows/OneDrive file-locking
+The pipeline's crash-safe checkpoint writes (atomic rename via
+tmp_path.replace(path)) have intermittently failed with WinError 5
+(Access Denied) when the working directory sits under a OneDrive-
+synced path, most likely due to OneDrive's sync client transiently
+locking newly-written files. Affected videos are correctly requeued
+rather than silently losing data, but this introduces variable,
+environment-dependent processing delays and retries that are not
+present when running from a non-synced local path.
+
+4.2 Order-dependent data loss under rate-limiting
+Because several failure-recovery mechanisms (the Cysill circuit
+breaker, and previously the caption circuit breaker) are scoped at the
+level of a processing run rather than guaranteed to recover mid-run,
+whichever video is queued first in a given batch has a
+disproportionate influence on how much external corroboration the
+rest of that batch receives if a rate limit trips early. Queue order
+is not currently randomized, so this is a structural rather than
+occasional risk.
+
+
+5. SCOPE NOTE
+-----------------
+This document covers the Welsh mutation-erosion pipeline, which is the
+most mature of the project's components. The Tatar finite-subordination
+arm shares the same underlying software environment (Section 1) and
+will require its own limitations review once its ASR reliability (
+Whisper's Tatar support is not yet independently verified) and
+corroboration architecture are further along; a parallel list should
+be compiled before that arm's results are reported alongside the
+Welsh findings.

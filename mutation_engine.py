@@ -44,6 +44,8 @@ except Exception:
 # location (for example, to use an external drive or a shared project folder).
 BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR",
                                    str(Path.home() / "welsh_analysis"))).expanduser()
+from youtube_access import configure as configure_youtube_access
+configure_youtube_access(BASE_DIR)
 AUDIO_DIR     = BASE_DIR / "audio"
 TRANS_DIR     = BASE_DIR / "transcriptions"
 MUT_DIR       = BASE_DIR / "mutations"

@@ -44,6 +44,7 @@ from mutation_engine import (
 # file, plus a fourth, DIFFERENT (and wrong) computation for the headline
 # email number. All four now reference this one import.
 from mutation_tables import EVALUABLE_STATUSES
+from youtube_access import YouTubeRateLimited, call as youtube_call
 
 # ========================= QUEUE / LOG HELPERS =========================
 def _write_json(path, value):
@@ -93,6 +94,20 @@ def record_failure(video, error, failed):
     """Record a failed queue item and return whether it may be retried."""
     video_id = str(video["id"])
     previous = failed.get(video_id, {})
+    # A shared YouTube cooldown is not evidence that this video is bad.  Do
+    # not consume its finite retry budget simply because the whole service
+    # asked this process to pause; keeping it queued makes the run resumable.
+    if isinstance(error, YouTubeRateLimited):
+        failed[video_id] = {
+            **previous,
+            "attempts": int(previous.get("attempts", 0)),
+            "last_error": str(error),
+            "title": video.get("title", video_id),
+            "deferred_until": time.time() + error.retry_after,
+            "last_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        save_failed(failed)
+        return True
     attempts = int(previous.get("attempts", 0)) + 1
     failed[video_id] = {
         "attempts": attempts,
@@ -802,37 +817,29 @@ def _is_dns_resolution_error(exc):
 
 
 def download_audio(video, max_retries=3):
+    # Titles are neither unique nor stable.  Keying the cache by the source id
+    # prevents one video's resume artefact from being mistaken for another's.
     safe_title = clean_title_for_file(video["title"])
-    raw_path   = AUDIO_DIR / f"{safe_title}.mp3"
-    norm_path  = AUDIO_DIR / f"{safe_title}_norm.mp3"
+    file_stem  = f"{video['id']}_{safe_title}"
+    raw_path   = AUDIO_DIR / f"{file_stem}.mp3"
+    norm_path  = AUDIO_DIR / f"{file_stem}_norm.mp3"
+    if norm_path.exists() and norm_path.stat().st_size > 0:
+        return str(norm_path)
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": str(AUDIO_DIR / f"{safe_title}.%(ext)s"),
+        "outtmpl": str(AUDIO_DIR / f"{file_stem}.%(ext)s"),
         "postprocessors": [{"key": "FFmpegExtractAudio",
                             "preferredcodec": "mp3", "preferredquality": "192"}],
         "quiet": True, "no_warnings": True, "noprogress": True,
         "logger": _YtdlpTqdmLogger(), "retries": 3,
         **yt_dlp_cookie_opts(),
     }
-    for attempt in range(1, max_retries + 1):
-        try:
-            tqdm.write(f" Downloading (attempt {attempt}/{max_retries})...")
+    if not raw_path.exists() or raw_path.stat().st_size == 0:
+        def _download():
+            tqdm.write(" Downloading audio...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video["url"]])
-            break
-        except Exception as e:
-            tqdm.write(f" ⚠️ Download attempt {attempt} failed: {e}")
-            if attempt < max_retries:
-                if _is_dns_resolution_error(e):
-                    wait = DNS_BACKOFF_SECONDS[min(attempt - 1, len(DNS_BACKOFF_SECONDS) - 1)]
-                    tqdm.write(f"    (DNS resolution failure -- waiting {wait}s "
-                               f"for resolver to recover, longer than the usual "
-                               f"backoff)")
-                else:
-                    wait = 3 * attempt
-                time.sleep(wait)
-            else:
-                raise
+                return ydl.download([video["url"]])
+        youtube_call("audio download", _download, max_attempts=max_retries)
     tqdm.write(" Normalizing audio...")
     try:
         subprocess.run(

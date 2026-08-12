@@ -525,6 +525,11 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # PATCH: cancel check happens before the (slow, RAM-heavy) model
                 # load, not after -- no point loading Whisper just to bail out.
                 reset_cysill_circuit_breaker()
+                # PATCH: same reset, same reason, for the caption circuit breaker --
+                # it's a module-level global in fetch_captions.py that otherwise
+                # stays tripped for every subsequent run in this same interactive
+                # session, not just the rest of the run that tripped it.
+                fetch_captions.reset_caption_circuit_breaker()
                 _ensure_model()
                 notify_on_completion = save_results
                 run_type = "Local MP3 batch" if save_results else "Local MP3 batch (preview)"
@@ -629,6 +634,11 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # PATCH: cancel check happens before the (slow, RAM-heavy) model
                 # load, not after -- no point loading Whisper just to bail out.
                 reset_cysill_circuit_breaker()
+                # PATCH: same reset, same reason, for the caption circuit breaker --
+                # it's a module-level global in fetch_captions.py that otherwise
+                # stays tripped for every subsequent run in this same interactive
+                # session, not just the rest of the run that tripped it.
+                fetch_captions.reset_caption_circuit_breaker()
                 _ensure_model()
                 notify_on_completion = True
                 run_type = "Queue processing"
@@ -684,6 +694,22 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         # cross-check is not a reason to lose the data.
                         captions_csv_path = None
                         try:
+                            # A successful previous attempt is the strongest
+                            # cache possible: do not ask YouTube to rediscover
+                            # a track merely to corroborate the same video.
+                            cached_vtts = sorted(vpaths["captions_dir"].glob("*.vtt"))
+                            if cached_vtts:
+                                vtt_path, cap_lang, cap_kind = cached_vtts[0], "cached", "cached"
+                                cap_segments = fetch_captions.parse_vtt(vtt_path)
+                                captions_csv_path = vtt_path.with_suffix(".csv")
+                                if not captions_csv_path.exists():
+                                    with open(captions_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                                        writer = csv.DictWriter(f, fieldnames=[
+                                            "segment_start", "segment_end", "segment_text"])
+                                        writer.writeheader()
+                                        writer.writerows(cap_segments)
+                                tqdm.write(f"  Captions (cached): {len(cap_segments)} segment(s)")
+                            else:
                             # PATCH: pass the already-fetched track listing
                             # straight into download_captions() via
                             # known_tracks= instead of letting it silently
@@ -692,25 +718,24 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             # video for no reason, and was part of what was
                             # tripping YouTube's 429 rate limit on caption
                             # fetching (see fetch_captions.py PATCH comment).
-                            tracks = fetch_captions.list_available_tracks(video["url"])
-                            manual_cy, auto_cy, _ = tracks
-                            if manual_cy or auto_cy:
-                                vtt_path, cap_lang, cap_kind, _ = fetch_captions.download_captions(
-                                    video["url"], out_dir=vpaths["captions_dir"],
-                                    known_tracks=tracks)
-                                if vtt_path is not None:
-                                    cap_segments = fetch_captions.parse_vtt(vtt_path)
-                                    captions_csv_path = vtt_path.with_suffix(".csv")
-                                    with open(captions_csv_path, "w", newline="",
-                                              encoding="utf-8-sig") as f:
-                                        writer = csv.DictWriter(f, fieldnames=[
-                                            "segment_start", "segment_end", "segment_text"])
-                                        writer.writeheader()
-                                        writer.writerows(cap_segments)
-                                    tqdm.write(f"  Captions ({cap_kind}, {cap_lang}): "
-                                               f"{len(cap_segments)} segment(s)")
-                            else:
-                                tqdm.write("  No Welsh captions available for this video.")
+                                tracks = fetch_captions.list_available_tracks(video["url"])
+                                manual_cy, auto_cy, _ = tracks
+                                if manual_cy or auto_cy:
+                                    vtt_path, cap_lang, cap_kind, _ = fetch_captions.download_captions(
+                                        video["url"], out_dir=vpaths["captions_dir"],
+                                        known_tracks=tracks)
+                                    if vtt_path is not None:
+                                        cap_segments = fetch_captions.parse_vtt(vtt_path)
+                                        captions_csv_path = vtt_path.with_suffix(".csv")
+                                        with open(captions_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                                            writer = csv.DictWriter(f, fieldnames=[
+                                                "segment_start", "segment_end", "segment_text"])
+                                            writer.writeheader()
+                                            writer.writerows(cap_segments)
+                                        tqdm.write(f"  Captions ({cap_kind}, {cap_lang}): "
+                                                   f"{len(cap_segments)} segment(s)")
+                                else:
+                                    tqdm.write("  No Welsh captions available for this video.")
                         except Exception as e:
                             tqdm.write(f"  Caption fetch failed (continuing without "
                                        f"corroboration): {e}")

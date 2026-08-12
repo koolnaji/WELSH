@@ -49,6 +49,7 @@ from pathlib import Path
 
 import pandas as pd
 import yt_dlp
+from tqdm import tqdm
 
 # PATCH: previously duplicated these here (Path.home() / "Documents" /
 # "welsh_analysis") per the old standalone-script pattern -- silently
@@ -58,6 +59,7 @@ import yt_dlp
 # than the one welsh_pipeline.py actually uses. Importing instead of
 # duplicating keeps every file in the project pointed at the same place.
 from mutation_engine import BASE_DIR, CAPTIONS_DIR, TRANS_DIR, yt_dlp_cookie_opts
+from youtube_access import call as youtube_call
 
 WELSH_LANG_CODES = ["cy", "cy-GB", "cy-orig"]
 
@@ -233,32 +235,95 @@ def _is_rate_limit_error(exc):
     substring on str(exc) rather than exception type, since yt-dlp wraps
     the underlying HTTPError in its own DownloadError/ExtractorError and
     the specific status code only survives in the message text (confirmed
-    against the actual error text: 'HTTP Error 429: Too Many Requests')."""
+    against the actual error text: 'HTTP Error 429: Too Many Requests').
+    PATCH: this got dropped when the circuit breaker below was added in
+    the same edit, even though _extract_info_with_backoff() still calls
+    it -- restored, since without it every retry-loop exception raised
+    NameError instead of a backoff, which would have broken the very
+    thing this file exists to fix."""
     msg = str(exc).lower()
     return "429" in msg or "too many requests" in msg
+
+# PATCH: circuit breaker for caption fetching, same shape as Cysill's in
+# cysill_client.py. The per-video backoff above handles a transient 429
+# fine, but a persistent block on YouTube's caption/timedtext endpoint
+# (confirmed live: still 3/3-failing on the FIRST video of a run, before
+# this run itself could plausibly have built up enough requests to
+# trigger it -- and independently, this specific 429 is widely reported
+# to have a cooldown running into the hours, not something any in-process
+# backoff can wait out -- see YTDLP_COOKIES_FILE/YTDLP_COOKIES_FROM_BROWSER
+# in mutation_engine.py for avoiding the block in the first place) means
+# every subsequent video would otherwise pay the full 3-attempt/up-to-60s
+# -per-attempt cost just to fail anyway. After a few consecutive
+# whole-video caption failures, stop attempting captions for the rest of
+# THIS run -- corpus transcription/mutation output is unaffected either
+# way (captions are corroboration-only), so this only saves wasted
+# wall-clock, not data.
+_caption_consecutive_failures = 0
+_CAPTION_FAILURE_THRESHOLD    = 3
+_captions_disabled_for_run    = False
+
+
+def reset_caption_circuit_breaker():
+    """Reset the caption circuit breaker for a fresh run. Same rationale
+    as reset_cysill_circuit_breaker() in cysill_client.py: these are
+    module-level globals that persist for the process lifetime, so a
+    breaker tripped during one run would otherwise silently stay open
+    for the next one in the same interactive session."""
+    global _caption_consecutive_failures, _captions_disabled_for_run
+    _caption_consecutive_failures = 0
+    _captions_disabled_for_run    = False
+
+
+def is_captions_disabled():
+    """True once the caption circuit breaker has tripped for this run.
+    Callers (welsh_pipeline.py's queue loop) should check this BEFORE
+    calling list_available_tracks(), not just react to it raising --
+    mirrors is_cysill_disabled()'s rationale exactly: skip the call (and
+    the retry/backoff wait inside it) entirely once captions are
+    known-dead for the run, instead of re-discovering that on every
+    video."""
+    return _captions_disabled_for_run
+
+
+def _record_caption_outcome(success):
+    """Call after every whole-video caption attempt (list_available_tracks
+    OR download_captions, whichever failed) to feed the circuit breaker."""
+    global _caption_consecutive_failures, _captions_disabled_for_run
+    if success:
+        _caption_consecutive_failures = 0
+        return
+    _caption_consecutive_failures += 1
+    if _caption_consecutive_failures >= _CAPTION_FAILURE_THRESHOLD:
+        if not _captions_disabled_for_run:
+            tqdm.write(f"  ⚠️ Captions disabled for the rest of this run "
+                       f"({_caption_consecutive_failures} consecutive "
+                       f"whole-video caption failures -- looks like a "
+                       f"persistent YouTube rate limit, not a blip). "
+                       f"Transcription/mutations are unaffected.")
+        _captions_disabled_for_run = True
 
 
 def _extract_info_with_backoff(url, opts, max_retries=3, download=False):
     """extract_info() wrapped with the same attempt/backoff shape as
     download_audio()'s retry loop, but with a longer, rate-limit-specific
     cooldown -- a 429 means YouTube wants you to slow down, not that the
-    request was merely unlucky."""
-    for attempt in range(1, max_retries + 1):
-        try:
+    request was merely unlucky.
+
+    PATCH: short-circuits instantly (no network call, no wait) once the
+    circuit breaker above has tripped -- same rationale as _cysill_get()
+    in cysill_client.py. Feeds _record_caption_outcome() on the way out
+    so the breaker sees every whole-call success/exhausted-retries
+    outcome, regardless of which caller (list_available_tracks or
+    download_captions) triggered it."""
+    # Do not maintain a caption-only breaker here. A 429 on timedtext and a
+    # 429 on media download are the same YouTube/IP budget, so the shared
+    # coordinator also paces audio and persists its cooldown across restarts.
+    def _extract():
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=download)
-        except Exception as e:
-            if attempt < max_retries:
-                if _is_rate_limit_error(e):
-                    wait = RATE_LIMIT_BACKOFF_SECONDS[
-                        min(attempt - 1, len(RATE_LIMIT_BACKOFF_SECONDS) - 1)]
-                    tqdm.write(f"    (rate limited (429) -- waiting {wait}s "
-                               f"before retrying)")
-                else:
-                    wait = 3 * attempt
-                time.sleep(wait)
-            else:
-                raise
+    return youtube_call("caption download" if download else "caption discovery",
+                        _extract, max_attempts=max_retries)
 
 
 def list_available_tracks(url):
