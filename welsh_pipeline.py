@@ -525,11 +525,6 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # PATCH: cancel check happens before the (slow, RAM-heavy) model
                 # load, not after -- no point loading Whisper just to bail out.
                 reset_cysill_circuit_breaker()
-                # PATCH: same reset, same reason, for the caption circuit breaker --
-                # it's a module-level global in fetch_captions.py that otherwise
-                # stays tripped for every subsequent run in this same interactive
-                # session, not just the rest of the run that tripped it.
-                fetch_captions.reset_caption_circuit_breaker()
                 _ensure_model()
                 notify_on_completion = save_results
                 run_type = "Local MP3 batch" if save_results else "Local MP3 batch (preview)"
@@ -634,11 +629,6 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # PATCH: cancel check happens before the (slow, RAM-heavy) model
                 # load, not after -- no point loading Whisper just to bail out.
                 reset_cysill_circuit_breaker()
-                # PATCH: same reset, same reason, for the caption circuit breaker --
-                # it's a module-level global in fetch_captions.py that otherwise
-                # stays tripped for every subsequent run in this same interactive
-                # session, not just the rest of the run that tripped it.
-                fetch_captions.reset_caption_circuit_breaker()
                 _ensure_model()
                 notify_on_completion = True
                 run_type = "Queue processing"
