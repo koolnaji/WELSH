@@ -317,9 +317,23 @@ def parse_vtt(vtt_path):
             continue
         start = _vtt_ts_to_seconds(m.group(1))
         end   = _vtt_ts_to_seconds(m.group(2))
-        text_lines = block[m.end():].strip().splitlines()
-        # Strip inline VTT positioning/styling tags (<c>, timestamps
-        # embedded in auto-captions for word-level highlighting, etc.)
+        # PATCH: WebVTT cue lines can carry trailing cue SETTINGS on the
+        # same line as the timestamps -- e.g. "... --> ... align:start
+        # position:0%", which YouTube's auto-captions use for word-by-word
+        # rolling highlight positioning. block[m.end():] swallowed that
+        # trailing settings text as if it were the first line of caption
+        # content, feeding literal strings like "align:start" and
+        # "position:0%" into the token stream as fake words -- confirmed
+        # live in the 20260813 batch, where every caption-available row
+        # came back "alignment_timing_implausible" because these garbage
+        # pseudo-tokens were corrupting the whole-video SequenceMatcher
+        # alignment for real words near them too, not just themselves.
+        # Fix: only start reading text from the line AFTER the cue timing
+        # line, discarding whatever settings text (align/position/line/
+        # size/vertical -- any of them) trails on that same line, rather
+        # than trying to regex out each specific settings keyword.
+        line_end = block.find("\n", m.end())
+        text_lines = block[line_end + 1:].strip().splitlines() if line_end != -1 else []
         text = " ".join(re.sub(r"<[^>]+>", "", line).strip() for line in text_lines)
         text = re.sub(r"\s+", " ", text).strip()
         if text:
