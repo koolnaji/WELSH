@@ -45,7 +45,14 @@ figures.
 6. Copy `.env.example` to your preferred environment-variable setup and
    fill in what you need (see **Environment variables** below). Only
    `WELSH_ANALYSIS_DIR` affects core functionality; the rest are optional.
-7. Run `python welsh_pipeline.py`, optionally followed by a transcription
+7. Set up a PO token provider for yt-dlp (see **YouTube PO tokens**
+   below). Without this, audio downloads may intermittently or
+   persistently fail with `HTTP Error 403: Forbidden` even when
+   captions/metadata calls succeed fine -- this is a separate issue from
+   cookie auth (step 6) and from YouTube's rate limiting, and has become
+   common enough industry-wide during 2026 that it's effectively
+   required now, not just a nice-to-have.
+8. Run `python welsh_pipeline.py`, optionally followed by a transcription
    preset (`fast`, `balanced`, or `accurate` -- see **Transcription
    presets** below) and/or `--sample-minutes`/`--skip-minutes` (see
    **Sampling long videos** below). This opens the main interactive menu
@@ -165,6 +172,59 @@ Queue & Processing -> b and Testing -> b respect it if set at launch.
 
 Applies only to already-downloaded/local audio -- it doesn't reduce
 what gets downloaded from YouTube first (that's still the full video).
+
+### YouTube PO tokens
+
+YouTube increasingly requires a PO (Proof-of-Origin) token on the actual
+media (audio/video) fetch -- a cryptographic attestation mechanism,
+separate from and unrelated to cookie authentication or the earlier
+n-signature/JS-challenge handling (`remote_components: ["ejs:github"]`,
+which needs Deno or another JS runtime installed and unblocked --
+`Unblock-File` on Windows if downloaded rather than installed via a
+package manager). Without a PO token provider, `download_audio()` can
+fail with a persistent `HTTP Error 403: Forbidden` on the media URL
+itself, even though caption/metadata calls for the same video succeed
+normally -- that combination (captions fine, audio 403s) is the
+signature of this specific issue rather than rate-limiting or cookie
+problems.
+
+1. Download the Rust POT provider binary (`bgutil-pot`) for your
+   platform from
+   [jim60105/bgutil-ytdlp-pot-provider-rs releases](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases).
+   On Windows, unblock the downloaded `.exe` the same way as Deno.
+2. Download the matching plugin zip from the same releases page and
+   extract it into a yt-dlp plugin directory (on Windows,
+   `%APPDATA%\yt-dlp\plugins\`) -- you should end up with a
+   `yt_dlp_plugins\extractor\` folder containing `getpot_bgutil*.py`
+   files somewhere inside whatever folder you extracted.
+3. Run the provider as an HTTP server: `bgutil-pot server --host
+   127.0.0.1` (explicitly binding IPv4 avoids a mismatch with yt-dlp's
+   default `base_url` of `http://127.0.0.1:4416` -- the binary's own
+   default binds the IPv6 wildcard `[::]`, which yt-dlp's default
+   `127.0.0.1` base URL won't reach). This needs to be running as a
+   persistent background process for the full duration of any pipeline
+   run -- it is not started automatically by `download_audio()` or
+   anything else in this codebase.
+4. Verify with `yt-dlp -v <any video URL>` and check for a
+   `PO Token Providers: bgutil:http-...` line (not `unavailable`) in
+   the debug output, and confirm the server's own log shows it
+   generating tokens on request.
+
+No `ydl_opts` changes are needed in `corpus_ops.py` for the default
+setup -- yt-dlp auto-detects a correctly-installed plugin and reachable
+server. If you run the server on a non-default host/port, that would
+need `extractor_args: {"youtubepot-bgutilhttp": {"base_url":
+"http://HOST:PORT"}}` merged into `ydl_opts` alongside
+`yt_dlp_cookie_opts()`.
+
+Providing a PO token does not *guarantee* a 403 won't happen -- per the
+provider's own documentation, it may just make requests appear more
+legitimate. If 403s persist after this is set up and confirmed
+reachable, check for a leftover `.part` file from an earlier failed
+attempt in `AUDIO_DIR` first (a resumed byte-range request against a
+freshly re-signed URL can 403 independently of PO-token status --
+`yt-dlp --no-continue` on the same URL is the fastest way to tell the
+two failure modes apart).
 
 ### Environment variables
 

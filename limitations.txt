@@ -71,6 +71,28 @@ to the rate-limit ceiling and session behavior of a specific Google
 account, which is not publicly documented and could change without
 notice.
 
+A second, mechanically distinct YouTube-side failure was confirmed
+2026-08-15/16: `download_audio()` began throwing a persistent
+`HTTP Error 403: Forbidden` on the actual media fetch, while the same
+video's caption/metadata calls succeeded normally. Root-caused to
+YouTube's PO (Proof-of-Origin) token enforcement -- a cryptographic
+attestation, unrelated to the cookie-auth mitigation above, that
+googlevideo.com media URLs increasingly require but that metadata
+endpoints do not. Mitigated by running a local PO token provider
+(`bgutil-pot`, Rust implementation, HTTP server mode on port 4416)
+alongside the yt-dlp plugin that consumes it -- see README Setup for
+install/run instructions. This is a THIRD external, small-team-
+maintained dependency layered onto the ones already named in Section
+1.3, with the same absence of any uptime/maintenance guarantee, and it
+requires a persistent background process to be running for the full
+duration of any pipeline run, not just a one-time configuration step --
+a new operational failure mode (the provider process not running, or
+silently dying mid-run) that didn't exist before this mitigation.
+YouTube's own PO-token enforcement criteria are undocumented and have
+already changed shape multiple times industry-wide during 2026 per
+community tracking on the yt-dlp issue tracker; there is no guarantee
+this mitigation remains sufficient for the remainder of the project.
+
 
 2. CORPUS_ANALYZER.PY — MUTATION EROSION RATE COMPUTATION LIMITATIONS
 ------------------------------------------------------------------------
@@ -227,6 +249,19 @@ disproportionate influence on how much external corroboration the
 rest of that batch receives if a rate limit trips early. Queue order
 is not currently randomized, so this is a structural rather than
 occasional risk.
+
+4.3 Resumed partial downloads can 403 independently of PO-token status
+Confirmed 2026-08-16: a leftover partial (`.part`) file from an
+earlier failed download attempt can cause yt-dlp to issue a
+byte-range `Resuming download at byte N` request against a freshly
+re-signed googlevideo.com URL, which the CDN can reject with its own
+`HTTP Error 403: Forbidden` -- a distinct failure from, and easily
+mistaken for, the PO-token issue in Section 1.4, since both surface as
+the same error text at the same call site. This was diagnosed by
+testing with `--no-continue`. Stale partial files in `AUDIO_DIR` from
+prior failed attempts are not currently swept automatically and could
+reintroduce this failure on retry for any video that failed
+mid-download before this was understood.
 
 
 5. SCOPE NOTE

@@ -10,6 +10,7 @@ writing CSV outputs, and generating the research-summary figures.
 import json
 import os
 import re
+import shutil
 import smtplib
 import subprocess
 import time
@@ -122,6 +123,66 @@ def clear_failure(video_id, failed):
     if str(video_id) in failed:
         failed.pop(str(video_id))
         save_failed(failed)
+
+# PATCH (2026-08): _video_slug() creates a video's transcription/mutation/
+# captions folders and welsh_pipeline.py's choice-3 loop now fetches
+# captions into them BEFORE calling download_audio() -- so a download
+# failure partway through a video (confirmed cause, 2026-08: yt-dlp
+# throwing "HTTP Error 403: Forbidden" on the actual media fetch, even
+# though the earlier metadata/caption calls succeeded fine) leaves real
+# caption files sitting in an otherwise-empty per-video folder tree with
+# no mutations CSV ever written, forever, since that video goes back onto
+# the retry queue and gets a BRAND NEW stamp/slug pair next attempt. Left
+# alone these orphaned folders just accumulate silently -- they're invisible
+# to every mutations_*.csv-based glob (corpus_analyzer.py, rerun_rules.py),
+# so they never distort the research figures, but they do burn disk and
+# make the output tree misleading to browse by hand.
+#
+# The only reliable signal that an attempt was genuinely incomplete (as
+# opposed to a real, legitimately-zero-mutations video -- see the
+# any_written check in welsh_pipeline.py, which already marks that case
+# "processed" on purpose) is whether vpaths["mutations"] ever got written.
+# Call this from any per-video except block, right after computing vpaths
+# and before the video goes back onto the retry queue.
+def cleanup_incomplete_video_dirs(vpaths, video_label="video"):
+    """
+    If this attempt's vpaths never got a mutations CSV written, deletes
+    the exact stamp/slug folders _video_slug() created for THIS attempt
+    (transcription dir, mutation dir, captions dir) -- never anything
+    else in TRANS_DIR/MUT_DIR/CAPTIONS_DIR. Returns True if anything was
+    removed, so callers can log accordingly.
+
+    Safe no-op if vpaths["mutations"] exists (this attempt did produce
+    real data -- e.g. a partial video-loop failure that happened AFTER
+    mutations were already written, such as the corroboration pass) or
+    if vpaths is falsy/None.
+    """
+    if not vpaths:
+        return False
+    mutations_path = vpaths.get("mutations")
+    if mutations_path is not None and Path(mutations_path).exists():
+        return False  # this attempt DID produce mutation data -- leave it alone
+
+    dirs_to_remove = set()
+    for key, value in vpaths.items():
+        if value is None:
+            continue
+        p = Path(value)
+        # captions_dir is itself a directory; every other key is a filename
+        # inside that video's transcription/mutation folder -- take .parent.
+        dirs_to_remove.add(p if key == "captions_dir" else p.parent)
+
+    removed = []
+    for d in dirs_to_remove:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(str(d))
+
+    if removed:
+        tqdm.write(f"  🧹 No mutation data was produced for {video_label} -- "
+                   f"removed {len(removed)} empty/partial folder(s) from this "
+                   f"attempt: {', '.join(removed)}")
+    return bool(removed)
 
 def load_local_processed():
     if not LOCAL_PROCESSED_LOG.exists():
@@ -832,6 +893,17 @@ def download_audio(video, max_retries=3):
                             "preferredcodec": "mp3", "preferredquality": "192"}],
         "quiet": True, "no_warnings": True, "noprogress": True,
         "logger": _YtdlpTqdmLogger(), "retries": 3,
+        # PATCH: without this, yt-dlp silently skips downloading its EJS
+        # JS-challenge solver script even when a runtime (deno/node/etc)
+        # is installed -- it now requires this explicit opt-in before
+        # fetching/running that remote script. Skipped solving means the
+        # n-parameter challenge fails and YouTube only offers image
+        # (storyboard) formats, so every download errors out with
+        # "Requested format is not available" instead of getting audio.
+        # ejs:github is yt-dlp's own recommended default (works with any
+        # runtime); ejs:npm is deno/bun-only and needs GitHub reachable
+        # regardless, so github is strictly the safer choice here.
+        "remote_components": ["ejs:github"],
         **yt_dlp_cookie_opts(),
     }
     if not raw_path.exists() or raw_path.stat().st_size == 0:

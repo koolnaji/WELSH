@@ -39,6 +39,7 @@ from corpus_ops import (
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
     send_notification_email, build_email_body, channel_display_name,
     TRANSCRIBE_PRESETS, DEFAULT_TRANSCRIBE_PRESET,
+    cleanup_incomplete_video_dirs,
 )
 import corpus_analyzer
 # PATCH: fetch_captions is now a normal top-level import rather than
@@ -534,6 +535,14 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 for p in tqdm(pending_mp3_files, desc="Videos", unit="video"):
                     meta = {"title": p.stem, "url": str(p), "source": "local",
                             "channel_register": local_reg}
+                    # PATCH: see matching comment in the choice "3" loop --
+                    # vpaths is only assigned once _video_slug() runs below
+                    # (after analyze() succeeds), but declaring it here lets
+                    # the except block below safely no-op via
+                    # cleanup_incomplete_video_dirs() if a failure happens
+                    # AFTER _video_slug() created folders but before mutations
+                    # got written (e.g. a disk-write error in _append()).
+                    vpaths = None
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
                             segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
@@ -573,6 +582,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         tqdm.write(f"  💥 Error on {p.stem}: {e}")
                         tqdm.write("=" * 60)
                         failed_videos.append(p.stem)
+                        cleanup_incomplete_video_dirs(vpaths, video_label=p.stem)
 
                 if not save_results:
                     # PATCH: preview batches skip the shared corpus-summary +
@@ -651,6 +661,10 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
                 keys = ["segments", "words", "lemmas", "pos", "mutations"]
                 for video in tqdm(videos_to_process, desc="Videos", unit="video"):
+                    # PATCH: defined before the try block (not just inside it)
+                    # so the except block below can tell whether _video_slug()
+                    # ever ran for this attempt -- see cleanup_incomplete_video_dirs().
+                    vpaths = None
                     try:
                         # PATCH: explicit start-of-video banner. Caption fetch
                         # now prints BEFORE transcription, so without this the
@@ -775,6 +789,17 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         tqdm.write(f"  💥 Error: {e}")
                         tqdm.write("=" * 60)
                         failed_videos.append(video.get("title", video["id"]))
+                        # PATCH: a failure here (confirmed cause, 2026-08:
+                        # download_audio() throwing on a persistent HTTP 403
+                        # from yt-dlp) can happen AFTER _video_slug() already
+                        # created this video's transcription/mutation/captions
+                        # folders and captions were already fetched into them
+                        # -- leaving real caption files stranded next to empty
+                        # folders with no mutations CSV, forever, since a retry
+                        # gets a brand new stamp/slug. Clean those up now,
+                        # before the video goes back onto the retry queue.
+                        cleanup_incomplete_video_dirs(
+                            vpaths, video_label=video.get("title", video["id"]))
                         if record_failure(video, e, failed_state):
                             retry_queue.append(video)
                             tqdm.write("  Will retry this video in a later queue run.")
