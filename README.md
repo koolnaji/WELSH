@@ -226,6 +226,33 @@ freshly re-signed URL can 403 independently of PO-token status --
 `yt-dlp --no-continue` on the same URL is the fastest way to tell the
 two failure modes apart).
 
+If 403s persist even with a fresh (non-resumed) download and a
+confirmed-reachable token server, check next whether yt-dlp is
+fetching player data with one client but requesting a token for
+another (visible in `-v` output as e.g. `Downloading android vr
+player API JSON` followed by `Generating a gvs PO Token for web_safari
+client`) -- that mismatch has been observed to 403 partway through an
+otherwise-successful-looking download. This repo's `download_audio()`
+now pins `extractor_args: {"youtube": {"player_client": ["mweb"]}}`
+for exactly this reason. Even with a matched client and a valid token,
+low-view/niche-channel videos (this project's actual corpus) have been
+observed to 403 more readily than heavily-viewed videos under
+otherwise identical conditions -- plausibly because YouTube's anti-bot
+heuristics weight traffic-pattern legitimacy signals that low-view
+content simply doesn't have. `AUDIO_DOWNLOAD_MIN_INTERVAL` in
+`corpus_ops.py` slows audio-download pacing specifically as a
+mitigation; there's no code-level fix that fully eliminates this
+asymmetry.
+
+**Unconfirmed as of 2026-08-17**: a nightly yt-dlp build was reported
+to stop producing these 403s in quick manual testing, without the
+`mweb`/pacing mitigations above necessarily being required. This has
+not been isolated or confirmed at batch scale -- see `limitations.txt`
+Section 1.4 before relying on it alone. If you do switch to nightly,
+record the exact build (`yt-dlp --version`) somewhere durable, since
+nightly builds aren't version-pinned and a later build could
+reintroduce this behavior without warning.
+
 ### Environment variables
 
 | Variable | Required? | Purpose |

@@ -1,6 +1,14 @@
 pandas>=2.2,<3
 requests>=2.31,<3
 tqdm>=4.66,<5
+# yt-dlp>=2025.1.0 lower bound kept as a floor; as of 2026-08-17 a
+# NIGHTLY build was reported to resolve 403s that stable 2026.07.04 hit
+# on low-view videos even with a PO-token provider configured (see
+# limitations.txt Section 1.4 -- unconfirmed at batch scale, not yet
+# isolated from the mweb/pacing mitigations also in place). If you
+# adopt nightly, record the exact build string here as a comment
+# (`yt-dlp --version`) since nightly is not semver-stable and a later
+# build could silently change this behavior again.
 yt-dlp>=2025.1.0
 faster-whisper>=1.1,<2
 torch>=2.2,<3

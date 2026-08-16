@@ -93,6 +93,45 @@ already changed shape multiple times industry-wide during 2026 per
 community tracking on the yt-dlp issue tracker; there is no guarantee
 this mitigation remains sufficient for the remainder of the project.
 
+A further, more specific pattern was confirmed the same debugging
+session: even with a valid PO token being generated and correctly
+bound to the requesting client, low-view/niche-channel videos (i.e.
+most of this project's actual corpus) were disproportionately prone to
+a mid-stream 403 that heavily-viewed videos did not exhibit under
+otherwise identical conditions -- consistent with community reports
+that YouTube's anti-bot heuristics treat request patterns against
+low-traffic content as more suspicious than the same pattern against
+pre-warmed, high-traffic content, independent of token validity.
+Mitigated pragmatically by (a) forcing a single, consistent yt-dlp
+player client end-to-end (`mweb`, set via `extractor_args` in
+`download_audio()`'s `ydl_opts`) rather than letting yt-dlp select a
+metadata client and a media-fetch client independently, since a
+mismatch between the two was directly observed to 403 even with a
+valid token, and (b) a slower, audio-download-specific minimum request
+interval (`AUDIO_DOWNLOAD_MIN_INTERVAL`, threaded through
+`youtube_access.call()`'s new `min_interval` parameter) on the theory
+that request pacing itself is part of what these heuristics evaluate.
+Neither is a guaranteed fix, and the underlying asymmetry -- low-view
+content is structurally more exposed to this failure mode than viral
+content -- is not something client-flag or pacing changes can fully
+eliminate.
+
+UNCONFIRMED, noted 2026-08-17: switching from stable to a nightly
+yt-dlp build was reported to stop producing 403s in casual testing
+(a handful of manual downloads, not a full batch run). This is
+plausible -- nightly ships extractor/signature fixes faster than
+stable's release cadence -- but has not yet been isolated against the
+`mweb`/pacing mitigation above (i.e. it is not yet known whether
+nightly alone is sufficient with those reverted, or whether all three
+are jointly necessary). Nightly builds are explicitly not
+version-pinned/semver-stable, which is in tension with the
+reproducibility concern already raised in Section 1.2 -- if the
+project ships on a nightly build, the EXACT build string
+(`yt-dlp --version`) needs to be recorded, since a later nightly could
+silently reintroduce or change this behavior. Should be confirmed
+against a full batch run, and the isolation test above, before being
+treated as the settled fix.
+
 
 2. CORPUS_ANALYZER.PY — MUTATION EROSION RATE COMPUTATION LIMITATIONS
 ------------------------------------------------------------------------

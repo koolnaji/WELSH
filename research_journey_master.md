@@ -215,10 +215,80 @@ reflect this as a new, load-bearing, unpaid-maintainer-project
 dependency, on top of the two already named in `limitations.txt`
 Section 1.3.
 
-**Not yet done**: retry of the actual triggering video (Tŷ Cŵn |
-Heledd a Mared) through the real pipeline queue, and a sweep of
-`AUDIO_DIR` for other stale `.part` files from earlier failed attempts
-that could reintroduce the resume-403 on other queued retries.
+**Not yet done (as of 2026-08-16)**: retry of the actual triggering
+video (Tŷ Cŵn | Heledd a Mared) through the real pipeline queue, and a
+sweep of `AUDIO_DIR` for other stale `.part` files from earlier failed
+attempts that could reintroduce the resume-403 on other queued
+retries.
+
+### Phase 9 continued — client mismatch, low-view-video asymmetry, mweb fix, nightly report: 2026-08-16/17
+
+With the PO-token infrastructure confirmed working (server generating
+and caching real tokens per video ID, visible in its own log), 403s
+persisted on real corpus videos even though the rickroll test video
+downloaded cleanly. Diagnosed in stages via direct `yt-dlp -v` testing
+against the actual failing video (F1gPkVIHzig):
+
+1. First hypothesis (client/token mismatch) was directly observed:
+   yt-dlp fetched player data via the `android_vr` client but
+   requested a PO token scoped to `web_safari` -- download started
+   (real bytes flowing at full speed) then 403'd at 20.5% of the file.
+2. Forcing a single consistent client (`--extractor-args
+   "youtube:player_client=mweb"`) produced a correctly-matched
+   token/client pair (confirmed in debug output) but the SAME video
+   still 403'd, this time at 20.6% -- functionally the same byte
+   offset on a separately-signed URL. This ruled out the
+   client-mismatch theory as sufficient explanation on its own, since
+   a real mismatch fix didn't change the outcome.
+3. `tv` and `web` clients were tested as alternatives and rejected:
+   `tv` hit DRM-protected formats, `web` got SABR'd into image-only
+   formats -- neither produced a real media download attempt at all
+   regardless of the 403 question.
+4. Control test: the SAME `mweb` command against the earlier rickroll
+   test video (`dQw4w9WgXcQ`) downloaded cleanly. This isolated the
+   failure to something about THIS video (or its CDN routing)
+   specifically, not a systemic client/token/network problem --
+   directly contradicting an initial local-network-interference theory
+   (Windows Defender/antivirus resetting long connections) that had
+   been raised as the leading candidate given the near-identical
+   cutoff percentage across two different signed URLs.
+5. Landed on a structural explanation: heavily-viewed videos are
+   pre-warmed across nearly all CDN edge nodes and read by YouTube's
+   anti-bot heuristics as an established-legitimate traffic pattern;
+   this project's actual corpus (low-view S4C/Welsh-channel uploads)
+   does not get that treatment and is disproportionately exposed to
+   both edge-node flakiness and stricter automated-traffic scrutiny --
+   independent of PO-token validity. This is consistent with, and now
+   documented as an extension of, the general YouTube-side fragility
+   already in `limitations.txt` Section 1.4.
+
+**Fix applied to `corpus_ops.py`/`youtube_access.py`** (not yet
+confirmed against a full batch run): `download_audio()`'s `ydl_opts`
+now forces `player_client=["mweb"]` via `extractor_args`, and
+`youtube_access.call()` gained an optional `min_interval` parameter so
+audio downloads specifically can use a slower pace
+(`AUDIO_DOWNLOAD_MIN_INTERVAL = 6.0`) than the shared default used for
+lighter caption/metadata calls, without changing that shared default.
+Both changes are pragmatic mitigations for a heuristic YouTube-side
+behavior, not a guaranteed fix -- see `limitations.txt` Section 1.4 for
+the full caveat.
+
+**UNCONFIRMED, same session**: switching yt-dlp from stable to a
+nightly build was separately reported to stop producing 403s in quick
+manual testing. Plausible (nightly ships extractor fixes faster than
+stable), but NOT yet isolated against the `mweb`/pacing fix above --
+still open whether nightly alone is sufficient, whether all three
+mitigations are independently necessary, or whether nightly's build
+just happened to test-download successfully by chance on a small
+sample. `requirements.txt` updated with a comment flagging this and
+the reproducibility risk of an unpinned nightly build (ties into the
+existing environment-drift concern in `limitations.txt` Section 1.2).
+
+**Not yet done**: isolation test (nightly alone, `mweb`/pacing
+reverted, against a batch of previously-failing low-view videos) to
+determine which mitigation(s) are actually load-bearing; full-batch
+confirmation of whichever combination is kept; the Tŷ Cŵn retry and
+`AUDIO_DIR` stale-file sweep noted above, still outstanding.
 
 ---
 
@@ -228,6 +298,6 @@ that could reintroduce the resume-403 on other queued retries.
 - **Methods — Mutation/Erosion Detection**: Phases 0–1, 4 (three-layer corroboration, corroboration-integrity fixes)
 - **Methods — Language Identification**: Phase 3 (weighted-vote panel, abstain-first design)
 - **Theory / Framing**: Phase 6 (unifying contact-pressure hypothesis, literature grounding)
-- **Limitations**: Phase 3 (Cysill lockout), Phase 4 (denominator/cache issues, pre/post-fix comparability), Phase 5 (Whisper hallucination, diagnostic saga), Phase 7 (Tatar ASR risk), Phase 9 (PO-token dependency, resumed-download 403s)
+- **Limitations**: Phase 3 (Cysill lockout), Phase 4 (denominator/cache issues, pre/post-fix comparability), Phase 5 (Whisper hallucination, diagnostic saga), Phase 7 (Tatar ASR risk), Phase 9 (PO-token dependency, resumed-download 403s, client-mismatch/low-view-video CDN asymmetry, unpinned-nightly reproducibility risk)
 - **Cross-linguistic Discussion**: Phase 7 (Welsh vs. Tatar structural/scale comparison), Phase 6 (loanword branch rationale)
 - **Appendix / Reproducibility**: `SITE_OVERRIDES` table, consensus thresholds, model versions, `limitations.txt`
