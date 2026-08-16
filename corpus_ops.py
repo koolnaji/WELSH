@@ -1,16 +1,16 @@
 """
 corpus_ops.py
 =============
-Everything about moving data in and out of the linguistic engine: the
-video queue / processed-log on disk, discovering new videos from the
-CURATED_CHANNELS (with optional per-channel filtering), downloading audio,
-running Whisper + the mutation_engine over it (analyze / analyze_phrase),
-writing CSV outputs, and generating the research-summary figures.
+Everything about moving data in and out of the linguistic engine:
+discovering new videos from CURATED_CHANNELS (with optional per-channel
+filtering), downloading audio, running Whisper + the mutation_engine over
+it (analyze / analyze_phrase), and generating the research-summary
+figures. Queue/processed/failed state logs, output-path layout, and CSV
+persistence mechanics now live in corpus_io.py (imported below) -- this
+file only calls them, it doesn't own them.
 """
-import json
 import os
 import re
-import shutil
 import smtplib
 import subprocess
 import time
@@ -23,10 +23,7 @@ import yt_dlp
 from tqdm import tqdm
 
 from mutation_engine import (
-    AUDIO_DIR, SUMMARY_DIR, VIDEO_QUEUE, PROCESSED_LOG,
-    LOCAL_PROCESSED_LOG, FAILED_LOG, FAILED_MAX_RETRIES, CURATED_CHANNELS,
-    EROSION_CONFIDENCE_THRESHOLD,
-    run_paths,
+    CURATED_CHANNELS, EROSION_CONFIDENCE_THRESHOLD,
     filter_hallucinated_segments, deduplicate_overlapping_segments,
     preprocess_segment, expand_whisper_tokens, enrich_words,
     normalize_word, get_welsh_lemma, is_english_code_switch,
@@ -40,161 +37,25 @@ from mutation_engine import (
     # logic keeps both call sites governed by the same two env vars.
     yt_dlp_cookie_opts,
 )
+# PATCH: queue/processed/failed state logs, output-path layout
+# (run_paths), and cleanup_incomplete_video_dirs() all moved to
+# corpus_io.py -- this module used to define all of these itself, mixed
+# in among download/analyze/email code. See corpus_io.py's own docstring
+# for the full rationale.
+from corpus_io import (
+    AUDIO_DIR, SUMMARY_DIR,
+    run_paths,
+    load_queue, save_queue, load_processed, save_processed,
+    load_failed, save_failed, record_failure, clear_failure,
+    load_local_processed, save_local_processed,
+    cleanup_incomplete_video_dirs,
+)
 # PATCH: single source of truth (see mutation_tables.py for rationale) --
 # was three separate inline copies of this same 4-status list in this
 # file, plus a fourth, DIFFERENT (and wrong) computation for the headline
 # email number. All four now reference this one import.
 from mutation_tables import EVALUABLE_STATUSES
 from youtube_access import YouTubeRateLimited, call as youtube_call
-
-# ========================= QUEUE / LOG HELPERS =========================
-def _write_json(path, value):
-    """Atomically replace a JSON state file to avoid corrupting it on a crash."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp_path.replace(path)
-
-def load_queue():
-    if VIDEO_QUEUE.exists():
-        try:
-            data = json.loads(VIDEO_QUEUE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except (OSError, json.JSONDecodeError):
-            return []
-    return []
-
-def save_queue(queue):
-    _write_json(VIDEO_QUEUE, queue)
-
-def load_processed():
-    if PROCESSED_LOG.exists():
-        try:
-            data = json.loads(PROCESSED_LOG.read_text(encoding="utf-8"))
-            return set(data) if isinstance(data, list) else set()
-        except (OSError, json.JSONDecodeError):
-            return set()
-    return set()
-
-def save_processed(processed):
-    _write_json(PROCESSED_LOG, sorted(processed))
-
-def load_failed():
-    if not FAILED_LOG.exists():
-        return {}
-    try:
-        data = json.loads(FAILED_LOG.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-def save_failed(failed):
-    _write_json(FAILED_LOG, failed)
-
-def record_failure(video, error, failed):
-    """Record a failed queue item and return whether it may be retried."""
-    video_id = str(video["id"])
-    previous = failed.get(video_id, {})
-    # A shared YouTube cooldown is not evidence that this video is bad.  Do
-    # not consume its finite retry budget simply because the whole service
-    # asked this process to pause; keeping it queued makes the run resumable.
-    if isinstance(error, YouTubeRateLimited):
-        failed[video_id] = {
-            **previous,
-            "attempts": int(previous.get("attempts", 0)),
-            "last_error": str(error),
-            "title": video.get("title", video_id),
-            "deferred_until": time.time() + error.retry_after,
-            "last_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
-        save_failed(failed)
-        return True
-    attempts = int(previous.get("attempts", 0)) + 1
-    failed[video_id] = {
-        "attempts": attempts,
-        "last_error": str(error),
-        "title": video.get("title", video_id),
-        "last_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
-    save_failed(failed)
-    return attempts < FAILED_MAX_RETRIES
-
-def clear_failure(video_id, failed):
-    if str(video_id) in failed:
-        failed.pop(str(video_id))
-        save_failed(failed)
-
-# PATCH (2026-08): _video_slug() creates a video's transcription/mutation/
-# captions folders and welsh_pipeline.py's choice-3 loop now fetches
-# captions into them BEFORE calling download_audio() -- so a download
-# failure partway through a video (confirmed cause, 2026-08: yt-dlp
-# throwing "HTTP Error 403: Forbidden" on the actual media fetch, even
-# though the earlier metadata/caption calls succeeded fine) leaves real
-# caption files sitting in an otherwise-empty per-video folder tree with
-# no mutations CSV ever written, forever, since that video goes back onto
-# the retry queue and gets a BRAND NEW stamp/slug pair next attempt. Left
-# alone these orphaned folders just accumulate silently -- they're invisible
-# to every mutations_*.csv-based glob (corpus_analyzer.py, rerun_rules.py),
-# so they never distort the research figures, but they do burn disk and
-# make the output tree misleading to browse by hand.
-#
-# The only reliable signal that an attempt was genuinely incomplete (as
-# opposed to a real, legitimately-zero-mutations video -- see the
-# any_written check in welsh_pipeline.py, which already marks that case
-# "processed" on purpose) is whether vpaths["mutations"] ever got written.
-# Call this from any per-video except block, right after computing vpaths
-# and before the video goes back onto the retry queue.
-def cleanup_incomplete_video_dirs(vpaths, video_label="video"):
-    """
-    If this attempt's vpaths never got a mutations CSV written, deletes
-    the exact stamp/slug folders _video_slug() created for THIS attempt
-    (transcription dir, mutation dir, captions dir) -- never anything
-    else in TRANS_DIR/MUT_DIR/CAPTIONS_DIR. Returns True if anything was
-    removed, so callers can log accordingly.
-
-    Safe no-op if vpaths["mutations"] exists (this attempt did produce
-    real data -- e.g. a partial video-loop failure that happened AFTER
-    mutations were already written, such as the corroboration pass) or
-    if vpaths is falsy/None.
-    """
-    if not vpaths:
-        return False
-    mutations_path = vpaths.get("mutations")
-    if mutations_path is not None and Path(mutations_path).exists():
-        return False  # this attempt DID produce mutation data -- leave it alone
-
-    dirs_to_remove = set()
-    for key, value in vpaths.items():
-        if value is None:
-            continue
-        p = Path(value)
-        # captions_dir is itself a directory; every other key is a filename
-        # inside that video's transcription/mutation folder -- take .parent.
-        dirs_to_remove.add(p if key == "captions_dir" else p.parent)
-
-    removed = []
-    for d in dirs_to_remove:
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-            removed.append(str(d))
-
-    if removed:
-        tqdm.write(f"  🧹 No mutation data was produced for {video_label} -- "
-                   f"removed {len(removed)} empty/partial folder(s) from this "
-                   f"attempt: {', '.join(removed)}")
-    return bool(removed)
-
-def load_local_processed():
-    if not LOCAL_PROCESSED_LOG.exists():
-        return {}
-    try:
-        data = json.loads(LOCAL_PROCESSED_LOG.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-def save_local_processed(processed):
-    _write_json(LOCAL_PROCESSED_LOG, processed)
 
 
 # ========================= EMAIL NOTIFICATION =========================

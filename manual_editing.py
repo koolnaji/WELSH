@@ -125,7 +125,7 @@ import pandas as pd
 # standalone from the command line same as before; importing the path
 # constants doesn't change that, it just means there's one definition of
 # where the data lives instead of two that can quietly disagree.
-from mutation_engine import BASE_DIR, TRANS_DIR, MUT_DIR
+from corpus_io import BASE_DIR, TRANS_DIR, MUT_DIR
 
 # The boolean column this script edits. "is_mutation" in casual conversation
 # maps to "is_erosion" in the actual CSV -- change this if that's wrong.

@@ -26,20 +26,27 @@ from faster_whisper import WhisperModel
 import spacy_tagging
 
 from mutation_engine import (
-    BASE_DIR, LOCAL_MP3_DIR, PREVIEW_DIR,
-    ensure_dirs, run_stamp, _video_slug, _preview_video_slug, load_spacy,
-    reset_cysill_circuit_breaker, load_lemma_cache, save_lemma_cache,
-    load_bangor_lexicon,
+    load_spacy, reset_cysill_circuit_breaker, load_lemma_cache,
+    save_lemma_cache, load_bangor_lexicon,
 )
-from corpus_ops import (
+# PATCH: BASE_DIR/LOCAL_MP3_DIR/PREVIEW_DIR, ensure_dirs/run_stamp/
+# _video_slug/_preview_video_slug, every queue/processed/failed state log,
+# and the CSV-append helper (previously a local `_append` closure defined
+# right here in main()) all now live in corpus_io.py -- see that module's
+# own docstring for why. This file just calls them.
+from corpus_io import (
+    BASE_DIR, LOCAL_MP3_DIR, PREVIEW_DIR,
+    ensure_dirs, run_stamp, _video_slug, _preview_video_slug,
     load_queue, save_queue, load_processed, save_processed,
     load_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
+    append_output_csv, cleanup_incomplete_video_dirs,
+)
+from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
     send_notification_email, build_email_body, channel_display_name,
     TRANSCRIBE_PRESETS, DEFAULT_TRANSCRIBE_PRESET,
-    cleanup_incomplete_video_dirs,
 )
 import corpus_analyzer
 # PATCH: fetch_captions is now a normal top-level import rather than
@@ -292,11 +299,6 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     # loops) instead of being re-prompted/re-loaded every single choice.
     model = None
 
-    def _append(df, path, flags, idx):
-        df.to_csv(path, mode="a", header=flags[idx], index=False,
-                  encoding="utf-8-sig", quoting=1)
-        flags[idx] = False
-
     current_model_size = None
 
     def _ensure_model():
@@ -541,7 +543,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     # the except block below safely no-op via
                     # cleanup_incomplete_video_dirs() if a failure happens
                     # AFTER _video_slug() created folders but before mutations
-                    # got written (e.g. a disk-write error in _append()).
+                    # got written (e.g. a disk-write error in append_output_csv()).
                     vpaths = None
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
@@ -552,7 +554,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         any_written = False
                         for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
                             if data:
-                                _append(pd.DataFrame(data), vpaths[key], h, hi)
+                                append_output_csv(pd.DataFrame(data), vpaths[key], h, hi)
                                 any_written = True
                         # PATCH: when every output list is empty (all segments
                         # got filtered out as hallucinations/non-speech/near-
@@ -752,7 +754,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         any_written = False
                         for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
                             if data:
-                                _append(pd.DataFrame(data), vpaths[key], h, hi)
+                                append_output_csv(pd.DataFrame(data), vpaths[key], h, hi)
                                 any_written = True
                         # PATCH: see matching comment in the choice "1" (local MP3)
                         # block above -- when every output list is empty, nothing

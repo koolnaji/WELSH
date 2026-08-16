@@ -39,60 +39,23 @@ except Exception:
     simplemma_is_known = None
 
 # ========================= CONFIGURATION =========================
-# Keep data outside the source tree so the program can be copied, installed,
-# or run from any working directory.  Set WELSH_ANALYSIS_DIR to override this
-# location (for example, to use an external drive or a shared project folder).
-BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR",
-                                   str(Path.home() / "welsh_analysis"))).expanduser()
-from youtube_access import configure as configure_youtube_access
-configure_youtube_access(BASE_DIR)
-AUDIO_DIR     = BASE_DIR / "audio"
-TRANS_DIR     = BASE_DIR / "transcriptions"
-MUT_DIR       = BASE_DIR / "mutations"
-# PATCH: dedicated home for run-level summary/rollup CSVs (research_summary,
-# erosion_by_trigger_type, erosion_by_rule) so they don't get mixed in with
-# the per-video transcription CSVs in TRANS_DIR.
-SUMMARY_DIR   = BASE_DIR / "summaries"
-VIDEO_QUEUE   = BASE_DIR / "video_queue.json"
-PROCESSED_LOG = BASE_DIR / "processed_videos.json"
-LOCAL_MP3_DIR = BASE_DIR / "test_audio"
-# PATCH: mirrors PROCESSED_LOG but for local MP3 batches (menu option 1),
-# which previously had no resume capability at all -- a crash partway
-# through a folder of local files meant reprocessing everything from
-# scratch, at 25-50+ min/video on this hardware. Keyed by filename, with
-# file size recorded so a same-named file that's actually been swapped out
-# gets reprocessed rather than incorrectly skipped.
-LOCAL_PROCESSED_LOG = BASE_DIR / "processed_local_mp3s.json"
-# PATCH: queue videos that fail (download error, transcription crash, etc.)
-# used to get silently marked "processed" forever with no record of why --
-# a transient network blip meant losing that video permanently. This tracks
-# per-video attempt count and last error so failures are retried a bounded
-# number of times before being given up on, instead of either infinite-
-# retrying a permanently broken video or silently dropping a good one.
-FAILED_LOG           = BASE_DIR / "failed_videos.json"
-FAILED_MAX_RETRIES    = 3
-# PATCH: LOCAL_PROCESSED_LOG/FAILED_LOG above give resume at the WHOLE-VIDEO
-# level -- a crash means reprocess this video from scratch, which is fine
-# for a video that fails fast, but not for one that got hours into the
-# expensive Cysill/spaCy tagging pass in enrich_words() before dying (an
-# interrupted Cysill run genuinely lost 8 hours of work with nothing on
-# disk to show for it -- see enrich_words()'s own checkpoint comments).
-# CHECKPOINT_DIR holds CHUNK-level progress within a single video's
-# enrich_words() call, one JSON file per in-progress video, so a kill/crash
-# partway through tagging resumes from the last completed chunk instead of
-# re-tagging (and re-hitting Cysill's rate limit for) everything again.
-CHECKPOINT_DIR = BASE_DIR / "checkpoints"
-
-# PATCH: previously only defined locally inside fetch_captions.py and
-# corpus_analyzer.py respectively -- redefined here too (same value, same
-# BASE_DIR) purely so ensure_dirs() below can create every output folder
-# up front, not just the ones menu option 3 happens to write to. This
-# doesn't change where fetch_captions.py/corpus_analyzer.py look; it just
-# means the folder already exists by the time they get around to needing
-# it, instead of being created lazily on first use.
-CAPTIONS_DIR = BASE_DIR / "captions"
-OUT_DIR      = BASE_DIR / "analysis"
-FIG_DIR      = OUT_DIR / "figures"
+# Directory/path config, run-stamp/output-path layout, ensure_dirs(), and
+# every JSON state log (queue/processed/failed/local-processed) now live in
+# corpus_io.py -- see that module's own docstring for why. This module
+# keeps only what's genuinely linguistics-adjacent config: the yt-dlp
+# cookie-auth opts (used by download_audio()/fetch_captions.py, not a
+# state/output-layout concern) and the mutation-detection trigger tables
+# further down.
+from corpus_io import (
+    BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR, VIDEO_QUEUE,
+    PROCESSED_LOG, LOCAL_MP3_DIR, LOCAL_PROCESSED_LOG, FAILED_LOG,
+    FAILED_MAX_RETRIES, CHECKPOINT_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR,
+    LEMMA_CACHE_PATH, PHRASE_TEST_DIR, PREVIEW_DIR,
+    ensure_dirs, run_stamp, run_paths, _video_slug, _preview_video_slug,
+    load_lemma_cache_json, save_lemma_cache_json,
+    checkpoint_fingerprint, checkpoint_path_for, load_enrich_checkpoint,
+    save_enrich_checkpoint, delete_enrich_checkpoint,
+)
 
 # PATCH: YouTube 429s on the caption/timedtext endpoint were assumed to be
 # a simple request-rate problem (see fetch_captions.py's backoff/circuit-
@@ -130,36 +93,6 @@ def yt_dlp_cookie_opts():
     if YTDLP_COOKIES_FROM_BROWSER:
         return {"cookiesfrombrowser": (YTDLP_COOKIES_FROM_BROWSER,)}
     return {}
-
-# PATCH: persistent lemma cache path
-LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
-
-# BUGFIX: dedicated home for ad-hoc "test a Welsh phrase" output (menu
-# option 4, via run_paths() below). This used to write straight into
-# TRANS_DIR/MUT_DIR using flat filenames (mutations_<stamp>.csv, no
-# per-video subfolder). Because corpus_analyzer.py and rerun_rules.py both
-# aggregate the real corpus via MUT_DIR.rglob("mutations_*.csv") --
-# recursive, so nesting alone doesn't help -- a throwaway typed-phrase
-# test (explicitly documented as being for "checking a linguistic rule
-# against a specific example", not corpus contribution) would silently
-# get swept into the real erosion-rate research figures alongside genuine
-# video data. interactive_batch_selection() in corpus_analyzer.py does
-# let you spot and exclude it by hand at load time, but nothing stops it
-# from being missed, especially once there are many real batches to skim.
-# Giving phrase-test output its own directory entirely outside MUT_DIR's/
-# TRANS_DIR's tree means the glob simply never sees it -- no reliance on
-# a human catching it later.
-PHRASE_TEST_DIR = BASE_DIR / "phrase_tests"
-
-# PATCH: dedicated home for local-MP3 "preview, don't save" output --
-# the Testing menu's save-or-preview toggle (see welsh_pipeline.py).
-# Same rationale as PHRASE_TEST_DIR just above: a sibling of MUT_DIR/
-# TRANS_DIR, outside either directory's tree, so a preview run (e.g.
-# sanity-checking a new/unfamiliar audio source before trusting it) is
-# never picked up by option 6's or rerun_rules.py's *.rglob("mutations_*.csv")
-# discovery -- something you haven't decided to keep shouldn't silently
-# become part of your erosion-rate figures.
-PREVIEW_DIR = BASE_DIR / "mp3_previews"
 
 # PATCH: explicit imports instead of `import *` -- a star import makes
 # every name "maybe defined" to any linter/IDE, which is what generated
@@ -286,156 +219,6 @@ from mutation_tables import (
 
 
 # ========================= HELPERS =========================
-def ensure_dirs():
-    # PATCH: previously only created the folders menu option 3 needs
-    # (audio/transcriptions/mutations/summaries) -- LOCAL_MP3_DIR
-    # (test_audio), CAPTIONS_DIR, OUT_DIR (analysis), and FIG_DIR were
-    # each created lazily by whichever menu option first needed them
-    # (option 1, caption download, option 6). That's not wrong, just
-    # confusing to look at from the outside -- a user who's only run
-    # option 3 sees a handful of folders and no signal that the others
-    # are just as real, only not-yet-triggered. Creating everything up
-    # front makes the whole output layout visible from the very first
-    # run, regardless of which menu options get used afterward.
-    for p in [BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR,
-              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR, PHRASE_TEST_DIR,
-              PREVIEW_DIR]:
-        p.mkdir(parents=True, exist_ok=True)
-
-def run_stamp():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def run_paths(stamp):
-    """
-    BUGFIX: this used to point "mutations" at
-    MUT_DIR / f"mutations_{stamp}.csv" -- a flat filename living directly
-    in MUT_DIR, matching the exact glob (mutations_*.csv) that
-    corpus_analyzer.py and rerun_rules.py both use to aggregate the real
-    per-video corpus. run_paths() is only ever called for menu option 4's
-    ad-hoc "test a Welsh phrase" output (see save_analysis_outputs in
-    corpus_ops.py) -- explicitly documented as being for checking a rule
-    against one example, not for contributing to the research corpus. Left
-    as-is, every phrase you tested via option 4 would silently become part
-    of the real erosion-rate figures the next time you ran option 6.
-    Redirected to PHRASE_TEST_DIR (a sibling of MUT_DIR/TRANS_DIR, outside
-    either directory's tree) so the aggregating globs -- which are
-    recursive and would still find it even nested deeper inside MUT_DIR --
-    never see it at all, regardless of filename.
-    """
-    return {
-        "segments": PHRASE_TEST_DIR / f"segments_{stamp}.csv",
-        "words":    PHRASE_TEST_DIR / f"words_{stamp}.csv",
-        "lemmas":   PHRASE_TEST_DIR / f"lemmas_{stamp}.csv",
-        "pos":      PHRASE_TEST_DIR / f"pos_{stamp}.csv",
-        "mutations":PHRASE_TEST_DIR / f"mutations_{stamp}.csv",
-    }
-
-
-def _video_slug(meta, stamp):
-    """
-    Build a filesystem-safe filename slug for a single video, and organise
-    that video's output CSVs into a run-then-video nested folder structure.
-
-    Layout:
-        transcriptions/<stamp>/<slug>/segments_<stamp>_<slug>.csv
-        transcriptions/<stamp>/<slug>/words_<stamp>_<slug>.csv
-        transcriptions/<stamp>/<slug>/lemmas_<stamp>_<slug>.csv
-        transcriptions/<stamp>/<slug>/pos_<stamp>_<slug>.csv
-        mutations/<stamp>/<slug>/mutations_<stamp>_<slug>.csv
-        captions/<stamp>/<slug>/<video_id>.<lang>.vtt
-        captions/<stamp>/<slug>/<video_id>.<lang>.csv
-
-    `stamp` is generated once per menu-loop iteration in welsh_pipeline.py
-    (see run_stamp()) and reused for every video processed in that single
-    run, so every video from the same option-1 or option-3 invocation
-    lands under the same <stamp> parent folder -- browsing by run, then by
-    video within it, same as before a previous session flattened this.
-    Filenames still carry both stamp and slug (not simplified to e.g.
-    "words.csv") so corpus_analyzer.py's existing filename-based parsing,
-    and every *.rglob("mutations_*.csv")-style discovery call elsewhere,
-    keep working unchanged regardless of nesting depth.
-    Falls back to the video id, then the run stamp, if neither is available
-    for the slug itself.
-
-    # PATCH: a previous fix collapsed both transcripts (which used to
-    # nest two levels deep, TRANS_DIR / stamp / folder_name) AND mutations
-    # (which had no per-video subfolder at all, flat under MUT_DIR / stamp)
-    # down to a single flat <stamp>_<slug> folder for both -- solving the
-    # transcript/mutation inconsistency, but as a side effect also
-    # removing the ability to browse a run's videos grouped together under
-    # one folder, which turned out to be wanted behavior, not a bug.
-    # Restored here the other direction: both output types now nest
-    # run-then-video symmetrically, rather than collapsing to flat.
-    # find_segments_csv() in fetch_captions.py/manual_editing.py and
-    # _mutations_dir_for() in rerun_rules.py all had fast-path candidates
-    # hardcoded to the old flat layout -- updated alongside this change.
-    #
-    # PATCH: added "captions_dir" so caption data (.vtt + the parsed
-    # captions CSV) nests the same run-then-video way as transcriptions
-    # and mutations, instead of landing flat in CAPTIONS_DIR alongside
-    # every other video's captions ever fetched. Unlike the other keys
-    # above, this deliberately returns a DIRECTORY, not a filename --
-    # download_captions() derives the actual .vtt filename itself from
-    # the video ID (yt-dlp's own outtmpl convention), so the caller just
-    # needs somewhere to point out_dir at. welsh_pipeline.py's caption-
-    # fetch block now runs _video_slug() before fetching captions (it
-    # used to run after) specifically so this directory exists in time.
-    """
-    import re
-    title = meta.get("title") or meta.get("id") or stamp
-    # keep only alphanumeric, spaces, hyphens; collapse whitespace; truncate
-    slug = re.sub(r"[^\w\s-]", "", str(title), flags=re.UNICODE)
-    slug = re.sub(r"[\s]+", "_", slug.strip())[:60]
-    slug = slug or "untitled"
-
-    folder_name = f"{stamp}_{slug}"
-    video_trans_dir    = TRANS_DIR / stamp / slug
-    video_mut_dir      = MUT_DIR / stamp / slug
-    video_captions_dir = CAPTIONS_DIR / stamp / slug
-    video_trans_dir.mkdir(parents=True, exist_ok=True)
-    video_mut_dir.mkdir(parents=True, exist_ok=True)
-    video_captions_dir.mkdir(parents=True, exist_ok=True)
-
-    return {
-        "segments": video_trans_dir / f"segments_{folder_name}.csv",
-        "words":    video_trans_dir / f"words_{folder_name}.csv",
-        "lemmas":   video_trans_dir / f"lemmas_{folder_name}.csv",
-        "pos":      video_trans_dir / f"pos_{folder_name}.csv",
-        "mutations":video_mut_dir   / f"mutations_{folder_name}.csv",
-        "captions_dir": video_captions_dir,
-    }
-
-def _preview_video_slug(meta, stamp):
-    """
-    Mirrors _video_slug() above but writes under PREVIEW_DIR instead of
-    TRANS_DIR/MUT_DIR -- used by the Testing menu's "preview, don't save"
-    choice for local MP3 analysis (see welsh_pipeline.py). Deliberately a
-    separate small function rather than parameterizing _video_slug() with
-    a base-dir argument: _video_slug() is also called from the queue-
-    processing path, where "preview" isn't a concept at all (queue videos
-    are always real corpus data) -- keeping this separate avoids threading
-    an always-unused parameter through that call site too.
-
-    No captions_dir here -- local MP3s never fetch captions regardless of
-    preview/save, same as the real path.
-    """
-    title = meta.get("title") or meta.get("id") or stamp
-    slug = re.sub(r"[^\w\s-]", "", str(title), flags=re.UNICODE)
-    slug = re.sub(r"[\s]+", "_", slug.strip())[:60]
-    slug = slug or "untitled"
-
-    folder_name = f"{stamp}_{slug}"
-    video_dir = PREVIEW_DIR / stamp / slug
-    video_dir.mkdir(parents=True, exist_ok=True)
-
-    return {
-        "segments": video_dir / f"segments_{folder_name}.csv",
-        "words":    video_dir / f"words_{folder_name}.csv",
-        "lemmas":   video_dir / f"lemmas_{folder_name}.csv",
-        "pos":      video_dir / f"pos_{folder_name}.csv",
-        "mutations":video_dir / f"mutations_{folder_name}.csv",
-    }
-
 def normalize_word(word):
     if not word:
         return ""
@@ -482,23 +265,25 @@ HALLUCINATION_REPEAT_RATIO    = 0.4
 GAP_ALIGN_WINDOW              = 5    # lookahead window for gap-tolerant alignment
 
 # ========================= LEMMA CACHE PERSISTENCE =========================
+# Thin wrappers around corpus_io's generic load_lemma_cache_json()/
+# save_lemma_cache_json() -- this module owns the actual LEMMA_CACHE dict
+# (engine runtime state, consulted mid-processing by get_welsh_lemma() and
+# friends), corpus_io only owns the disk-persistence mechanics. See
+# corpus_io.py's own docstring for why this split avoids a circular import.
 def load_lemma_cache():
     """Load persisted lemma cache from disk to avoid redundant API calls across runs."""
-    if LEMMA_CACHE_PATH.exists():
-        try:
-            LEMMA_CACHE.update(
-                json.loads(LEMMA_CACHE_PATH.read_text(encoding="utf-8"))
-            )
+    try:
+        loaded = load_lemma_cache_json(LEMMA_CACHE_PATH)
+        LEMMA_CACHE.update(loaded)
+        if loaded:
             print(f"✅ Lemma cache loaded ({len(LEMMA_CACHE)} entries).")
-        except Exception as e:
-            print(f"⚠️  Could not load lemma cache: {e}")
+    except Exception as e:
+        print(f"⚠️  Could not load lemma cache: {e}")
 
 def save_lemma_cache():
     """Persist lemma cache to disk for reuse in future runs."""
     try:
-        # Match the crash-safe persistence used for queue and checkpoint
-        # state. A direct write can leave truncated JSON after an interrupt.
-        _write_json_atomic(LEMMA_CACHE_PATH, LEMMA_CACHE)
+        save_lemma_cache_json(LEMMA_CACHE, LEMMA_CACHE_PATH)
     except Exception as e:
         print(f"⚠️  Could not save lemma cache: {e}")
 
@@ -1034,120 +819,17 @@ def align_with_gap_tolerance(tagger_tokens, whisper_words, window=GAP_ALIGN_WIND
 
 
 # ==================== ENRICH_WORDS CHECKPOINTING ====================
-# Lives here, not its own module (unlike cysill_client.py/spacy_tagging.py,
-# which wrap genuinely external systems) -- this is tightly coupled to
-# chunk_words_for_pos()'s exact chunking and enrich_words()'s own merge
-# logic, not a separable concern. A small atomic-JSON-write helper is
-# duplicated from corpus_ops.py's _write_json() rather than imported --
-# corpus_ops.py imports FROM mutation_engine.py, so the reverse import
-# would be circular. Deliberate, acknowledged duplication of ~4 stable
-# lines, not an oversight (see corpus_ops.py's _write_json for the twin).
-
-def _write_json_atomic(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(value, ensure_ascii=False,
-                                    default=lambda o: float(o) if hasattr(o, "__float__") else str(o)),
-                         encoding="utf-8")
-    tmp_path.replace(path)
-
-
-def _checkpoint_fingerprint(all_preprocessed_words):
-    """
-    Cheap fingerprint of the exact word sequence enrich_words() was given,
-    so a checkpoint can be verified to still match the input before
-    resuming from it -- NOT just trusted because a file happens to exist
-    with the right name. Guards against the one way resuming could
-    silently corrupt data: if this video gets re-transcribed with
-    different Whisper settings (or Whisper's own non-determinism) between
-    the interrupted attempt and this one, the word list -- and therefore
-    chunk_words_for_pos()'s chunk boundaries -- could differ, and splicing
-    "chunks 1-17 from the OLD word list" onto "chunks 18+ freshly computed
-    from the NEW word list" would misalign every word after the resume
-    point. Hashing every word (not just count) catches a same-length but
-    reordered/changed transcript, not just a shorter/longer one.
-    """
-    h = hashlib.sha256()
-    for w in all_preprocessed_words:
-        h.update(w["word"].encode("utf-8"))
-        h.update(b"\x00")
-    return h.hexdigest()
-
-
-def _checkpoint_path_for(checkpoint_key):
-    """
-    Filename is a hash of checkpoint_key (video url/id/audio path -- may
-    contain characters that aren't filesystem-safe on every OS this
-    project runs on, per the Windows-path issues already hit elsewhere in
-    this project) rather than a slugified version of it. The original key
-    is still stored INSIDE the checkpoint JSON for anyone grepping
-    CHECKPOINT_DIR by hand to figure out which file belongs to which
-    video, without needing the filename itself to be readable.
-    """
-    digest = hashlib.sha256(checkpoint_key.encode("utf-8")).hexdigest()[:24]
-    return CHECKPOINT_DIR / f"{digest}.json"
-
-
-def _load_enrich_checkpoint(checkpoint_path, checkpoint_key, expected_fingerprint,
-                            chunk_word_counts):
-    """
-    Returns {"completed_chunk_count": int, "enriched_words": [...]} if a
-    valid, matching checkpoint exists, else None. "Valid" means: the file
-    parses, its fingerprint matches the CURRENT input words, its completed
-    chunk count is in range, and its saved-word count exactly matches that
-    completed chunk prefix. Any mismatch
-    is treated as "this checkpoint doesn't apply anymore" and logged, not
-    silently discarded -- so a fingerprint mismatch (see
-    _checkpoint_fingerprint()'s docstring) is visible instead of just
-    quietly re-tagging everything with no explanation of why the resume
-    didn't happen.
-    """
-    if not checkpoint_path.exists():
-        return None
-    try:
-        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        tqdm.write(f" ⚠️ Checkpoint file unreadable ({e}) -- starting this video fresh.")
-        return None
-
-    if data.get("fingerprint") != expected_fingerprint:
-        tqdm.write(" ⚠️ Found a checkpoint for this video, but its fingerprint doesn't "
-                   "match the current transcription (re-transcribed with different "
-                   "settings, or Whisper produced a different result this time) -- "
-                   "discarding it and starting this video's tagging fresh, rather than "
-                   "risk misaligning words to the wrong chunk.")
-        return None
-
-    total_chunks = len(chunk_word_counts)
-    completed = data.get("completed_chunk_count", 0)
-    enriched  = data.get("enriched_words", [])
-    if not isinstance(completed, int) or not (0 <= completed <= total_chunks):
-        tqdm.write(" ⚠️ Checkpoint's completed_chunk_count is invalid for this video's "
-                   "current chunk count -- starting fresh.")
-        return None
-
-    expected_word_count = sum(chunk_word_counts[:completed])
-    if not isinstance(enriched, list) or len(enriched) != expected_word_count:
-        tqdm.write("Checkpoint word count does not match its completed chunks; "
-                   "starting this video fresh to avoid shifted alignment.")
-        return None
-
-    return {"completed_chunk_count": completed, "enriched_words": enriched}
-
-
-def _save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
-                             total_chunks, completed_chunk_count, enriched_words):
-    _write_json_atomic(checkpoint_path, {
-        "source_key":            checkpoint_key,
-        "fingerprint":           fingerprint,
-        "total_chunks":          total_chunks,
-        "completed_chunk_count": completed_chunk_count,
-        "enriched_words":        enriched_words,
-    })
-
-
-def _delete_enrich_checkpoint(checkpoint_path):
-    checkpoint_path.unlink(missing_ok=True)
+# The actual read/write/validate mechanics (checkpoint_fingerprint,
+# checkpoint_path_for, load_enrich_checkpoint, save_enrich_checkpoint,
+# delete_enrich_checkpoint) now live in corpus_io.py -- imported at the
+# top of this file. What stays here is enrich_words() itself: the
+# decision logic for WHEN to check/write a checkpoint, tightly coupled to
+# chunk_words_for_pos()'s exact chunking and this function's own merge
+# logic, not a separable concern.
+# (Previously duplicated a small atomic-JSON-write helper from
+# corpus_ops.py to avoid what would have been a circular import --
+# corpus_io.py now sits below both this module and corpus_ops.py in the
+# import graph, so that duplication is no longer needed.)
 
 
 def enrich_words(all_preprocessed_words, checkpoint_key=None):
@@ -1183,9 +865,9 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
 
     checkpoint_path = None
     if checkpoint_key:
-        fingerprint     = _checkpoint_fingerprint(all_preprocessed_words)
-        checkpoint_path = _checkpoint_path_for(checkpoint_key)
-        loaded = _load_enrich_checkpoint(
+        fingerprint     = checkpoint_fingerprint(all_preprocessed_words)
+        checkpoint_path = checkpoint_path_for(checkpoint_key)
+        loaded = load_enrich_checkpoint(
             checkpoint_path, checkpoint_key, fingerprint,
             [len(chunk) for chunk in chunks],
         )
@@ -1379,7 +1061,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
             enriched.append(entry)
 
         if checkpoint_path is not None:
-            _save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
+            save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
                                      len(chunks), chunk_idx + 1, enriched)
 
     if checkpoint_path is not None:
@@ -1389,7 +1071,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
         # by chunk from scratch, or (if this exact video is ever queued
         # again for some reason) misleadingly claiming to resume a run
         # that already fully completed.
-        _delete_enrich_checkpoint(checkpoint_path)
+        delete_enrich_checkpoint(checkpoint_path)
 
     return enriched
 

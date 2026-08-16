@@ -58,7 +58,7 @@ import seaborn as sns
 # wrote to. Importing the same names from mutation_engine.py makes this
 # the single source of truth: change WELSH_ANALYSIS_DIR once, and every
 # file (pipeline + all three companion tools) follows automatically.
-from mutation_engine import BASE_DIR, MUT_DIR, OUT_DIR, FIG_DIR
+from corpus_io import BASE_DIR, MUT_DIR, OUT_DIR, FIG_DIR
 
 # Seaborn theme -- clean, publication-friendly.
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)

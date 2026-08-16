@@ -56,7 +56,8 @@ import yt_dlp
 # this looked for/wrote transcripts and captions in a different folder
 # than the one welsh_pipeline.py actually uses. Importing instead of
 # duplicating keeps every file in the project pointed at the same place.
-from mutation_engine import BASE_DIR, CAPTIONS_DIR, TRANS_DIR, yt_dlp_cookie_opts
+from corpus_io import BASE_DIR, CAPTIONS_DIR, TRANS_DIR
+from mutation_engine import yt_dlp_cookie_opts
 from youtube_access import call as youtube_call
 
 WELSH_LANG_CODES = ["cy", "cy-GB", "cy-orig"]

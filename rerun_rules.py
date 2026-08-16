@@ -60,13 +60,16 @@ import pandas as pd
 from tqdm import tqdm
 
 from mutation_engine import (
-    BASE_DIR, normalize_word, process_comprehensive_mutations,
+    normalize_word, process_comprehensive_mutations,
     align_with_gap_tolerance, load_lemma_cache, save_lemma_cache,
 )
+# PATCH: previously redefined MUT_DIR/TRANS_DIR locally here (BASE_DIR /
+# "mutations", BASE_DIR / "transcriptions") instead of importing the real
+# ones -- harmless while both definitions matched, but a second place
+# either could silently drift from corpus_io.py's own. Importing directly
+# now.
+from corpus_io import BASE_DIR, MUT_DIR, TRANS_DIR
 from spacy_tagging import load_spacy, parse_spacy_doc
-
-MUT_DIR   = BASE_DIR / "mutations"
-TRANS_DIR = BASE_DIR / "transcriptions"
 
 # Columns manual_editing.py owns on a mutation row. Never overwritten by
 # --commit, and their presence (manual_reviewed == True specifically) is
