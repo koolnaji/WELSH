@@ -99,7 +99,12 @@ def _mutations_dir_for(mutations_csv_path):
     if candidate.exists():
         return candidate
 
-    folder_name = mutations_csv_path.stem[len("mutations_"):]
+    for prefix in ("mutations_original_", "mutations_corroborated_", "mutations_"):
+        if mutations_csv_path.stem.startswith(prefix):
+            folder_name = mutations_csv_path.stem[len(prefix):]
+            break
+    else:
+        folder_name = mutations_csv_path.stem
     matches = list(BASE_DIR.rglob(f"pos_{folder_name}.csv"))
     return matches[0].parent if matches else candidate
 
@@ -304,7 +309,16 @@ def run_rerun(trigger_arg=None, rule_arg=None, video="all", commit=False):
     triggers = [normalize_word(t) for t in trigger_arg.split(",")] if trigger_arg else None
     rules    = [r.strip() for r in rule_arg.split(",")] if rule_arg else None
 
-    all_csvs = sorted(MUT_DIR.rglob("mutations_*.csv"))
+    # PATCH: mutations_original_*.csv and mutations_corroborated_*.csv now
+    # both match "mutations_*.csv" -- restricted to originals only, since
+    # rule re-classification changes status/is_erosion/mutation_found,
+    # which only makes sense against the raw pipeline output. Running it
+    # against the corroborated file too would reclassify the same video
+    # twice and leave the corroboration columns stale against the new
+    # classification underneath them; re-run fetch_captions.py's
+    # corroboration pass afterward if the corroborated version needs
+    # refreshing against the new results.
+    all_csvs = sorted(MUT_DIR.rglob("mutations_original_*.csv"))
     all_csvs = [p for p in all_csvs if "precaption_backup" not in p.name
                 and "_rerun_candidate" not in p.name]
     if video and video != "all":

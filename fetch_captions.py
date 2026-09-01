@@ -351,6 +351,26 @@ def parse_vtt(vtt_path):
     return deduped
 
 
+def _folder_name_from_mutations_stem(stem):
+    """Strips whichever mutations-filename prefix is present to recover the
+    shared "<stamp>_<slug>" folder_name used by every other file for this
+    video (words_<folder_name>.csv, segments_<folder_name>.csv, etc.).
+
+    PATCH: mutations files now come in two variants -- mutations_original_
+    and mutations_corroborated_ -- instead of one plain mutations_ prefix.
+    A naive strip of just "mutations_" left "original_" or "corroborated_"
+    stuck onto the front of folder_name, silently breaking every sibling-
+    file lookup (words_original_<stamp>_<slug>.csv doesn't exist). Checks
+    the longer, more specific prefixes first; still falls back to the
+    plain "mutations_" prefix for old-style files from before this rename
+    (e.g. anything not yet migrated).
+    """
+    for prefix in ("mutations_original_", "mutations_corroborated_", "mutations_"):
+        if stem.startswith(prefix):
+            return stem[len(prefix):]
+    return None
+
+
 def find_segments_csv(mutations_csv_path):
     """Mirrors manual_editing.py's / scan_dom_verbnoun_impact.py's
     find_segments_csv -- same layout, same fallback search.
@@ -366,9 +386,9 @@ def find_segments_csv(mutations_csv_path):
     # directory instead of erroring when depth shifts.
     """
     stem = mutations_csv_path.stem
-    if not stem.startswith("mutations_"):
+    folder_name = _folder_name_from_mutations_stem(stem)
+    if folder_name is None:
         return None
-    folder_name = stem[len("mutations_"):]
 
     slug  = mutations_csv_path.parent.name
     stamp = mutations_csv_path.parent.parent.name
@@ -388,9 +408,9 @@ def find_words_csv(mutations_csv_path):
     which segments_*.csv doesn't have at word granularity."""
     mutations_csv_path = Path(mutations_csv_path)
     stem = mutations_csv_path.stem
-    if not stem.startswith("mutations_"):
+    folder_name = _folder_name_from_mutations_stem(stem)
+    if folder_name is None:
         return None
-    folder_name = stem[len("mutations_"):]
 
     slug  = mutations_csv_path.parent.name
     stamp = mutations_csv_path.parent.parent.name
@@ -563,11 +583,16 @@ def local_window_text(tokens, center_idx, window=6):
     return " ".join(tokens[lo:hi])
 
 
-def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=None):
+def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=None, output_path=None):
     """The actual reinforcement pass: applies rules 1-3 to every row of a
-    mutations_*.csv against the matching captions CSV (from a prior
-    fetch_captions.py run) and the video's own words_*.csv, and writes
-    the result back with new columns added.
+    mutations_original_*.csv against the matching captions CSV (from a
+    prior fetch_captions.py run) and the video's own words_*.csv, and
+    writes the RESULT TO A SEPARATE mutations_corroborated_*.csv file --
+    the original mutations_original_*.csv is never modified, so both the
+    raw pipeline output and the caption-reinforced version always exist
+    side by side (previously this overwrote mutations_csv_path in place,
+    keeping only a one-time "_precaption_backup.csv" copy of the true
+    original -- now unnecessary since the original simply never changes).
 
     Deliberately additive-only: NEVER touches status/is_erosion/
     mutation_found/expected_mutation -- those are the pipeline's actual
@@ -584,9 +609,27 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=
     docstring) or YouTube's automatic ASR (a second machine guess, not an
     editorial choice). This function doesn't act on that distinction
     itself; it just makes sure it isn't lost by the time anyone wants to.
+
+    output_path: where to write the corroborated file. Callers that
+    already have both paths from _video_slug() (welsh_pipeline.py) should
+    pass vpaths["mutations_corroborated"] explicitly. If omitted (e.g.
+    the CLI --corroborate mode below, which only ever sees one raw path),
+    it's derived from mutations_csv_path's own filename -- swapping a
+    leading "mutations_original_" for "mutations_corroborated_" if
+    present, or just appending "_corroborated" to the stem otherwise.
     """
     mutations_csv_path = Path(mutations_csv_path)
     captions_csv_path  = Path(captions_csv_path)
+
+    if output_path is None:
+        name = mutations_csv_path.name
+        if name.startswith("mutations_original_"):
+            output_path = mutations_csv_path.with_name(
+                name.replace("mutations_original_", "mutations_corroborated_", 1))
+        else:
+            output_path = mutations_csv_path.with_name(
+                mutations_csv_path.stem + "_corroborated.csv")
+    output_path = Path(output_path)
 
     words_path = find_words_csv(mutations_csv_path)
     if words_path is None:
@@ -620,7 +663,7 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=
         for c, vals in new_cols.items():
             mut_df[c] = vals
         mut_df["caption_kind"] = cap_kind
-        mut_df.to_csv(mutations_csv_path, index=False, encoding="utf-8-sig")
+        mut_df.to_csv(output_path, index=False, encoding="utf-8-sig")
         print("No usable words/captions data -- nothing corroborated.")
         return
 
@@ -793,24 +836,20 @@ def run_corroboration(mutations_csv_path, captions_csv_path, nlp=None, cap_kind=
     needs_flag = mut_df["caption_flag_reason"].notna()
     mut_df.loc[needs_flag, "flagged"] = mut_df.loc[needs_flag, "flagged"].fillna(False) | True
 
-    # Back up the pre-corroboration file ONCE -- if this is re-run later
-    # (e.g. after re-fetching better captions), the backup still holds the
-    # true original, not an already-corroborated intermediate version.
-    backup_path = mutations_csv_path.with_name(mutations_csv_path.stem + "_precaption_backup.csv")
-    if not backup_path.exists():
-        shutil.copy2(mutations_csv_path, backup_path)
-
-    mut_df.to_csv(mutations_csv_path, index=False, encoding="utf-8-sig")
+    # Original mutations_original_*.csv is never touched -- the
+    # corroborated result is a separate file, so there's nothing to back
+    # up before writing.
+    mut_df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
     print(f"\n{'='*70}")
-    print(f"Corroboration complete: {mutations_csv_path.name}")
+    print(f"Corroboration complete: {output_path.name}")
     print(f"{'='*70}")
     for label, n in counts.most_common():
         print(f"  {label:32s} {n:6d}")
     flagged_n = int(needs_flag.sum())
     print(f"\n  Rows newly flagged for manual review: {flagged_n}")
-    print(f"  Original backed up to: {backup_path.name}")
-    print(f"  Updated in place: {mutations_csv_path}")
+    print(f"  Original (untouched): {mutations_csv_path.name}")
+    print(f"  Corroborated data written to: {output_path}")
 
 
 def main():

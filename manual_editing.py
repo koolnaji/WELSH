@@ -209,33 +209,54 @@ RULE_DESCRIPTIONS = {
 TIMESTAMP_RE = re.compile(r"([\d.]+)s\s*-\s*([\d.]+)s")
 
 
+def _pick_best_mutations_file(paths):
+    """Per video folder, keep only ONE mutations file to review: the
+    corroborated version if this video has one (it carries the
+    caption_corroboration/flagged columns manual review actually triages),
+    otherwise the original. Needed now that mutations_original_*.csv and
+    mutations_corroborated_*.csv BOTH match "mutations_*.csv" -- without
+    this, a video with both would show up twice, once as a stale
+    pre-corroboration copy."""
+    by_dir = {}
+    for p in paths:
+        by_dir.setdefault(p.parent, []).append(p)
+    picked = []
+    for files in by_dir.values():
+        corroborated = [f for f in files if f.name.startswith("mutations_corroborated_")]
+        original     = [f for f in files if f.name.startswith("mutations_original_")]
+        legacy       = [f for f in files if f not in corroborated and f not in original]
+        picked.extend(corroborated or original or legacy)
+    return sorted(picked)
+
+
 def find_mutation_csvs(explicit_paths):
-    # PATCH: exclude "*_precaption_backup.csv" -- see the matching comment
-    # in corpus_analyzer.py's load_and_merge_mutations(). These are
-    # fetch_captions.py's one-time pre-corroboration backups, not separate
-    # videos' worth of review data; without this filter they'd show up as
-    # duplicate files to review, with stale (pre-corroboration) rows.
+    # PATCH: exclude "*_precaption_backup.csv" -- a leftover naming
+    # pattern from before mutations_original_/mutations_corroborated_
+    # became separate files (see fetch_captions.run_corroboration's
+    # docstring); kept here only so any not-yet-migrated old backup file
+    # doesn't show up as a stray extra entry.
     if explicit_paths:
-        paths = []
+        direct_files, expanded = [], []
         for p in explicit_paths:
             p = Path(p)
             if p.is_dir():
-                paths.extend(sorted(
+                expanded.extend(
                     f for f in p.rglob("mutations_*.csv")
                     if not f.name.endswith("_precaption_backup.csv")
-                ))
+                )
             else:
-                paths.append(p)
-        return paths
+                direct_files.append(p)
+        return direct_files + _pick_best_mutations_file(expanded)
     if not MUT_DIR.exists():
         print(f"{MUT_DIR} doesn't exist and no files were given. Either "
               f"point this at your mutations CSVs directly, or check "
               f"BASE_DIR at the top of this script.")
         sys.exit(1)
-    return sorted(
+    all_files = [
         f for f in MUT_DIR.rglob("mutations_*.csv")
         if not f.name.endswith("_precaption_backup.csv")
-    )
+    ]
+    return _pick_best_mutations_file(all_files)
 
 
 def quick_row_count(path):
@@ -300,11 +321,21 @@ def find_segments_csv(mutations_csv_path):
     # BASE_DIR directly -- a fixed-depth assumption silently resolves to
     # the wrong directory (rather than erroring) every time folder
     # nesting changes, which it has twice now.
+    PATCH: mutations files now come in two variants -- mutations_original_
+    and mutations_corroborated_ -- instead of one plain mutations_ prefix.
+    Checks the longer, more specific prefixes first so folder_name doesn't
+    end up with "original_"/"corroborated_" stuck onto its front; still
+    falls back to the plain "mutations_" prefix for any old-style file
+    that predates this rename.
     """
-    stem = mutations_csv_path.stem  # "mutations_<stamp>_<slug>"
-    if not stem.startswith("mutations_"):
+    stem = mutations_csv_path.stem  # "mutations_original_<stamp>_<slug>" etc.
+    folder_name = None
+    for prefix in ("mutations_original_", "mutations_corroborated_", "mutations_"):
+        if stem.startswith(prefix):
+            folder_name = stem[len(prefix):]  # "<stamp>_<slug>"
+            break
+    if folder_name is None:
         return None
-    folder_name = stem[len("mutations_"):]  # "<stamp>_<slug>"
 
     slug  = mutations_csv_path.parent.name
     stamp = mutations_csv_path.parent.parent.name

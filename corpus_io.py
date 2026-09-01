@@ -56,13 +56,38 @@ BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR",
                                    str(Path.home() / "welsh_analysis"))).expanduser()
 configure_youtube_access(BASE_DIR)
 
-AUDIO_DIR     = BASE_DIR / "audio"
-TRANS_DIR     = BASE_DIR / "transcriptions"
-MUT_DIR       = BASE_DIR / "mutations"
-# Dedicated home for run-level summary/rollup CSVs (research_summary,
-# erosion_by_trigger_type, erosion_by_rule) so they don't get mixed in with
-# the per-video transcription CSVs in TRANS_DIR.
-SUMMARY_DIR   = BASE_DIR / "summaries"
+# PATCH: restructured from five separate top-level folders (audio/,
+# transcriptions/, mutations/, captions/, summaries/) into one runs/
+# tree, requested explicitly: everything for one video (transcript,
+# both mutation files, both audio files, captions) now lives together
+# in ONE folder -- runs/<stamp>/<slug>/ -- with no further subfolders
+# inside it, so nothing needs an extra click to reach. Session-level
+# summary CSVs (research_summary etc. -- belong to the whole run, not
+# one video) sit one level up, directly in runs/<stamp>/, alongside
+# that run's video folders.
+#
+#   runs/<stamp>/research_summary_<stamp>.csv         (session-level)
+#   runs/<stamp>/erosion_by_trigger_type_<stamp>.csv  (session-level)
+#   runs/<stamp>/erosion_by_rule_<stamp>.csv          (session-level)
+#   runs/<stamp>/<slug>/segments_<stamp>_<slug>.csv
+#   runs/<stamp>/<slug>/words_<stamp>_<slug>.csv
+#   runs/<stamp>/<slug>/lemmas_<stamp>_<slug>.csv
+#   runs/<stamp>/<slug>/pos_<stamp>_<slug>.csv
+#   runs/<stamp>/<slug>/mutations_original_<stamp>_<slug>.csv
+#   runs/<stamp>/<slug>/mutations_corroborated_<stamp>_<slug>.csv
+#   runs/<stamp>/<slug>/<video_id>_<title>.mp3        (raw audio)
+#   runs/<stamp>/<slug>/<video_id>_<title>_norm.mp3   (normalized audio)
+#   runs/<stamp>/<slug>/<video_id>.<lang>.vtt / .csv  (captions)
+#
+# TRANS_DIR/MUT_DIR/CAPTIONS_DIR/AUDIO_DIR/SUMMARY_DIR are kept as
+# aliases, all pointing at RUNS_DIR, purely so any other module that
+# still imports those names (mutation_engine.py, corpus_ops.py) doesn't
+# break. Don't build new paths from them directly -- use RUNS_DIR, or
+# better, the "video_dir" a call already has from _video_slug(), so
+# it's obvious you mean "this video's one folder."
+RUNS_DIR      = BASE_DIR / "runs"
+AUDIO_DIR = TRANS_DIR = MUT_DIR = CAPTIONS_DIR = SUMMARY_DIR = RUNS_DIR
+
 VIDEO_QUEUE   = BASE_DIR / "video_queue.json"
 PROCESSED_LOG = BASE_DIR / "processed_videos.json"
 LOCAL_MP3_DIR = BASE_DIR / "test_audio"
@@ -93,30 +118,32 @@ FAILED_MAX_RETRIES = 3
 # everything again.
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 
-CAPTIONS_DIR = BASE_DIR / "captions"
 OUT_DIR      = BASE_DIR / "analysis"
-FIG_DIR      = OUT_DIR / "figures"
+# PATCH: figures moved out of analysis/figures/ to a plain top-level
+# folder -- requested explicitly, figures live at the same level as
+# runs/ and the state JSON files, not nested under "analysis".
+FIG_DIR      = BASE_DIR / "figures"
 
 # Persistent lemma cache path.
 LEMMA_CACHE_PATH = BASE_DIR / "lemma_cache.json"
 
 # Dedicated home for ad-hoc "test a Welsh phrase" output (menu option 4,
 # via run_paths() below). Because corpus_analyzer.py and rerun_rules.py
-# both aggregate the real corpus via MUT_DIR.rglob("mutations_*.csv") --
+# both aggregate the real corpus via discover_mutation_files() (below) --
 # recursive, so nesting alone doesn't help -- a throwaway typed-phrase
 # test (explicitly "checking a linguistic rule against a specific
 # example", not corpus contribution) would silently get swept into the
 # real erosion-rate research figures alongside genuine video data. Giving
-# phrase-test output its own directory entirely outside MUT_DIR's/
-# TRANS_DIR's tree means the glob simply never sees it.
+# phrase-test output its own directory entirely outside RUNS_DIR's tree
+# means the discovery walk simply never sees it.
 PHRASE_TEST_DIR = BASE_DIR / "phrase_tests"
 
 # Dedicated home for local-MP3 "preview, don't save" output -- the Testing
 # menu's save-or-preview toggle. Same rationale as PHRASE_TEST_DIR just
-# above: a sibling of MUT_DIR/TRANS_DIR, outside either directory's tree,
-# so a preview run is never picked up by the corpus-aggregating globs --
-# something you haven't decided to keep shouldn't silently become part of
-# your erosion-rate figures.
+# above: a sibling of RUNS_DIR, outside its tree, so a preview run is
+# never picked up by the corpus-aggregating discovery walk -- something
+# you haven't decided to keep shouldn't silently become part of your
+# erosion-rate figures.
 PREVIEW_DIR = BASE_DIR / "mp3_previews"
 
 
@@ -125,9 +152,8 @@ def ensure_dirs():
     visible from the very first run, regardless of which menu options get
     used afterward -- rather than each folder appearing lazily the first
     time whichever menu option needs it actually runs."""
-    for p in [BASE_DIR, AUDIO_DIR, TRANS_DIR, MUT_DIR, SUMMARY_DIR,
-              LOCAL_MP3_DIR, CAPTIONS_DIR, OUT_DIR, FIG_DIR, PHRASE_TEST_DIR,
-              PREVIEW_DIR]:
+    for p in [BASE_DIR, RUNS_DIR, LOCAL_MP3_DIR, OUT_DIR, FIG_DIR,
+              PHRASE_TEST_DIR, PREVIEW_DIR, CHECKPOINT_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -156,28 +182,39 @@ def run_paths(stamp):
 
 def _video_slug(meta, stamp):
     """
-    Build a filesystem-safe filename slug for a single video, and organise
-    that video's output CSVs into a run-then-video nested folder structure.
+    One flat folder per video: runs/<stamp>/<slug>/ holds the transcript
+    CSVs, both mutation files, both audio files, and captions together --
+    no further subfolders, so nothing needs an extra click to reach.
 
-    Layout:
-        transcriptions/<stamp>/<slug>/segments_<stamp>_<slug>.csv
-        transcriptions/<stamp>/<slug>/words_<stamp>_<slug>.csv
-        transcriptions/<stamp>/<slug>/lemmas_<stamp>_<slug>.csv
-        transcriptions/<stamp>/<slug>/pos_<stamp>_<slug>.csv
-        mutations/<stamp>/<slug>/mutations_<stamp>_<slug>.csv
-        captions/<stamp>/<slug>/<video_id>.<lang>.vtt
-        captions/<stamp>/<slug>/<video_id>.<lang>.csv
+        runs/<stamp>/<slug>/segments_<stamp>_<slug>.csv
+        runs/<stamp>/<slug>/words_<stamp>_<slug>.csv
+        runs/<stamp>/<slug>/lemmas_<stamp>_<slug>.csv
+        runs/<stamp>/<slug>/pos_<stamp>_<slug>.csv
+        runs/<stamp>/<slug>/mutations_original_<stamp>_<slug>.csv
+        runs/<stamp>/<slug>/mutations_corroborated_<stamp>_<slug>.csv
+        runs/<stamp>/<slug>/<video_id>_<title>.mp3        (raw audio)
+        runs/<stamp>/<slug>/<video_id>_<title>_norm.mp3   (normalized)
+        runs/<stamp>/<slug>/<video_id>.<lang>.vtt / .csv  (captions)
 
     `stamp` is generated once per menu-loop iteration in welsh_pipeline.py
     (see run_stamp()) and reused for every video processed in that single
-    run, so every video from the same option-1 or option-3 invocation
-    lands under the same <stamp> parent folder -- browsing by run, then by
-    video within it. Filenames still carry both stamp and slug (not
-    simplified to e.g. "words.csv") so corpus_analyzer.py's existing
-    filename-based parsing, and every *.rglob("mutations_*.csv")-style
-    discovery call elsewhere, keep working unchanged regardless of
-    nesting depth. Falls back to the video id, then the run stamp, if
-    neither is available for the slug itself.
+    run, so every video from the same invocation lands under the same
+    <stamp> parent folder -- browsing by run, then by video within it.
+    Filenames still carry both stamp and slug so corpus_analyzer.py's
+    filename-based parsing keeps working regardless of nesting depth.
+
+    "mutations" (original, direct pipeline output) and
+    "mutations_corroborated" (written separately by
+    fetch_captions.run_corroboration -- see its own docstring) are now
+    two SEPARATE files, not one file overwritten in place with a backup.
+    "mutations" is the key every other module already checks to decide
+    whether a video actually produced data (cleanup_incomplete_video_dirs,
+    etc.), so that key name is kept as-is -- only its filename changed.
+
+    "captions_dir" and "audio_dir" both point at this same flat video_dir
+    now (previously separate nested trees) -- kept as dict keys purely so
+    call sites that already do vpaths["captions_dir"] / vpaths["audio_dir"]
+    keep working unchanged.
     """
     import re
     title = meta.get("title") or meta.get("id") or stamp
@@ -187,20 +224,18 @@ def _video_slug(meta, stamp):
     slug = slug or "untitled"
 
     folder_name = f"{stamp}_{slug}"
-    video_trans_dir    = TRANS_DIR / stamp / slug
-    video_mut_dir      = MUT_DIR / stamp / slug
-    video_captions_dir = CAPTIONS_DIR / stamp / slug
-    video_trans_dir.mkdir(parents=True, exist_ok=True)
-    video_mut_dir.mkdir(parents=True, exist_ok=True)
-    video_captions_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = RUNS_DIR / stamp / slug
+    video_dir.mkdir(parents=True, exist_ok=True)
 
     return {
-        "segments": video_trans_dir / f"segments_{folder_name}.csv",
-        "words":    video_trans_dir / f"words_{folder_name}.csv",
-        "lemmas":   video_trans_dir / f"lemmas_{folder_name}.csv",
-        "pos":      video_trans_dir / f"pos_{folder_name}.csv",
-        "mutations":video_mut_dir   / f"mutations_{folder_name}.csv",
-        "captions_dir": video_captions_dir,
+        "segments": video_dir / f"segments_{folder_name}.csv",
+        "words":    video_dir / f"words_{folder_name}.csv",
+        "lemmas":   video_dir / f"lemmas_{folder_name}.csv",
+        "pos":      video_dir / f"pos_{folder_name}.csv",
+        "mutations":              video_dir / f"mutations_original_{folder_name}.csv",
+        "mutations_corroborated": video_dir / f"mutations_corroborated_{folder_name}.csv",
+        "captions_dir": video_dir,
+        "audio_dir":    video_dir,
     }
 
 
@@ -233,7 +268,7 @@ def _preview_video_slug(meta, stamp):
         "words":    video_dir / f"words_{folder_name}.csv",
         "lemmas":   video_dir / f"lemmas_{folder_name}.csv",
         "pos":      video_dir / f"pos_{folder_name}.csv",
-        "mutations":video_dir / f"mutations_{folder_name}.csv",
+        "mutations":video_dir / f"mutations_original_{folder_name}.csv",
     }
 
 
@@ -549,9 +584,10 @@ def cleanup_incomplete_video_dirs(vpaths, video_label="video"):
         if value is None:
             continue
         p = Path(value)
-        # captions_dir is itself a directory; every other key is a filename
-        # inside that video's transcription/mutation folder -- take .parent.
-        dirs_to_remove.add(p if key == "captions_dir" else p.parent)
+        # captions_dir and audio_dir are themselves directories; every
+        # other key is a filename inside that video's transcription/
+        # mutation folder -- take .parent for those.
+        dirs_to_remove.add(p if key in ("captions_dir", "audio_dir") else p.parent)
 
     removed = []
     for d in dirs_to_remove:

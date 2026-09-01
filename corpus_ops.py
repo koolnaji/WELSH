@@ -403,9 +403,14 @@ def generate_research_summary(mutation_rows, stamp):
         "bod_suppressed_note":           "bod forms suppressed as targets pre-analysis (not in output rows)",
         "implausible_orth_note":         "implausible-orthography tokens suppressed pre-analysis (not in output rows)",
     }
-    (SUMMARY_DIR / "research_summary").mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([summary]).to_csv(
-        SUMMARY_DIR / "research_summary" / f"research_summary_{stamp}.csv", index=False)
+    # PATCH: session-level summaries now write directly into runs/<stamp>/
+    # (the same folder this run's video subfolders live in) instead of
+    # SUMMARY_DIR/<summary-type>/ -- SUMMARY_DIR is just an alias for
+    # RUNS_DIR now (see corpus_io.py), and a run's own summary files
+    # belong alongside its video folders, not in a separate top-level tree.
+    run_dir = SUMMARY_DIR / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([summary]).to_csv(run_dir / f"research_summary_{stamp}.csv", index=False)
 
     breakdown_rows = []
     trig_df = df[
@@ -429,10 +434,8 @@ def generate_research_summary(mutation_rows, stamp):
                 "low_n_warning":       low_n_warning.strip(),
             })
     if breakdown_rows:
-        (SUMMARY_DIR / "erosion_by_trigger_type").mkdir(parents=True, exist_ok=True)
         pd.DataFrame(breakdown_rows).to_csv(
-            SUMMARY_DIR / "erosion_by_trigger_type" / f"erosion_by_trigger_type_{stamp}.csv",
-            index=False)
+            run_dir / f"erosion_by_trigger_type_{stamp}.csv", index=False)
 
     rule_breakdown = []
     if "rule" in df.columns:
@@ -450,9 +453,8 @@ def generate_research_summary(mutation_rows, stamp):
                 "erosion_rate_hc":  float(group["is_high_confidence_erosion"].mean()),
             })
     if rule_breakdown:
-        (SUMMARY_DIR / "erosion_by_rule").mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rule_breakdown).to_csv(
-            SUMMARY_DIR / "erosion_by_rule" / f"erosion_by_rule_{stamp}.csv", index=False)
+            run_dir / f"erosion_by_rule_{stamp}.csv", index=False)
 
     detection_dist = df["detection_source"].value_counts().to_dict() \
         if "detection_source" in df.columns else {}
@@ -738,13 +740,24 @@ def _is_dns_resolution_error(exc):
     return "getaddrinfo failed" in msg or "failed to resolve" in msg
 
 
-def download_audio(video, max_retries=3):
+def download_audio(video, max_retries=3, audio_dir=None):
     # Titles are neither unique nor stable.  Keying the cache by the source id
     # prevents one video's resume artefact from being mistaken for another's.
+    #
+    # PATCH: audio_dir lets the caller pass this video's own nested folder
+    # (vpaths["audio_dir"] from _video_slug()) so audio lands right next to
+    # that video's transcript/mutation/caption files instead of flat in
+    # AUDIO_DIR -- makes it possible to pair all four by folder, and means
+    # a cleanup pass over one video's data catches its audio too. Falls
+    # back to the old flat AUDIO_DIR if no audio_dir is given, so any
+    # other caller that doesn't have a vpaths dict yet keeps working
+    # unchanged.
+    target_dir = Path(audio_dir) if audio_dir is not None else AUDIO_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
     safe_title = clean_title_for_file(video["title"])
     file_stem  = f"{video['id']}_{safe_title}"
-    raw_path   = AUDIO_DIR / f"{file_stem}.mp3"
-    norm_path  = AUDIO_DIR / f"{file_stem}_norm.mp3"
+    raw_path   = target_dir / f"{file_stem}.mp3"
+    norm_path  = target_dir / f"{file_stem}_norm.mp3"
     if norm_path.exists() and norm_path.stat().st_size > 0:
         return str(norm_path)
     ydl_opts = {
@@ -780,12 +793,33 @@ def download_audio(video, max_retries=3):
              "loudnorm=I=-16:TP=-1.5:LRA=11", "-y", str(norm_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         # PATCH: clean up raw file after successful normalization to avoid
-        # accumulating double storage over long queue runs
+        # accumulating double storage over long queue runs.
+        #
+        # PATCH: even though ffmpeg has already exited by the time
+        # subprocess.run() returns, Windows can hold its handle on
+        # raw_path/norm_path open for a brief moment longer (confirmed via
+        # Resource Monitor -- a lingering ffmpeg.exe handle on both files
+        # right when this raised WinError 32). A single immediate
+        # unlink() can lose that race. Retrying with a short, growing
+        # wait gives Windows time to actually release the handle instead
+        # of failing the whole video over a timing fluke.
         if norm_path.exists():
-            raw_path.unlink(missing_ok=True)
+            for attempt in range(5):
+                try:
+                    time.sleep(0.5 * (attempt + 1))
+                    raw_path.unlink(missing_ok=True)
+                    break
+                except (PermissionError, OSError) as e:
+                    if getattr(e, "winerror", None) != 32 or attempt == 4:
+                        # Not the "file in use" case, or out of attempts --
+                        # leftover raw file isn't fatal, normalized file
+                        # already exists and is what gets used downstream.
+                        tqdm.write(f" ⚠️ Could not remove raw file after "
+                                   f"{attempt + 1} attempt(s), leaving it: {e}")
+                        break
         return str(norm_path)
-    except Exception:
-        tqdm.write(" ⚠️ Normalization failed, using raw file")
+    except Exception as e:
+        tqdm.write(f" ⚠️ Normalization failed, using raw file: {e}")
         return str(raw_path)
 
 

@@ -746,7 +746,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             tqdm.write(f"  Caption fetch failed (continuing without "
                                        f"corroboration): {e}")
 
-                        mp3_path = download_audio(video)
+                        mp3_path = download_audio(video, audio_dir=vpaths["audio_dir"])
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
                             segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
@@ -776,7 +776,8 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         if captions_csv_path is not None and muts:
                             try:
                                 fetch_captions.run_corroboration(
-                                    vpaths["mutations"], captions_csv_path, nlp=nlp, cap_kind=cap_kind)
+                                    vpaths["mutations"], captions_csv_path, nlp=nlp, cap_kind=cap_kind,
+                                    output_path=vpaths["mutations_corroborated"])
                             except SystemExit:
                                 tqdm.write("  Corroboration pass skipped (no matching words file).")
                             except Exception as e:

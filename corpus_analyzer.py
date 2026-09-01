@@ -170,7 +170,12 @@ def interactive_batch_selection(csv_files):
             n_rows        = "?"
             short_sources = ["(unreadable)"]
 
-        m = re.search(r"mutations_(\d{8}_\d{6})", f.name)
+        # PATCH: filenames are now mutations_original_<stamp>_<slug>.csv
+        # or mutations_corroborated_<stamp>_<slug>.csv, not just
+        # mutations_<stamp>_<slug>.csv -- the optional non-capturing group
+        # skips past whichever prefix (or neither, for legacy files) is
+        # present before the actual stamp digits.
+        m = re.search(r"mutations_(?:original_|corroborated_)?(\d{8}_\d{6})", f.name)
         stamp = m.group(1) if m else f.stem
         try:
             dt       = datetime.strptime(stamp, "%Y%m%d_%H%M%S")
@@ -293,28 +298,38 @@ def load_and_merge_mutations():
     Returns the merged DataFrame and a list of (batch_stamp, row_count) tuples.
     """
     # PATCH: mutation CSVs now live one level deeper, in a per-video
-    # subfolder (mutations/<stamp>_<slug>/mutations_<stamp>_<slug>.csv)
+    # subfolder (runs/<stamp>/<slug>/mutations_original_<stamp>_<slug>.csv)
     # rather than flat in MUT_DIR, so this needs to recurse. "_deleted" is
     # excluded since files moved there by interactive_batch_selection()
     # should stay excluded from future runs, not silently reappear.
     #
-    # PATCH: also exclude "*_precaption_backup.csv". fetch_captions.py's
-    # run_corroboration() corroborates a video's mutations file IN PLACE
-    # (adds the caption_corroboration columns directly onto the real
-    # mutations_<stamp>_<slug>.csv) and, before doing that, writes a
-    # one-time backup of the pre-corroboration state to
-    # mutations_<stamp>_<slug>_precaption_backup.csv -- so re-running
-    # corroboration later can't double-corroborate an already-corroborated
-    # file. That backup's name still starts with "mutations_" and ends in
-    # ".csv", so it matched this glob too: every corroborated video was
-    # being loaded twice and every mutation row double-counted in the
-    # merged corpus. The backup is intentional and should stay on disk as
-    # a safety net; it just shouldn't be treated as a second video's worth
-    # of data.
-    csv_files = sorted(
+    # PATCH: mutations_original_ and mutations_corroborated_ are now two
+    # SEPARATE files per video (fetch_captions.run_corroboration() used
+    # to overwrite the original in place, backing it up once to
+    # "*_precaption_backup.csv" -- that backup pattern is gone now, the
+    # original simply never gets touched). Both filenames match
+    # "mutations_*.csv", so for research figures this picks ONE per video:
+    # the corroborated version when it exists (it's a strict superset --
+    # same classification columns, plus the caption cross-check), falling
+    # back to the original when a video was never corroborated (e.g. no
+    # captions were available for it). Without this, every corroborated
+    # video would load twice and double-count its mutation rows in the
+    # merged corpus. "*_precaption_backup.csv" is still excluded for any
+    # older, not-yet-migrated file that predates this split.
+    all_found = [
         p for p in MUT_DIR.rglob("mutations_*.csv")
         if "_deleted" not in p.parts and not p.name.endswith("_precaption_backup.csv")
-    )
+    ]
+    by_video = {}
+    for p in all_found:
+        by_video.setdefault(p.parent, []).append(p)
+    csv_files = []
+    for files in by_video.values():
+        corroborated = [f for f in files if f.name.startswith("mutations_corroborated_")]
+        original     = [f for f in files if f.name.startswith("mutations_original_")]
+        legacy       = [f for f in files if f not in corroborated and f not in original]
+        csv_files.extend(corroborated or original or legacy)
+    csv_files = sorted(csv_files)
     if not csv_files:
         print(f"No mutations_*.csv files found in {MUT_DIR}")
         print("Run the pipeline first to generate mutation data.")
