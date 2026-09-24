@@ -59,6 +59,7 @@ import seaborn as sns
 # the single source of truth: change WELSH_ANALYSIS_DIR once, and every
 # file (pipeline + all three companion tools) follows automatically.
 from corpus_io import BASE_DIR, MUT_DIR, OUT_DIR, FIG_DIR
+import corpus_formality
 
 # Seaborn theme -- clean, publication-friendly.
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
@@ -382,6 +383,153 @@ def load_and_merge_mutations():
     return merged, batch_log
 
 
+# ========================= ASR DIVERGENCE (original vs. corroborated) =========================
+# Discrepancy between mutations_original_ (Whisper's own transcript) and
+# mutations_corroborated_ (cross-checked against YouTube's official captions)
+# is NOT a measure of language change -- it's a proxy for ASR reliability.
+# load_and_merge_mutations() above deliberately picks ONE file per video for
+# the research corpus (corroborated when available); this section instead
+# loads BOTH files for every video where both exist, so the two can be
+# compared directly.
+DIVERGENCE_JOIN_KEYS = ["video_url", "timestamp", "trigger_word", "following_word"]
+
+
+def load_original_corroborated_pairs():
+    """
+    Finds every video with BOTH mutations_original_*.csv and
+    mutations_corroborated_*.csv on disk, and loads both. Videos with only
+    one of the two (never corroborated -- no YouTube captions were available
+    for that video) are skipped, since there's nothing to diverge from.
+    Returns a list of (video_dir, df_original, df_corroborated) tuples.
+    """
+    all_found = [
+        p for p in MUT_DIR.rglob("mutations_*.csv")
+        if "_deleted" not in p.parts and not p.name.endswith("_precaption_backup.csv")
+    ]
+    by_video = {}
+    for p in all_found:
+        by_video.setdefault(p.parent, []).append(p)
+
+    pairs, skipped = [], 0
+    for video_dir, files in by_video.items():
+        corroborated = next((f for f in files if f.name.startswith("mutations_corroborated_")), None)
+        original     = next((f for f in files if f.name.startswith("mutations_original_")), None)
+        if not (corroborated and original):
+            skipped += 1
+            continue
+        try:
+            df_orig = pd.read_csv(original, encoding="utf-8-sig")
+            df_corr = pd.read_csv(corroborated, encoding="utf-8-sig")
+        except Exception as e:
+            print(f"  ⚠️ Could not read pair in {video_dir}: {e}")
+            continue
+        pairs.append((video_dir, df_orig, df_corr))
+
+    print(f"  Loaded {len(pairs)} original/corroborated pair(s) "
+          f"({skipped} video(s) skipped -- never corroborated, nothing to compare).")
+    return pairs
+
+
+def compute_asr_divergence(pairs):
+    """
+    For each (original, corroborated) pair, joins rows on
+    DIVERGENCE_JOIN_KEYS and flags contexts where the erosion verdict
+    (is_erosion) disagrees between the two. `direction` distinguishes the
+    two ways this can go:
+      - "orig_erosion_only":  the raw Whisper transcript alone read as
+        erosion, but the caption-corroborated version did not -- plausibly
+        a transcription artefact reading a standard form as eroded.
+      - "corr_erosion_only":  only the caption-corroborated version reads
+        as erosion -- plausibly Whisper silently "normalising" an eroded
+        form back toward the standard spelling, which would mean erosion
+        rates computed from mutations_original_ alone UNDERSTATE erosion.
+    Callers should run prepare() on each side (for boolean-normalised
+    is_erosion and the channel column) before passing pairs in here.
+    Returns one row per joined mutation context, or an empty DataFrame if
+    no pairs had joinable rows.
+    """
+    rows = []
+    for video_dir, df_orig, df_corr in pairs:
+        keys = [k for k in DIVERGENCE_JOIN_KEYS if k in df_orig.columns and k in df_corr.columns]
+        if "is_erosion" not in df_orig.columns or "is_erosion" not in df_corr.columns or not keys:
+            continue
+
+        # Safety dedup -- each file should already be one row per context,
+        # but a duplicate key would silently fan out the merge otherwise.
+        d_orig = df_orig.drop_duplicates(subset=keys, keep="first")
+        d_corr = df_corr.drop_duplicates(subset=keys, keep="first")
+
+        merged = d_orig.merge(d_corr, on=keys, how="inner", suffixes=("_orig", "_corr"))
+        if merged.empty:
+            continue
+
+        merged["diverges"] = merged["is_erosion_orig"] != merged["is_erosion_corr"]
+
+        def _direction(row):
+            o, c = row["is_erosion_orig"], row["is_erosion_corr"]
+            if pd.isna(o) or pd.isna(c) or o == c:
+                return pd.NA
+            return "orig_erosion_only" if o else "corr_erosion_only"
+        merged["direction"] = merged.apply(_direction, axis=1)
+
+        merged["video_dir"] = str(video_dir)
+        # PATCH (Phase 3): "channel_register" dropped from this loop --
+        # that hand-assigned label is gone; "channel" (the source URL/
+        # slug, unaffected by the removal) is all that's carried through
+        # here now.
+        for col in ("channel",):
+            orig_c, corr_c = f"{col}_orig", f"{col}_corr"
+            if orig_c in merged.columns:
+                merged[col] = merged[orig_c].fillna(merged.get(corr_c))
+            elif col in merged.columns:
+                pass  # unsuffixed column already present (only one side had it)
+
+        rows.append(merged)
+
+    if not rows:
+        print("  No original/corroborated pairs with joinable rows found.")
+        return pd.DataFrame()
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def print_asr_divergence_summary(divergence_df):
+    """
+    Prints divergence rate overall, by direction, and broken down by
+    channel and register -- the register breakdown is the one most likely
+    to matter for the thesis argument (ASR instability concentrated in
+    informal/casual speech vs. formal/scripted).
+    """
+    if divergence_df.empty:
+        return
+    total     = len(divergence_df)
+    n_diverge = int(divergence_df["diverges"].fillna(False).sum())
+
+    print("\n" + "="*70)
+    print("ASR DIVERGENCE  (mutations_original_ vs. mutations_corroborated_)")
+    print("="*70)
+    print(f"Joined mutation contexts (both versions present) : {total:,}")
+    print(f"Divergent erosion classification                  : {n_diverge:,} "
+          f"({n_diverge/total:.1%})" if total else "")
+
+    if "direction" in divergence_df.columns:
+        print("\nDivergence direction:")
+        for d, n in divergence_df["direction"].value_counts(dropna=True).items():
+            print(f"  {d:<20} {n:>6,}")
+
+    if "channel" in divergence_df.columns:
+        print("\nDivergence rate by channel:")
+        for ch, group in divergence_df.groupby("channel"):
+            n    = len(group)
+            rate = group["diverges"].fillna(False).mean()
+            print(f"  {ch:<20} n={n:<6} divergence={rate:.1%}")
+
+    # PATCH (Phase 3): "Divergence rate by register" removed -- that
+    # hand-assigned label is gone. See corpus_formality.py for the
+    # grounded, per-video replacement.
+    print("="*70)
+
+
 def validate_columns(df):
     """
     Warn loudly if expected columns are missing -- pipeline version mismatches
@@ -507,29 +655,28 @@ def _bar_with_counts(ax, x, y, counts, color="#4C72B0", fmt="{:.1f}%"):
 
 
 # ========================= INDIVIDUAL FIGURES =========================
-def fig_erosion_by_type(df, register=None, filename_prefix=""):
+def fig_erosion_by_type(df, filename_prefix=""):
     """
     Horizontal bar chart: erosion rate (%) per expected mutation type.
     Excludes code-switch rows and phantom rows (no expected mutation type).
     Colour-coded per mutation type for consistency with other figures.
 
-    PATCH: takes an optional `register` filter ("formal" / "informal" /
-    "casual"), same reasoning as fig_erosion_by_rule -- formal (BBC Radio
-    Cymru), informal (Hansh / Rownd a Rownd / S4C), and casual (fully
-    spontaneous unscripted speech, e.g. podcasts) have different erosion
-    baselines, so this is called once per register from main().
+    PATCH (Phase 3): the per-`register` split (formal/informal/casual,
+    called 3x from main()) is gone -- channel_register was a hand-
+    assigned, per-channel label. See corpus_formality.py for the grounded,
+    per-video, continuous replacement; the formal/informal/casual
+    comparison this project is built around now runs as an erosion-vs-
+    formality-score regression instead of three separately-filtered
+    copies of this figure. `filename_prefix` stays as a plain parameter
+    (unused by main() currently, kept for any future caller that wants a
+    differently-scoped copy of this figure without duplicating the
+    function).
     """
     if "expected_mutation" not in df.columns or "is_erosion" not in df.columns:
         print(f"  [skip] {filename_prefix}erosion_by_type -- missing columns")
         return
 
     sub = df
-    if register is not None:
-        if "channel_register" not in df.columns:
-            print(f"  [skip] {filename_prefix}erosion_by_type -- missing channel_register column")
-            return
-        sub = sub[sub["channel_register"] == register]
-
     sub = sub[(sub["is_code_switch"].isin([False])) & (sub["trigger_word"] != "[OMITTED]")] \
         if "is_code_switch" in sub.columns else sub
     # Restrict to evaluable contexts only -- phantom, selective invariant,
@@ -547,14 +694,13 @@ def fig_erosion_by_type(df, register=None, filename_prefix=""):
         print(f"  [skip] {filename_prefix}erosion_by_type -- insufficient data")
         return
 
-    title_suffix = f" -- {register.capitalize()} register" if register else ""
     fig, ax = plt.subplots(figsize=(8, max(3, len(grouped) * 0.6)))
     colors = [MUTATION_COLORS.get(m, MUTATION_COLORS["other"])
               for m in grouped["expected_mutation"]]
     _bar_with_counts(ax, grouped["expected_mutation"],
                      grouped["erosion_rate"] * 100,
                      grouped["contexts"], color=colors)
-    ax.set_title(f"Mutation Erosion Rate by Expected Mutation Type{title_suffix}",
+    ax.set_title("Mutation Erosion Rate by Expected Mutation Type",
                  fontweight="bold", pad=12)
     ax.set_xlabel("Erosion Rate (%)")
     ax.set_ylabel("Expected Mutation Type")
@@ -562,7 +708,7 @@ def fig_erosion_by_type(df, register=None, filename_prefix=""):
     _save(fig, f"{filename_prefix}erosion_by_type.png")
 
 
-def fig_erosion_by_rule(df, register=None, filename_prefix=""):
+def fig_erosion_by_rule(df, filename_prefix=""):
     """
     Horizontal bar chart: erosion rate per detection rule
     (word_trigger, definite_article+fem_noun, fem_noun+adjective,
@@ -570,25 +716,14 @@ def fig_erosion_by_rule(df, register=None, filename_prefix=""):
     This is the figure that most directly shows which grammatical
     environments are most at risk -- key for the assimilation argument.
 
-    PATCH: takes an optional `register` filter ("formal" / "informal" /
-    "casual"). Formal (BBC Radio Cymru, scripted/edited), informal (Hansh,
-    Rownd a Rownd, S4C -- produced but colloquial), and casual (fully
-    spontaneous unscripted peer speech, e.g. podcasts) have structurally
-    different erosion baselines, so pooling them into one chart blurs
-    exactly the register contrast the research is trying to measure.
-    Called once per register from main(), instead of once on the mixed pool.
+    PATCH (Phase 3): the per-`register` split is gone, same reasoning as
+    fig_erosion_by_type -- see that function's docstring.
     """
     if "rule" not in df.columns or "is_erosion" not in df.columns:
         print(f"  [skip] {filename_prefix}erosion_by_rule -- missing columns")
         return
 
     sub = df
-    if register is not None:
-        if "channel_register" not in df.columns:
-            print(f"  [skip] {filename_prefix}erosion_by_rule -- missing channel_register column")
-            return
-        sub = sub[sub["channel_register"] == register]
-
     sub = sub[sub["is_code_switch"].isin([False])] if "is_code_switch" in sub.columns else sub
     sub = sub[sub["rule"] != "phantom_check"]
     # Restrict to evaluable contexts only
@@ -605,11 +740,10 @@ def fig_erosion_by_rule(df, register=None, filename_prefix=""):
         print(f"  [skip] {filename_prefix}erosion_by_rule -- insufficient data")
         return
 
-    title_suffix = f" -- {register.capitalize()} register" if register else ""
     fig, ax = plt.subplots(figsize=(9, max(3, len(grouped) * 0.65)))
     _bar_with_counts(ax, grouped["rule"], grouped["erosion_rate"] * 100,
                      grouped["contexts"], color="#4C72B0")
-    ax.set_title(f"Mutation Erosion Rate by Detection Rule{title_suffix}\n"
+    ax.set_title("Mutation Erosion Rate by Detection Rule\n"
                  "(grammatical environment)", fontweight="bold", pad=12)
     ax.set_xlabel("Erosion Rate (%)")
     ax.set_ylabel("Detection Rule")
@@ -980,31 +1114,19 @@ def fig_tagger_agreement(df):
     _save(fig, "tagger_agreement.png")
 
 
-def fig_erosion_over_batches(df, batch_log, register=None, filename_prefix=""):
+def fig_erosion_over_batches(df, batch_log, filename_prefix=""):
     """
     Line chart: overall erosion rate per batch run, ordered chronologically.
     Lets you track whether successive corpus runs converge on a stable estimate.
 
-    PATCH: takes an optional `register` filter ("formal" / "informal" /
-    "casual"). A single batch/run can mix videos from multiple registers
-    (e.g. a queue that pulled BBC Radio Cymru and Hansh videos together),
-    so filtering by
-    register happens on the rows within each batch, not by excluding whole
-    batches. Needs its own >=2-batches-with-data check per register, since a
-    register that's only ever appeared in one run so far can't show a trend
-    yet even if the unfiltered pool has plenty of batches.
+    PATCH (Phase 3): the per-`register` split is gone, same reasoning as
+    fig_erosion_by_type -- see that function's docstring.
     """
     if "batch" not in df.columns or "is_erosion" not in df.columns:
         print(f"  [skip] {filename_prefix}erosion_over_batches -- missing columns")
         return
 
     sub = df
-    if register is not None:
-        if "channel_register" not in df.columns:
-            print(f"  [skip] {filename_prefix}erosion_over_batches -- missing channel_register column")
-            return
-        sub = sub[sub["channel_register"] == register]
-
     sub = sub[sub["is_code_switch"].isin([False])] if "is_code_switch" in sub.columns else sub
     # Restrict to evaluable contexts only
     if "status" in sub.columns:
@@ -1013,7 +1135,7 @@ def fig_erosion_over_batches(df, batch_log, register=None, filename_prefix=""):
     n_batches = sub["batch"].nunique() if "batch" in sub.columns else 0
     if n_batches < 2:
         print(f"  [skip] {filename_prefix}erosion_over_batches -- need at least 2 batches "
-              f"with {register or 'any'} data to plot a trend (found {n_batches})")
+              f"to plot a trend (found {n_batches})")
         return
 
     batch_rates = sub.groupby("batch").agg(
@@ -1033,10 +1155,9 @@ def fig_erosion_over_batches(df, batch_log, register=None, filename_prefix=""):
                     textcoords="offset points", xytext=(0, 10),
                     ha="center", fontsize=8)
 
-    title_suffix = f" -- {register.capitalize()} register" if register else ""
     ax.set_xlabel("Batch (run timestamp)")
     ax.set_ylabel("Erosion Rate (%)")
-    ax.set_title(f"Overall Erosion Rate Across Successive Batches{title_suffix}\n"
+    ax.set_title("Overall Erosion Rate Across Successive Batches\n"
                  "(convergence check)", fontweight="bold", pad=12)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
     plt.xticks(rotation=30, ha="right")
@@ -1070,6 +1191,111 @@ def fig_collision_flags(df):
         ax.text(count + 0.2, i, str(count), va="center", fontsize=9)
     fig.tight_layout()
     _save(fig, "collision_flags.png")
+
+
+# ========================= FORMALITY (Phase 4) =========================
+def _per_video_erosion_rates(df, min_contexts=5):
+    """
+    One row per video_url: erosion rate + context count, restricted to
+    EVALUABLE_STATUSES (same discipline as every other erosion-rate
+    figure in this file). min_contexts=5 matches the low-N guard already
+    used elsewhere (e.g. fig_erosion_by_type's `contexts >= 5`) -- a
+    video with only a handful of mutation contexts gives too noisy a
+    per-video rate to plot as a single point.
+    """
+    sub = df
+    if "status" in sub.columns:
+        sub = sub[sub["status"].isin(EVALUABLE_STATUSES)]
+    if sub.empty or "video_url" not in sub.columns or "is_erosion" not in sub.columns:
+        return pd.DataFrame()
+    per_video = sub.groupby("video_url").agg(
+        erosion_rate=("is_erosion", "mean"),
+        contexts=("is_erosion", "count"),
+    ).reset_index()
+    return per_video[per_video["contexts"] >= min_contexts]
+
+
+def fig_erosion_vs_formality(df, formality_df):
+    """
+    Scatter + linear regression: per-video erosion rate vs. formality
+    score (Heylighen-Dewaele F-score, corpus_formality.py) -- the direct
+    test of the formal/informal/casual comparison this project is built
+    around, now against a grounded, continuous, per-video measurement
+    instead of channel_register's hand-assigned per-channel label.
+    Replaces the old formal_/informal_/casual_ erosion_by_type/
+    erosion_by_rule/erosion_over_batches figure sets.
+    """
+    if formality_df.empty or "f_score" not in formality_df.columns:
+        print("  [skip] erosion_vs_formality -- no formality data")
+        return
+    per_video = _per_video_erosion_rates(df)
+    if per_video.empty:
+        print("  [skip] erosion_vs_formality -- no evaluable per-video erosion rates")
+        return
+
+    merged = per_video.merge(formality_df[["video_url", "f_score"]], on="video_url", how="inner")
+    merged = merged.dropna(subset=["f_score"])
+    if len(merged) < 3:
+        print(f"  [skip] erosion_vs_formality -- need at least 3 videos with both "
+              f"an erosion rate and a formality score (found {len(merged)})")
+        return
+    merged["erosion_rate_pct"] = merged["erosion_rate"] * 100
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.regplot(data=merged, x="f_score", y="erosion_rate_pct", ax=ax,
+                scatter_kws={"s": merged["contexts"].clip(upper=200), "alpha": 0.6},
+                line_kws={"color": "#C44E52"})
+    r = merged["f_score"].corr(merged["erosion_rate_pct"])
+    ax.set_xlabel("Formality Score (Heylighen-Dewaele F, higher = more formal)")
+    ax.set_ylabel("Erosion Rate (%)")
+    ax.set_title(f"Mutation Erosion Rate vs. Formality Score\n"
+                 f"(per video, n={len(merged)}, r={r:.2f}; point size = context count)",
+                 fontweight="bold", pad=12)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    fig.tight_layout()
+    _save(fig, "erosion_vs_formality.png")
+
+
+def fig_erosion_vs_codeswitch(df, formality_df):
+    """
+    Scatter + linear regression: per-video erosion rate vs. whole-
+    transcript code-switch rate -- reported as its OWN figure, separate
+    from formality (see corpus_formality.py's module docstring for why):
+    a real, independent contact-intensity signal, but mixing it into the
+    formality composite would muddy whether an erosion-formality
+    correlation reflects formality itself or just how much English is in
+    the room.
+    """
+    if formality_df.empty or "codeswitch_rate" not in formality_df.columns:
+        print("  [skip] erosion_vs_codeswitch -- no formality data")
+        return
+    per_video = _per_video_erosion_rates(df)
+    if per_video.empty:
+        print("  [skip] erosion_vs_codeswitch -- no evaluable per-video erosion rates")
+        return
+
+    merged = per_video.merge(formality_df[["video_url", "codeswitch_rate"]], on="video_url", how="inner")
+    merged = merged.dropna(subset=["codeswitch_rate"])
+    if len(merged) < 3:
+        print(f"  [skip] erosion_vs_codeswitch -- need at least 3 videos with both "
+              f"an erosion rate and a code-switch rate (found {len(merged)})")
+        return
+    merged["erosion_rate_pct"]    = merged["erosion_rate"] * 100
+    merged["codeswitch_rate_pct"] = merged["codeswitch_rate"] * 100
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.regplot(data=merged, x="codeswitch_rate_pct", y="erosion_rate_pct", ax=ax,
+                scatter_kws={"s": merged["contexts"].clip(upper=200), "alpha": 0.6},
+                line_kws={"color": "#C44E52"})
+    r = merged["codeswitch_rate_pct"].corr(merged["erosion_rate_pct"])
+    ax.set_xlabel("Code-Switch Rate (%, whole transcript)")
+    ax.set_ylabel("Erosion Rate (%)")
+    ax.set_title(f"Mutation Erosion Rate vs. Code-Switch Rate\n"
+                 f"(per video, n={len(merged)}, r={r:.2f}; point size = context count)",
+                 fontweight="bold", pad=12)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    fig.tight_layout()
+    _save(fig, "erosion_vs_codeswitch.png")
 
 
 # ========================= SUMMARY TABLE =========================
@@ -1132,15 +1358,10 @@ def print_corpus_summary(df, batch_log):
             print("Total video analyzed                : unavailable "
                   "(older CSVs predate duration tracking)")
 
-        if "channel_register" in video_level.columns:
-            print("  by register:")
-            for reg, group in video_level.groupby("channel_register"):
-                reg_n = len(group)
-                if has_duration:
-                    reg_min = group["video_duration_seconds"].fillna(0).sum() / 60
-                    print(f"    {reg:<12} {reg_n:>4} videos, {reg_min:>8,.1f} min")
-                else:
-                    print(f"    {reg:<12} {reg_n:>4} videos")
+        # PATCH (Phase 3): the "by register" breakdown that used to sit
+        # here is gone -- channel_register was a hand-assigned, per-
+        # channel label. See corpus_formality.py for the grounded, per-
+        # video replacement.
 
     # PATCH: unfiltered row counts (every status -- correct, erosion,
     # phantom, code-switch, mismatch, everything) per channel and per
@@ -1242,21 +1463,45 @@ def main():
 
     print_corpus_summary(df, batch_log)
 
+    print("\nComputing ASR divergence (original vs. corroborated)...")
+    pairs         = load_original_corroborated_pairs()
+    pairs         = [(vd, prepare(do), prepare(dc)) for vd, do, dc in pairs]
+    divergence_df = compute_asr_divergence(pairs)
+    if not divergence_df.empty:
+        divergence_path = OUT_DIR / "asr_divergence.csv"
+        divergence_df.to_csv(divergence_path, index=False, encoding="utf-8-sig",
+                              quoting=csv.QUOTE_MINIMAL)
+        print(f"ASR divergence export saved: {divergence_path.name} "
+              f"({len(divergence_df):,} rows)")
+    print_asr_divergence_summary(divergence_df)
+
     print("\nGenerating figures...")
-    fig_erosion_by_type(df, register="formal",   filename_prefix="formal_")
-    fig_erosion_by_type(df, register="informal", filename_prefix="informal_")
-    fig_erosion_by_type(df, register="casual",   filename_prefix="casual_")
-    fig_erosion_by_rule(df, register="formal",   filename_prefix="formal_")
-    fig_erosion_by_rule(df, register="informal", filename_prefix="informal_")
-    fig_erosion_by_rule(df, register="casual",   filename_prefix="casual_")
+    # PATCH (Phase 3): the 3x-per-register calls that used to sit here
+    # (formal/informal/casual) are gone along with channel_register
+    # itself -- each figure is now generated once, unfiltered. The
+    # formal-vs-informal comparison this project is built around now runs
+    # against the grounded, per-video formality score instead (see
+    # corpus_formality.py and its erosion-vs-formality figure, called
+    # below).
+    fig_erosion_by_type(df)
+    fig_erosion_by_rule(df)
     fig_erosion_by_channel(df)
     fig_codeswitch_by_channel(df)
     fig_status_distribution(df)
     fig_tagger_agreement(df)
-    fig_erosion_over_batches(df, batch_log, register="formal",   filename_prefix="formal_")
-    fig_erosion_over_batches(df, batch_log, register="informal", filename_prefix="informal_")
-    fig_erosion_over_batches(df, batch_log, register="casual",   filename_prefix="casual_")
+    fig_erosion_over_batches(df, batch_log)
     fig_collision_flags(df)
+
+    print("\nComputing per-video formality scores (corpus_formality.py)...")
+    formality_df = corpus_formality.build_video_formality_table()
+    if not formality_df.empty:
+        formality_path = OUT_DIR / "video_formality.csv"
+        formality_df.to_csv(formality_path, index=False, encoding="utf-8-sig")
+        print(f"Formality scores saved: {formality_path.name} ({len(formality_df):,} videos)")
+        fig_erosion_vs_formality(df, formality_df)
+        fig_erosion_vs_codeswitch(df, formality_df)
+    else:
+        print("  [skip] no formality data computed -- see corpus_formality.py output above")
 
     export_utterance_level(df)
 

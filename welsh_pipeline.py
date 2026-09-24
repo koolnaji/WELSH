@@ -9,7 +9,7 @@ Whisper model -- all the actual linguistics and corpus I/O live in
 mutation_engine.py and corpus_ops.py.
 
 For queue-processed (YouTube) videos, caption corroboration
-(fetch_captions.py) now runs automatically per video: captions are fetched
+(mutation_captions.py) now runs automatically per video: captions are fetched
 before transcription, and the corroboration pass runs immediately after
 that video's mutations are written -- no separate manual step. Local MP3
 batches (choice 1) skip this, since local files have no YouTube video ID
@@ -53,7 +53,7 @@ import corpus_analyzer
 # lazy-imported inside a menu branch -- it's no longer an optional manual
 # step (former option 8), it's part of the standard choice-3 video loop
 # now (see below), so it needs to be available every time that loop runs.
-import fetch_captions
+import mutation_captions as fetch_captions
 
 import csv
 import pandas as pd
@@ -85,7 +85,7 @@ def manage_queue():
             if not queue:
                 print("  Queue is empty.")
             else:
-                print(f"\n  {'#':<5} {'Title':<50} {'Register':<12} {'Source'}")
+                print(f"\n  {'#':<5} {'Title':<50} {'Source'}")
                 print("  " + "-" * 95)
                 for i, v in enumerate(queue):
                     src = v.get("source", "?")
@@ -96,8 +96,7 @@ def manage_queue():
                     # prefers the CURATED_CHANNELS entry's explicit "name".
                     src_short = channel_display_name(src)
                     title = v.get("title", v.get("id", "?"))[:48]
-                    reg   = v.get("channel_register", "unverified")
-                    print(f"  {i:<5} {title:<50} {reg:<12} {src_short}")
+                    print(f"  {i:<5} {title:<50} {src_short}")
 
         elif cmd == "b":
             if not queue:
@@ -206,15 +205,6 @@ def manage_queue():
             # normalise to full URL
             if not url.startswith("http"):
                 url = f"https://www.youtube.com/watch?v={url}"
-            # PATCH: register isn't inferrable from a one-off URL the way it
-            # is from CURATED_CHANNELS, so ask explicitly. Defaults to
-            # "unverified" (not "informal"/"formal") if left blank, so it
-            # doesn't silently slide into either side of a register
-            # comparison without a deliberate choice.
-            reg = input("  Channel register (formal/informal/unverified) [unverified]: ").strip().lower() or "unverified"
-            if reg not in ("formal", "informal", "unverified"):
-                print(f"  Unrecognized register '{reg}', defaulting to 'unverified'.")
-                reg = "unverified"
             opts = {"quiet": True, "no_warnings": True}
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -227,10 +217,9 @@ def manage_queue():
                     print(f"  Already in queue: {title}")
                 else:
                     queue.append({"id": vid_id, "url": url,
-                                  "title": title, "source": source,
-                                  "channel_register": reg})
+                                  "title": title, "source": source})
                     save_queue(queue)
-                    print(f"  Added: {title} [{reg}]")
+                    print(f"  Added: {title}")
             except Exception as e:
                 print(f"  Failed to fetch video info: {e}")
 
@@ -239,21 +228,19 @@ def manage_queue():
                 print("  Queue is empty.")
                 continue
             from collections import Counter
-            sources = [(channel_display_name(v.get("source", "?")), v.get("channel_register", "unverified"))
-                       for v in queue]
+            # PATCH (Phase 3): register-level rollup removed -- that hand-
+            # assigned label is gone. See corpus_formality.py for the
+            # grounded, per-video replacement (computed after
+            # transcription, so it has nothing to show for a still-queued,
+            # unprocessed video anyway).
+            sources = [channel_display_name(v.get("source", "?")) for v in queue]
             counts  = Counter(sources).most_common()
-            print(f"\n  {'Channel':<40} {'Register':<12} {'Videos':>7}")
-            print("  " + "-" * 61)
-            for (s, reg), n in counts:
-                print(f"  {s:<40} {reg:<12} {n:>7}")
-            print("  " + "-" * 61)
-            print(f"  {'TOTAL':<40} {'':<12} {len(queue):>7}")
-            # PATCH: register-level rollup, useful for eyeballing corpus
-            # balance between formal/informal before a big processing run
-            reg_counts = Counter(v.get("channel_register", "unverified") for v in queue)
-            print("\n  By register:")
-            for reg, n in reg_counts.most_common():
-                print(f"    {reg:<12} {n:>7}")
+            print(f"\n  {'Channel':<40} {'Videos':>7}")
+            print("  " + "-" * 48)
+            for s, n in counts:
+                print(f"  {s:<40} {n:>7}")
+            print("  " + "-" * 48)
+            print(f"  {'TOTAL':<40} {len(queue):>7}")
 
         else:
             print("  Unknown command.")
@@ -483,25 +470,19 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     continue
                 print(f"Found {len(mp3_files)} local MP3 file(s).")
                 print(f"Processing {len(pending_mp3_files)} new or changed file(s).")
-                # PATCH: register isn't inferrable from a local filename, so ask
-                # once up front and tag the whole batch -- assumes test_audio/
-                # is register-homogeneous per run. If you're mixing registers in
-                # the same folder, run this twice with different subsets instead
-                # of trusting one tag for all of them.
-                # Three-tier register scale, most to least formal:
-                # formal (e.g. BBC Radio Cymru) > informal (e.g. Hansh/S4C,
-                # produced-but-informal content) > casual (fully spontaneous,
-                # unscripted peer conversation -- e.g. podcasts like Haclediad).
-                local_reg = input("  Channel register for this local batch "
-                                  "(formal/informal/casual/unverified) [unverified], or q to cancel: "
-                                  ).strip().lower() or "unverified"
-                if local_reg == "q":
+                # PATCH (Phase 3): the channel-register prompt that used to
+                # sit here is gone -- that hand-assigned, per-batch label had
+                # no way to be checked against anything measurable. See
+                # corpus_formality.py for the grounded, per-video replacement
+                # (computed after transcription, not assigned up front, so
+                # there's nothing to prompt for at this point in the flow).
+                # Keeping its one other job -- a cancel point before the
+                # slow, RAM-heavy model load below -- as its own prompt.
+                if input(f"  Press Enter to process {len(pending_mp3_files)} "
+                         f"file(s), or q to cancel: ").strip().lower() == "q":
                     print("  Cancelled.")
                     save_lemma_cache()
                     continue
-                if local_reg not in ("formal", "informal", "casual", "unverified"):
-                    print(f"  Unrecognized register '{local_reg}', defaulting to 'unverified'.")
-                    local_reg = "unverified"
                 # PATCH: save-or-preview toggle. Lets you sanity-check a new or
                 # unfamiliar audio source (e.g. how well Whisper handles a
                 # genuinely spontaneous multi-speaker recording) without it
@@ -510,7 +491,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # PHRASE_TEST_DIR keeping option 4's output out of the
                 # corpus-aggregating globs) so you can actually inspect it --
                 # it's just never marked processed, never picked up by the
-                # Analysis menu or rerun_rules.py, and doesn't trigger a
+                # Analysis menu or mutation_rerun_rules.py, and doesn't trigger a
                 # completion email, since nothing was "completed" into the
                 # corpus. Re-running the same file(s) later and choosing
                 # "save" processes them for real -- preview mode never touches
@@ -533,10 +514,9 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 run_type = "Local MP3 batch" if save_results else "Local MP3 batch (preview)"
                 run_start_time = time.time()
                 videos_attempted = len(pending_mp3_files)
-                keys = ["segments", "words", "lemmas", "pos", "mutations"]
+                keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations", "plural_mutations"]
                 for p in tqdm(pending_mp3_files, desc="Videos", unit="video"):
-                    meta = {"title": p.stem, "url": str(p), "source": "local",
-                            "channel_register": local_reg}
+                    meta = {"title": p.stem, "url": str(p), "source": "local"}
                     # PATCH: see matching comment in the choice "3" loop --
                     # vpaths is only assigned once _video_slug() runs below
                     # (after analyze() succeeds), but declaring it here lets
@@ -547,12 +527,12 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     vpaths = None
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                            segs, words, lemmas, pos_r, muts, preps, plurs, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
                         vpaths = _video_slug(meta, stamp) if save_results else _preview_video_slug(meta, stamp)
-                        h = [True] * 5   # fresh header flags per video (new file each time)
+                        h = [True] * 7   # fresh header flags per video (new file each time)
                         any_written = False
-                        for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
+                        for data, key, hi in zip([segs, words, lemmas, pos_r, muts, preps, plurs], keys, range(7)):
                             if data:
                                 append_output_csv(pd.DataFrame(data), vpaths[key], h, hi)
                                 any_written = True
@@ -661,7 +641,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # Reading the module attribute after calling load_spacy() below
                 # gets the live value.
                 nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
-                keys = ["segments", "words", "lemmas", "pos", "mutations"]
+                keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations", "plural_mutations"]
                 for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                     # PATCH: defined before the try block (not just inside it)
                     # so the except block below can tell whether _video_slug()
@@ -723,7 +703,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             # second unpaced extract_info() request per
                             # video for no reason, and was part of what was
                             # tripping YouTube's 429 rate limit on caption
-                            # fetching (see fetch_captions.py PATCH comment).
+                            # fetching (see mutation_captions.py PATCH comment).
                                 tracks = fetch_captions.list_available_tracks(video["url"])
                                 manual_cy, auto_cy, _ = tracks
                                 if manual_cy or auto_cy:
@@ -748,11 +728,11 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
 
                         mp3_path = download_audio(video, audio_dir=vpaths["audio_dir"])
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                            segs, words, lemmas, pos_r, muts, preps, plurs, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
-                        h = [True] * 5   # fresh header flags per video (new file each time)
+                        h = [True] * 7   # fresh header flags per video (new file each time)
                         any_written = False
-                        for data, key, hi in zip([segs, words, lemmas, pos_r, muts], keys, range(5)):
+                        for data, key, hi in zip([segs, words, lemmas, pos_r, muts, preps, plurs], keys, range(7)):
                             if data:
                                 append_output_csv(pd.DataFrame(data), vpaths[key], h, hi)
                                 any_written = True
@@ -826,9 +806,9 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     save_lemma_cache()
                     continue
                 if phrase:
-                    word_rows, lemma_rows, pos_rows, mutation_rows = analyze_phrase(phrase)
+                    word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows = analyze_phrase(phrase)
                     all_mutation_rows = mutation_rows
-                    save_analysis_outputs(stamp, [], word_rows, lemma_rows, pos_rows, mutation_rows)
+                    save_analysis_outputs(stamp, [], word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows)
 
             elif choice == "5":
                 manage_queue()
@@ -849,40 +829,42 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 continue   # skip video-processing summary + email -- nothing was processed here
 
             elif choice == "7":
-                # PATCH: manual_editing.py is intentionally standalone (see its
-                # module docstring -- duplicated constants, no dependency on
-                # mutation_engine actually loading) so it's imported lazily here
-                # rather than at module load time, keeping that independence
-                # intact for people who still run it directly with
-                # `python manual_editing.py`. Its main() parses sys.argv itself;
-                # since this menu invokes it with no extra CLI args, it falls
-                # through to its documented default (every mutations_*.csv under
-                # mutations/, is_erosion==True rows, skipping already-reviewed
-                # ones). For --pick / --sample / --trigger / etc., run
-                # manual_editing.py directly from the command line instead.
-                # Same SystemExit-catch reasoning as option 6: manual_editing.py
-                # calls sys.exit(1) on its own early-exit path (no CSVs found),
+                # PATCH: mutation_manual_editing.py is intentionally standalone
+                # (see its module docstring -- duplicated constants, no
+                # dependency on mutation_engine actually loading) so it's
+                # imported lazily here rather than at module load time, keeping
+                # that independence intact for people who still run it directly
+                # with `python mutation_manual_editing.py`. Its main() parses
+                # sys.argv itself; since this menu invokes it with no extra CLI
+                # args, it falls through to its documented default (every
+                # mutations_*.csv under mutations/, is_erosion==True rows,
+                # skipping already-reviewed ones). For --pick / --sample /
+                # --trigger / etc., run mutation_manual_editing.py directly
+                # from the command line instead. Same SystemExit-catch
+                # reasoning as option 6: mutation_manual_editing.py calls
+                # sys.exit(1) on its own early-exit path (no CSVs found),
                 # which should return to this menu, not kill the pipeline.
-                import manual_editing
+                import mutation_manual_editing
                 try:
-                    manual_editing.main()
+                    mutation_manual_editing.main()
                 except SystemExit:
                     pass
                 save_lemma_cache()
                 continue   # skip video-processing summary + email -- nothing was processed here
 
             elif choice == "8":
-                # PATCH: rerun_rules.py re-evaluates already-cached tagging data
-                # (re-parsing spaCy fresh per segment, reusing cached Cysill
-                # fields, never re-transcribing or re-hitting Cysill) after a
-                # change to a rule in mutation_engine.py or a table in
-                # mutation_tables.py -- see rerun_rules.py's module docstring
-                # for exactly what it does and doesn't touch. Unlike choice 7,
-                # this genuinely has no sensible default (there's no "just rerun
-                # everything" mode by design -- that's what choice 3 is for), so
-                # the filter has to be gathered here rather than falling through
-                # to a documented default the way manual_editing.py's does.
-                import rerun_rules
+                # PATCH: mutation_rerun_rules.py re-evaluates already-cached
+                # tagging data (re-parsing spaCy fresh per segment, reusing
+                # cached Cysill fields, never re-transcribing or re-hitting
+                # Cysill) after a change to a rule in mutation_engine.py or a
+                # table in mutation_tables.py -- see mutation_rerun_rules.py's
+                # module docstring for exactly what it does and doesn't touch.
+                # Unlike choice 7, this genuinely has no sensible default
+                # (there's no "just rerun everything" mode by design -- that's
+                # what choice 3 is for), so the filter has to be gathered here
+                # rather than falling through to a documented default the way
+                # mutation_manual_editing.py's does.
+                import mutation_rerun_rules
                 print("\nRe-run mutation rule(s) on already-transcribed videos.")
                 print("Leave both blank to cancel -- at least one is required.")
                 trig_input = input("Trigger word(s), comma-separated (e.g. yn,ei) [blank = any]: ").strip()
@@ -903,7 +885,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         print("Cancelled -- nothing was written.")
                         save_lemma_cache()
                         continue
-                rerun_rules.run_rerun(trigger_arg=trig_input or None,
+                mutation_rerun_rules.run_rerun(trigger_arg=trig_input or None,
                                        rule_arg=rule_input or None,
                                        video=video_input, commit=commit)
                 save_lemma_cache()

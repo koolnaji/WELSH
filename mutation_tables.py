@@ -60,12 +60,22 @@ TRIGGERS = {
     "rhy": "soft", "lled": "soft", "pur": "soft_limited",
     "reit": "soft", "hollol": "soft", "gweddol": "soft",
     "go": "soft", "llwyr": "soft",
-    # PATCH: pre-posed adjectives -- when these precede their noun (instead
-    # of the usual noun+adjective order), the noun takes soft mutation
-    # regardless of gender/number, e.g. "hen ddyn", "rhyw brynhawn",
-    # "ychydig fisoedd", "amryw bethau", "prif fachgen".
-    "hen": "soft", "rhyw": "soft", "ychydig": "soft",
-    "amryw": "soft", "prif": "soft",
+    # PATCH (2.1): "hen"/"rhyw"/"ychydig"/"amryw" removed from here --
+    # they're pre-posed adjectives (see PREPOSED_ADJECTIVE_LEXICON below,
+    # handled by the dependency-checked Layer 1G-bis, which confirms via
+    # spaCy that the word is genuinely functioning as an adjective
+    # modifying the following noun, not e.g. "rhyw" the noun "sex/gender"
+    # -- exactly the ambiguity PREPOSED_ADJECTIVE_LEXICON's own comment
+    # already documented). Having them here TOO meant Layer 1A's plain,
+    # ungated word-trigger path caught them first and consumed the
+    # following word before Layer 1G-bis's dependency check was ever
+    # reached -- the exact same shadowing bug as "yr"/"dau"/"dwy" below,
+    # just for a different pair of layers. "prif" stays here deliberately
+    # -- it's NOT in PREPOSED_ADJECTIVE_LEXICON (see that set's own
+    # comment: it has its own separate mutation-of-the-adjective-itself
+    # rule this simple noun-only layer can't represent), so there's
+    # nothing shadowing it.
+    "prif": "soft",
     "mor": "soft_limited", "cyn": "soft_limited",
     "mae": "soft", "ydy": "soft", "oes": "soft",
     "sy": "soft", "sydd": "soft",
@@ -78,9 +88,20 @@ TRIGGERS = {
     "a": "soft|aspirate", "â": "aspirate",
     "gyda": "aspirate", "tra": "aspirate",
     "yn": "nasal|soft_limited", "ym": "nasal", "yng": "nasal",
-    "yr": "soft_limited",
+    # PATCH (2.1): "yr" removed -- it's one of DEFINITE_ARTICLE_FORMS
+    # ({"y","yr","r"}), handled by Layer 1B (definite_article+fem_noun),
+    # which gates on the target being a feminine, non-plural noun. Having
+    # "yr" here TOO meant Layer 1A's ungated path consumed it first,
+    # so "yr bachgen" (masculine, correctly unmutated) got wrongly scored
+    # erosion via Layer 1A, while the identical construction spelled
+    # "y bachgen"/"r bachgen" correctly reached Layer 1B's gate and wasn't.
+    # "y"/"r" were never in TRIGGERS themselves, so this only affected the
+    # "yr" spelling.
     "fe": "soft", "mi": "soft",
-    "dau": "soft", "dwy": "soft",
+    # PATCH (2.1): "dau"/"dwy" removed -- handled by Layer 1E
+    # (numeral_general+noun), which gates on the target actually being a
+    # noun. Having them here too meant Layer 1A's ungated path consumed
+    # them first, same shadowing bug as "yr" above.
 }
 
 DEFINITE_ARTICLE_FORMS             = {"y", "yr", "r"}

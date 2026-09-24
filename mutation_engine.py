@@ -27,7 +27,10 @@ from tqdm import tqdm
 # spaCy loading/parsing now lives in spacy_tagging.py (see that file for
 # SPACY_NLP/SPACY_AVAILABLE/load_spacy/parse_spacy_doc). load_spacy is
 # re-exported here for welsh_pipeline.py, which imports it from this module.
-from spacy_tagging import load_spacy, parse_spacy_doc
+from spacy_tagging import (
+    load_spacy, parse_spacy_doc, mark_consumed, was_consumed,
+    extract_gender_from_spacy, extract_number_from_spacy,
+)
 import bangor_lexicon
 
 
@@ -106,92 +109,12 @@ from cysill_client import (
 )
 
 
-# PATCH: CURATED_CHANNELS entries now carry a "channel_register" tag
-# alongside the URL. It flows through discover_new_videos -> video queue
-# entries -> video_meta -> every output row (segments/words/lemmas/pos/
-# mutations), so BBC-vs-S4C erosion-rate comparisons become a
-# groupby("channel_register") on the mutation CSVs instead of a manual join
-# reconstructed later.
-#
-# NOTE: deliberately named "channel_register", not "register_class" --
-# register_class already exists as a per-mutation-instance column produced
-# by classify_register_adjustment() below (colloquial_variant / n/a), which
-# is a different concept (documented colloquial variant vs. genuine
-# erosion for one specific mutation). channel_register is about which
-# source/channel a video came from. Do not merge these two columns.
-#
-# Sgorio removed: nominally Welsh-language sports coverage, but verified
-# (Vkq5, 2026-07) to be virtually all-English in practice -- was silently
-# contaminating the "informal Welsh" bucket with non-Welsh audio.
-#
-# "unverified" register: channel is plausibly Welsh-medium but its actual
-# language mix hasn't been spot-checked yet. Don't fold these into any
-# side of a formal/informal/casual comparison until checked -- see BBC
-# Cymru Wales below, which is a general bilingual channel (TV/Radio/
-# Online), not confirmed Welsh-medium.
-#
-# Register scale, most to least formal: formal (BBC Radio Cymru) >
-# informal (Hansh / Rownd a Rownd / S4C -- produced but informal) >
-# casual (fully spontaneous, unscripted peer conversation -- e.g.
-# podcasts like Haclediad). Casual sources currently only enter via the
-# local-MP3 path (option 1's register prompt in welsh_pipeline.py), not
-# CURATED_CHANNELS, since none of these are YouTube channels yet.
-CURATED_CHANNELS = [
-    {"url": "https://www.youtube.com/c/HanshS4C/videos",   "channel_register": "informal"},
-    {"url": "https://www.youtube.com/@RowndaRownd/videos", "channel_register": "informal"},
-    {"url": "https://www.youtube.com/@S4C/videos",         "channel_register": "informal"},
-    {"url": "https://www.youtube.com/@BBCRadio_Cymru/videos", "channel_register": "formal"},
-    # PATCH: BBC Cymru Wales (UCNH53DFjL1OBl3oWNxMmC_Q) removed -- it
-    # sat as "unverified" since it was added (general bilingual channel,
-    # never actually spot-checked as Welsh-medium) and was never going to
-    # be usable in a formal/informal/casual comparison in that state.
-    # Re-add with a real "name" and a decided register if it's ever
-    # verified.
-    #
-    # PATCH: casual-register additions (not YouTube channels -- see
-    # corpus_ops.py's _resolve_entry_url()/_discover_ypod_json() for how
-    # discover_new_videos() handles non-YouTube sources). Each carries an
-    # explicit "name" -- unlike a YouTube channel URL (where the slug in
-    # the URL itself, e.g. "HanshS4C", already reads fine), an RSS path
-    # or cache filename ("rss", "podcast-cwins.json?v=1") tells a human
-    # nothing about the show. prompt_channel_selection() in corpus_ops.py
-    # prefers this field when present.
-    #
-    # Haclediad -- long-running (since 2010), fully spontaneous unscripted
-    # peer conversation between three friends, once a month. Direct
-    # podcast RSS feed, confirmed via haclediad.cymru/subscribe.
-    # PATCH: haclediad.cymru/rss (what /subscribe pointed at) wasn't
-    # actually resolving through yt-dlp -- confirmed via search index that
-    # the real canonical feed is hosted directly on Fireside, not served
-    # reliably at the custom-domain path. Swapped to the confirmed URL.
-    {"url": "https://feeds.fireside.fm/haclediad/rss", "name": "Haclediad",
-     "channel_register": "casual"},
-    # Colli'r Plot (Y Pod) -- four novelists chatting about books and
-    # whatever else, unscripted. RSS feed via its Spreaker host.
-    {"url": "https://www.spreaker.com/show/5059223/episodes/feed",
-     "name": "Colli'r Plot", "channel_register": "casual"},
-    # Pryd ar Dafod (Y Pod) -- casual food-and-chat interview podcast.
-    # Confirmed working: Anchor/Spotify-for-Podcasters publishes a
-    # standard public RSS feed for this show, so it goes through the
-    # normal yt-dlp path like Haclediad/Colli'r Plot -- no need for
-    # the _discover_ypod_json cache adapter after all. That adapter is
-    # left in corpus_ops.py in case a future Y Pod-only show turns out
-    # not to have a real feed the way this one did.
-    {"url": "https://anchor.fm/s/1064d88dc/podcast/rss",
-     "name": "Pryd ar Dafod", "channel_register": "casual"},
-    # Siarad Siop efo Mari a Meilir (Y Pod) -- casual celebrity/pop-culture
-    # banter between two friends, unscripted. Confirmed: this show's Y Pod
-    # cache ID is "cwins" (a legacy name from when it started in 2023 as a
-    # RuPaul's Drag Race UK recap podcast, before broadening into general
-    # pop-culture chat) -- goes through the same ypod_json adapter as Pryd
-    # ar Dafod's cache did. Episode audio URLs here are already direct
-    # content.rss.com links (no Anchor-style play/redirect wrapper), so
-    # _extract_direct_media_url() passes them through unchanged -- verified
-    # working against this show's actual cache response, not guessed.
-    {"url": "https://ypod.cymru/beta/s/cache/podcast-cwins.json?v=1",
-     "name": "Siarad Siop efo Mari a Meilir",
-     "channel_register": "casual", "type": "ypod_json"},
-]
+# PATCH: CURATED_CHANNELS relocated to corpus_io.py -- channel/video-
+# discovery config, not mutation linguistics, and this module's own
+# docstring claims to be self-contained/independent of how audio gets fed
+# into it. See corpus_io.py's own comment for the full rationale, and for
+# why entries no longer carry a "channel_register" tag (replaced by the
+# per-video formality score in corpus_formality.py).
 
 # ========================= MUTATION TABLES =========================
 # All pure linguistic data now lives in mutation_tables.py -- see that
@@ -411,15 +334,13 @@ def get_welsh_lemma(word):
         LEMMA_CACHE[w] = lemma
     return lemma
 
-def extract_gender_from_spacy(spacy_token):
-    if not spacy_token:
-        return None
-    g = spacy_token.get("gender")
-    if g == "Fem":
-        return "feminine"
-    elif g == "Masc":
-        return "masculine"
-    return None
+# extract_gender_from_spacy/extract_number_from_spacy now live in
+# spacy_tagging.py (imported below with load_spacy/parse_spacy_doc) --
+# reading a generic UD morph feature off a spaCy token isn't mutation-
+# specific logic, and prep_engine.py/plural_engine.py need the same
+# capability without importing this module's internals just to get it.
+# Re-exported here under the same names so every existing call site in
+# this file keeps working unchanged.
 
 # PATCH: the fem_noun+adjective / definite_article+fem_noun mutation rules
 # (Layers 1B/1C/1C-bis) are specifically a FEMININE SINGULAR phenomenon --
@@ -430,16 +351,6 @@ def extract_gender_from_spacy(spacy_token):
 # as erosion. spaCy's UD morph features already carry Number=Sing/Plur on
 # every token (see the "morph" dict captured at record-build time), so
 # this reads directly off data already being collected, no new dependency.
-def extract_number_from_spacy(spacy_token):
-    if not spacy_token:
-        return None
-    n = (spacy_token.get("morph") or {}).get("Number")
-    if n == "Plur":
-        return "plural"
-    elif n == "Sing":
-        return "singular"
-    return None
-
 def filter_hallucinated_segments(segments):
     clean = []
     for seg in segments:
@@ -1770,17 +1681,31 @@ def _evaluate_mutation_outcome(target_node, expected):
         surface_mut = surface_mut or expected[0]
         note = (f"Correct mutation by radical form: {matched_radical} -> "
                 f"{t2['raw_word']}")
-    elif surface_mut in expected or colloquial_mut in expected:
+    # PATCH (2.4): was `colloquial_mut in expected` -- expected only ever
+    # contains soft/soft_limited/nasal/aspirate/h-mutation (from TRIGGERS/
+    # layer_1_trigger_detection), never the literal string
+    # "colloquial_affricate" itself, so that check could never be true.
+    # colloquial_mut == "colloquial_affricate" is specifically the ts->j
+    # colloquial realization of SOFT mutation on ts-initial loanwords (see
+    # layer_2_lemma_analysis) -- checking "soft" in expected is the
+    # correct condition, not a loosened one. Without this, every
+    # genuinely-correct colloquial affricate mutation (e.g. "i jips") was
+    # falling through to wrong_mutation_type/erosion instead, inflating
+    # erosion counts specifically on loanword/contact material.
+    elif surface_mut in expected or (colloquial_mut is not None and "soft" in expected):
         status, is_erosion = "correct_mutation", False
         note = f"Correct mutation: {surface_mut or colloquial_mut}"
     elif invariant_radical and raw_is_radical:
         status, is_erosion = "selective_invariancy", False
         note = f"Selective Invariancy under {expected}"
     elif raw_is_radical and surface_mut is None:
-        if invariant_radical:
-            status, is_erosion = "selective_invariancy", False
-            note = f"Selective Invariancy under {expected}"
-        elif any(m in expected for m in ["soft", "soft_limited", "nasal", "aspirate"]):
+        # PATCH (2.7): dropped a dead nested `if invariant_radical:` here
+        # -- reaching this elif already implies invariant_radical is
+        # False (the previous elif already required NOT(invariant_radical
+        # and raw_is_radical), and this elif's own condition confirms
+        # raw_is_radical is True, so invariant_radical must be False) --
+        # that branch could never fire. Cosmetic only, no behavior change.
+        if any(m in expected for m in ["soft", "soft_limited", "nasal", "aspirate"]):
             # PATCH: require at least one tagger to have tagged this token with
             # a real POS before calling it erosion. When both taggers return
             # unknown/absent, the radical appearance may be a hallucination,
@@ -1980,8 +1905,62 @@ def _build_cs_row(current_node, target_node, t1, norm_current, conf_current,
 
 
 def _evaluate_feminine_ei(current_node, target_node, trigger_word):
+    """
+    PATCH (2.3): _resolve_feminine_ei_expected classifies the environment
+    (vowel-initial radical -> h-mutation expected; p/t/c-initial radical
+    -> aspirate expected) from a word's RADICAL initial cluster -- that's
+    a property of the underlying lemma, not of whatever surface form was
+    actually spoken. The previous version called it on `t2["raw_word"]`
+    (the observed SURFACE form) via layer_2_lemma_analysis, which has two
+    compounding problems:
+
+    1. For the h-mutation case specifically, layer_2_lemma_analysis's own
+       unconditional "Vowel-Initial" skip fires and returns early BEFORE
+       _resolve_feminine_ei_expected is ever reached -- for BOTH sides:
+       the eroded surface ("afal", vowel-initial itself) and the
+       correctly-mutated surface ("hafal", whose LEMMA "afal" is
+       vowel-initial, so the lemma-or-raw base_form check still trips the
+       same skip). The whole environment was silently invisible, no row
+       either way.
+    2. For the aspirate case, that skip doesn't apply (p/t/c/ph/th/ch
+       aren't vowel-initial), so layer_2_lemma_analysis doesn't bail
+       early -- but _resolve_feminine_ei_expected(t2["raw_word"]) still
+       only ever recognizes the ERODED surface (radical "pen", "p"-initial,
+       matches ASPIRATE_INITIALS). A correctly-aspirated surface ("phen")
+       has cluster "ph", which is in neither WELSH_VOWELS nor
+       ASPIRATE_INITIALS ({"p","t","c"} -- the RADICAL initials, not their
+       mutated forms) -- so correct usage returned None and produced no
+       row, while the eroded case alone kept producing one. That's a
+       one-sided detector: capable of finding erosion in this environment,
+       structurally incapable of ever confirming correct usage.
+
+    Fix: resolve the lemma first (cheap, and needed anyway), classify the
+    environment from the RADICAL (lemma if available, else the raw
+    surface as a fallback -- same fallback shape _evaluate_h_mutation
+    already uses), then dispatch to the h-mutation path (mirroring
+    _evaluate_h_mutation's own dedicated, self-contained evaluation --
+    deliberately NOT reusing layer_2_lemma_analysis/_evaluate_mutation_
+    outcome for that branch, for the exact reason documented on
+    _evaluate_h_mutation itself) or continue through the normal
+    aspirate-branch evaluation, now correctly reachable for both the
+    correct and eroded surface since `expected` no longer depends on
+    which one was actually spoken.
+    """
     if target_node.get("confidence", 0) < 0.65:
         return None
+    raw = normalize_word(target_node["word"])
+    lemma = get_welsh_lemma(raw)
+    if is_english_code_switch(raw, lemma):
+        return None
+    radical_for_classification = lemma or raw
+    expected = _resolve_feminine_ei_expected(radical_for_classification)
+    if expected is None:
+        return None
+
+    if expected == ["h-mutation"]:
+        return _evaluate_feminine_ei_h_mutation(
+            current_node, target_node, trigger_word, raw, lemma)
+
     t2 = layer_2_lemma_analysis(
         target_node["word"],
         cysill_pos=target_node.get("cysill_pos"),
@@ -1989,15 +1968,80 @@ def _evaluate_feminine_ei(current_node, target_node, trigger_word):
     )
     if t2.get("skip_reason"):
         return None
-    expected = _resolve_feminine_ei_expected(t2["raw_word"])
-    if expected is None:
-        return None
     outcome = _evaluate_mutation_outcome(target_node, expected)
     if outcome["skip"]:
         return None
     return _build_row(current_node, target_node, expected, outcome,
                       current_node.get("confidence", 0.0),
                       trigger_word, "feminine_ei")
+
+
+def _evaluate_feminine_ei_h_mutation(current_node, target_node, trigger_word, raw, lemma):
+    """
+    Mirrors _evaluate_h_mutation() (for ein/eu/u before a vowel-initial
+    word) -- same underlying phenomenon, different trigger ("ei", "her",
+    specifically). Kept as its own function rather than merging with
+    _evaluate_h_mutation() directly: that function hardcodes its own rule
+    name ("h_mutation") and note text into the output row, and this
+    environment needs a DIFFERENT rule name ("feminine_ei") to stay
+    distinguishable downstream (manual_editing.py's RULE_DESCRIPTIONS,
+    corpus_analyzer.py's per-rule breakdowns) -- same grammatical
+    phenomenon, different trigger word, tracked separately on purpose.
+    """
+    base_form = normalize_word(lemma) if lemma else (raw[1:] if raw.startswith("h") else raw)
+    if not base_form or base_form[0] not in WELSH_VOWELS:
+        return None
+
+    h_applied  = raw.startswith("h") and not (lemma or "").startswith("h")
+    spacy_tok  = target_node.get("spacy_token")
+    cysill_mut = target_node.get("cysill_mutation_type")
+    cysill_pos = target_node.get("cysill_pos")
+    cysill_has_signal = (bool(target_node.get("cysill_aligned"))
+                          and not target_node.get("locally_resolved"))
+
+    status, is_erosion = ("correct_mutation", False) if h_applied else ("erosion", True)
+    note = "h-mutation correctly applied (feminine 'ei')." if h_applied else \
+        f"**EROSION**: expected h-mutation after {trigger_word} (feminine 'her'), radical used."
+    surface_mut = "h-mutation" if h_applied else None
+
+    confidence, detection_source = compute_confidence(
+        status, is_erosion, spacy_tok, cysill_mut, ["h-mutation"], surface_mut,
+        cysill_genuinely_aligned=cysill_has_signal)
+
+    return {
+        "timestamp":            f"{current_node['start']}s - {target_node['end']}s",
+        "trigger_word":         trigger_word,
+        "rule":                 "feminine_ei",
+        "following_word":       raw,
+        "lemma":                lemma,
+        "expected_mutation":    "h-mutation",
+        "mutation_found":       "h-mutation" if h_applied else "none",
+        "cysill_mutation_type": cysill_mut or "none",
+        "cysill_pos":           cysill_pos,
+        "cysill_coarse_pos":    cysill_coarse_pos(cysill_pos),
+        "spacy_dep":            spacy_tok["dep"] if spacy_tok else "none",
+        "spacy_pos":            spacy_tok["pos"] if spacy_tok else "none",
+        "spacy_coarse_pos":     spacy_coarse_pos(spacy_tok),
+        "pos_compatible":       pos_compatible(cysill_pos, spacy_tok),
+        "spacy_mutation":       spacy_tok["mutation"] if spacy_tok else "none",
+        "spacy_gender":         spacy_tok["gender"] if spacy_tok else "none",
+        "tagger_agreement":     "n/a",
+        "confidence_score":     confidence,
+        "detection_source":     detection_source,
+        "status":               status,
+        "note":                 note,
+        "is_erosion":           is_erosion,
+        "is_high_confidence_erosion": is_erosion and confidence >= EROSION_CONFIDENCE_THRESHOLD,
+        "is_code_switch":       False,
+        "collision_flag":       target_node.get("collision_note"),
+        "trigger_confidence":   current_node.get("confidence", 0.0),
+        "following_confidence": target_node.get("confidence"),
+        "register_class":       "n/a",
+        "radical_candidates":   None,
+        "matched_radical":      None,
+        "expected_surface_forms": None,
+        "locally_resolved":     bool(target_node.get("locally_resolved")),
+    }
 
 
 def _evaluate_mixed_mutation(current_node, target_node, trigger_word):
@@ -2209,7 +2253,27 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
             "nasal": NASAL_MUTATION, "aspirate": ASPIRATE_MUTATION,
         }
         checkable = [e for e in expected if e in mutation_tables]
-        if checkable and not any(radical_cluster in mutation_tables[e] for e in checkable):
+        # PATCH (2.4-followup, found by direct phrase-test verification of
+        # 2.4): colloquial affrication (ts -> j) lives in its own table
+        # (COLLOQUIAL_AFFRICATE_MUTATION), separate from the four tables
+        # this exemption checks -- "ts" is never a key in SOFT_MUTATION
+        # itself. Without this carve-out, ANY ts/j-initial word gets
+        # exempted right here as "this initial can't undergo the expected
+        # mutation" and returns None before ever reaching
+        # _evaluate_mutation_outcome -- meaning fix 2.4's colloquial_mut
+        # check can never fire, not even for the correctly-mutated case
+        # it exists to recognize. Confirmed live: "i jips" produced zero
+        # rows even after 2.4, traced to exactly this gate. Both "ts" (the
+        # radical, when lemma resolution succeeds) and "j" (the already-
+        # mutated surface, which is what `radical_cluster` falls back to
+        # when get_welsh_lemma() has no entry for informal slang like
+        # "jips" -- the same fallback shape used elsewhere in this
+        # function) need to pass through here; "soft" is the only
+        # expected type this is ever relevant for, since colloquial
+        # affrication is specifically a soft-mutation-adjacent phenomenon.
+        colloquial_affricate_eligible = "soft" in expected and radical_cluster in ("ts", "j")
+        if checkable and not colloquial_affricate_eligible and \
+                not any(radical_cluster in mutation_tables[e] for e in checkable):
             return None, lookahead
 
     outcome = _evaluate_mutation_outcome(target_found, expected)
@@ -2396,7 +2460,23 @@ def process_comprehensive_mutations(words_list):
         # item's "pob" as an adjective following "ffaith").
         no_clause_boundary = not current_node.get("_clause_boundary_after")
 
-        if conf_current < 0.65 or len(norm_current) <= 1:
+        # PATCH (found by direct phrase-test verification of the "i jips"
+        # case): `len(norm_current) <= 1` was skipping current_node
+        # entirely before layer_1_trigger_detection ever runs on it --
+        # meant to filter single-character transcription noise (stray
+        # punctuation remnants, orphaned letters), but it makes no
+        # exception for genuine single-character Welsh trigger words.
+        # TRIGGERS contains five of them: "i" (to), "o" (from), "a"
+        # (and/who), "â" (with), "u" (her/their, h-mutation). This meant
+        # NONE of those five triggers have ever been evaluated by Layer
+        # 1A in any run of this pipeline, on any word -- not something
+        # introduced by today's fixes, a pre-existing gap that predates
+        # all of them, confirmed live: "i jips" produced zero rows purely
+        # because "i" itself never reached layer_1_trigger_detection,
+        # regardless of what "jips" resolves to. A single-char word that
+        # ISN'T a recognized trigger is still skipped, same as before --
+        # this only carves out the ones that are.
+        if conf_current < 0.65 or (len(norm_current) <= 1 and norm_current not in TRIGGERS):
             i += 1
             continue
 
@@ -2427,6 +2507,24 @@ def process_comprehensive_mutations(words_list):
                 i, words_list, current_node, norm_current, t1, conf_current)
             if row:
                 mutation_rows.append(row)
+                # PATCH (2.2): mark the target this row is actually about
+                # as consumed -- for Layer 1A specifically, `consumed`
+                # equals the target's own index offset, so i+consumed
+                # becomes `current_node` on the VERY NEXT loop pass, with
+                # nothing previously recording it had already been
+                # scored. Confirmed live-traceable: if that same word also
+                # satisfies Layer 1H (object of a finite verb) or Layer 1I
+                # (vocative), it was getting built into a second,
+                # independent row describing the same mutation event.
+                # Only marked when a row was actually produced (not on
+                # the many exemption/skip paths inside
+                # _process_word_trigger that return None) -- those mean
+                # "this rule doesn't apply here", not "this word's
+                # mutation status was already judged", so the word stays
+                # fully available for 1H/1I's own, independent evaluation.
+                target_idx = i + consumed
+                if 0 <= target_idx < len(words_list):
+                    mark_consumed(words_list[target_idx])
             i += consumed
             continue
 
@@ -2607,7 +2705,11 @@ def process_comprehensive_mutations(words_list):
         # allowed through since most tokens don't carry this feature at
         # all and we don't want to silently stop evaluating rows we're
         # actually uncertain about (same principle as require_target_not_plural).
-        if spacy_tok and spacy_tok.get("dep") in OBJ_DEPS and \
+        # PATCH (2.2): skip if this word was already scored as a mutation
+        # TARGET earlier this pass (see mark_consumed() above / the Layer
+        # 1A block) -- otherwise the same physical mutation event gets
+        # built into a second, independent row here.
+        if not was_consumed(current_node) and spacy_tok and spacy_tok.get("dep") in OBJ_DEPS and \
                 spacy_tok.get("head_dep") in ("ROOT", "ccomp", "xcomp") and \
                 spacy_tok.get("head_verbform") != "Vnoun":
             t2 = layer_2_lemma_analysis(
@@ -2637,7 +2739,8 @@ def process_comprehensive_mutations(words_list):
         # VOCAT_DEPS` to match how OBJ_DEPS is used just above, and so a
         # future second vocative-marking dep label only needs adding in
         # one place.
-        if spacy_tok and spacy_tok.get("dep") in VOCAT_DEPS:
+        # PATCH (2.2): same consumption guard as Layer 1H above.
+        if not was_consumed(current_node) and spacy_tok and spacy_tok.get("dep") in VOCAT_DEPS:
             t2 = layer_2_lemma_analysis(
                 current_node["word"],
                 cysill_pos=cysill_pos,

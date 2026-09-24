@@ -36,6 +36,70 @@ def load_spacy():
         return False
 
 
+def mark_consumed(word_dict):
+    """Marks a word (a dict from the shared preprocessed-word-stream list
+    every detection branch walks) as already having been scored as a
+    mutation TARGET by some rule this pass, so a later rule walking the
+    same list doesn't score the same physical mutation event a second
+    time as if the word were untouched.
+
+    Internal bookkeeping only, same convention as the existing "_seg_id"/
+    "_clause_boundary_after" fields in mutation_engine.py's preprocessing:
+    never leaks into CSV output, since output rows are built from explicit
+    key-selection dicts, not from dumping a word dict wholesale.
+
+    Lives here (not in mutation_engine.py) because every branch that walks
+    this same word stream -- prep_engine.py, plural_engine.py, not just
+    mutation_engine.py -- needs the same protection from the same class of
+    bug: a rule that lands on a word as a TARGET, then advances the loop
+    onto that exact word, where a different, independently-triggered rule
+    could re-score it as if it were untouched. See mutation_engine.py's
+    process_comprehensive_mutations for the confirmed case this fixes
+    (Layer 1A's target reused as Layer 1H/1I's current_node)."""
+    word_dict["_consumed_as_target"] = True
+
+
+def was_consumed(word_dict):
+    """True if mark_consumed() was already called on this word dict this
+    pass."""
+    return bool(word_dict.get("_consumed_as_target"))
+
+
+def extract_gender_from_spacy(spacy_token):
+    """Reads UD Gender morph feature off a parsed token dict (see
+    parse_spacy_doc's "gender" key) into this project's shared friendly
+    vocabulary ("feminine"/"masculine"/None). Relocated here from
+    mutation_engine.py -- reading a generic UD morph feature off a spaCy
+    token isn't mutation-specific logic, and prep_engine.py/
+    plural_engine.py need the same capability without importing
+    mutation_engine.py's internals just to get it. mutation_engine.py
+    still uses this under the same name -- re-exported there via a plain
+    import, so every existing call site keeps working unchanged."""
+    if not spacy_token:
+        return None
+    g = spacy_token.get("gender")
+    if g == "Fem":
+        return "feminine"
+    elif g == "Masc":
+        return "masculine"
+    return None
+
+
+def extract_number_from_spacy(spacy_token):
+    """Reads UD Number morph feature off a parsed token dict into this
+    project's shared friendly vocabulary ("plural"/"singular"/None). Same
+    relocation rationale as extract_gender_from_spacy above -- this is
+    plural_engine.py's primary signal (see that module's docstring)."""
+    if not spacy_token:
+        return None
+    n = (spacy_token.get("morph") or {}).get("Number")
+    if n == "Plur":
+        return "plural"
+    elif n == "Sing":
+        return "singular"
+    return None
+
+
 def parse_spacy_doc(text):
     if SPACY_NLP is None:
         return None

@@ -40,6 +40,7 @@ What deliberately did NOT move here, and why:
 import hashlib
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -147,6 +148,77 @@ PHRASE_TEST_DIR = BASE_DIR / "phrase_tests"
 PREVIEW_DIR = BASE_DIR / "mp3_previews"
 
 
+# ========================= CHANNEL CONFIGURATION =========================
+# PATCH: relocated here from mutation_engine.py, where it sat despite that
+# module's own docstring claiming to be "self-contained... independent of
+# how audio gets fed into it" -- channel/video-discovery config isn't
+# mutation linguistics, it's exactly the "where does config/state live"
+# concern this module already owns everything else of. Moved as part of
+# the file-naming pass (see the project's branch-prefix convention) since
+# a mutation-branch file shouldn't own config every branch needs.
+#
+# PATCH: entries no longer carry a "channel_register" tag. That hand-
+# assigned, per-channel formal/informal/casual label couldn't detect an
+# unusually formal/casual episode from an otherwise-typical channel, and
+# there was no way to check whether the label was actually right -- it
+# wasn't derived from anything measurable. Replaced by a grounded,
+# continuous, per-VIDEO formality score computed from transcript data
+# already collected (see corpus_formality.py) -- computed after the fact,
+# not assigned up front, so it isn't something a CURATED_CHANNELS entry
+# can carry at all.
+#
+# Sgorio removed: nominally Welsh-language sports coverage, but verified
+# (Vkq5, 2026-07) to be virtually all-English in practice -- was silently
+# contaminating the corpus with non-Welsh audio.
+CURATED_CHANNELS = [
+    {"url": "https://www.youtube.com/c/HanshS4C/videos"},
+    {"url": "https://www.youtube.com/@RowndaRownd/videos"},
+    {"url": "https://www.youtube.com/@S4C/videos"},
+    {"url": "https://www.youtube.com/@BBCRadio_Cymru/videos"},
+    # PATCH: casual, fully-spontaneous-speech sources (not YouTube channels
+    # -- see corpus_ops.py's _resolve_entry_url()/_discover_ypod_json() for
+    # how discover_new_videos() handles non-YouTube sources). Each carries
+    # an explicit "name" -- unlike a YouTube channel URL (where the slug in
+    # the URL itself, e.g. "HanshS4C", already reads fine), an RSS path or
+    # cache filename ("rss", "podcast-cwins.json?v=1") tells a human
+    # nothing about the show. prompt_channel_selection() in corpus_ops.py
+    # prefers this field when present.
+    #
+    # Haclediad -- long-running (since 2010), fully spontaneous unscripted
+    # peer conversation between three friends, once a month. Direct
+    # podcast RSS feed, confirmed via haclediad.cymru/subscribe.
+    # PATCH: haclediad.cymru/rss (what /subscribe pointed at) wasn't
+    # actually resolving through yt-dlp -- confirmed via search index that
+    # the real canonical feed is hosted directly on Fireside, not served
+    # reliably at the custom-domain path. Swapped to the confirmed URL.
+    {"url": "https://feeds.fireside.fm/haclediad/rss", "name": "Haclediad"},
+    # Colli'r Plot (Y Pod) -- four novelists chatting about books and
+    # whatever else, unscripted. RSS feed via its Spreaker host.
+    {"url": "https://www.spreaker.com/show/5059223/episodes/feed",
+     "name": "Colli'r Plot"},
+    # Pryd ar Dafod (Y Pod) -- casual food-and-chat interview podcast.
+    # Confirmed working: Anchor/Spotify-for-Podcasters publishes a
+    # standard public RSS feed for this show, so it goes through the
+    # normal yt-dlp path like Haclediad/Colli'r Plot -- no need for
+    # the _discover_ypod_json cache adapter after all. That adapter is
+    # left in corpus_ops.py in case a future Y Pod-only show turns out
+    # not to have a real feed the way this one did.
+    {"url": "https://anchor.fm/s/1064d88dc/podcast/rss",
+     "name": "Pryd ar Dafod"},
+    # Siarad Siop efo Mari a Meilir (Y Pod) -- casual celebrity/pop-culture
+    # banter between two friends, unscripted. Confirmed: this show's Y Pod
+    # cache ID is "cwins" (a legacy name from when it started in 2023 as a
+    # RuPaul's Drag Race UK recap podcast, before broadening into general
+    # pop-culture chat) -- goes through the same ypod_json adapter as Pryd
+    # ar Dafod's cache did. Episode audio URLs here are already direct
+    # content.rss.com links (no Anchor-style play/redirect wrapper), so
+    # _extract_direct_media_url() passes them through unchanged -- verified
+    # working against this show's actual cache response, not guessed.
+    {"url": "https://ypod.cymru/beta/s/cache/podcast-cwins.json?v=1",
+     "name": "Siarad Siop efo Mari a Meilir", "type": "ypod_json"},
+]
+
+
 def ensure_dirs():
     """Creates every output folder up front so the whole output layout is
     visible from the very first run, regardless of which menu options get
@@ -159,6 +231,28 @@ def ensure_dirs():
 
 def run_stamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# You (or migrate_to_new_structure.py's --summaries-only pass) sometimes
+# rename a runs/<stamp> folder to append a personal tracking note --
+# "20260720_212400 (NULL SUMMARY)" while auditing what's missing, say.
+# That annotation is real and useful, but it must never leak into a
+# newly WRITTEN filename: a naive f"research_summary_{stamp}.csv" built
+# from that raw folder name would produce
+# "research_summary_20260720_212400 (NULL SUMMARY).csv" -- a brand new
+# file sitting right next to the correctly-named original, not an
+# update to it. clean_stamp() strips that trailing annotation so any
+# code building a stamp-based FILENAME (never a directory path -- the
+# actual folder on disk keeps whatever name it currently has) gets back
+# to the real stamp underneath.
+_STAMP_ANNOTATION_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def clean_stamp(raw_stamp):
+    """Strip a trailing user-added " (...)" tracking annotation off a
+    stamp string before it's used to build a new filename. A stamp with
+    no annotation is returned unchanged."""
+    return _STAMP_ANNOTATION_RE.sub("", raw_stamp).strip()
 
 
 def run_paths(stamp):
@@ -177,6 +271,8 @@ def run_paths(stamp):
         "lemmas":   PHRASE_TEST_DIR / f"lemmas_{stamp}.csv",
         "pos":      PHRASE_TEST_DIR / f"pos_{stamp}.csv",
         "mutations":PHRASE_TEST_DIR / f"mutations_{stamp}.csv",
+        "prep_mutations": PHRASE_TEST_DIR / f"prep_mutations_{stamp}.csv",
+        "plural_mutations": PHRASE_TEST_DIR / f"plural_mutations_{stamp}.csv",
     }
 
 
@@ -234,6 +330,13 @@ def _video_slug(meta, stamp):
         "pos":      video_dir / f"pos_{folder_name}.csv",
         "mutations":              video_dir / f"mutations_original_{folder_name}.csv",
         "mutations_corroborated": video_dir / f"mutations_corroborated_{folder_name}.csv",
+        # PATCH (Phase 5): own file for the conjugated-preposition branch --
+        # a separate schema/phenomenon from mutation erosion, not merged
+        # into the mutations_*.csv files (see prep_engine.py's docstring).
+        "prep_mutations": video_dir / f"prep_mutations_{folder_name}.csv",
+        # PATCH (Phase 6): same pattern for the plural-marking branch (see
+        # plural_engine.py's docstring).
+        "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
         "captions_dir": video_dir,
         "audio_dir":    video_dir,
     }
@@ -269,6 +372,8 @@ def _preview_video_slug(meta, stamp):
         "lemmas":   video_dir / f"lemmas_{folder_name}.csv",
         "pos":      video_dir / f"pos_{folder_name}.csv",
         "mutations":video_dir / f"mutations_original_{folder_name}.csv",
+        "prep_mutations": video_dir / f"prep_mutations_{folder_name}.csv",
+        "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
     }
 
 

@@ -1,13 +1,16 @@
 """
 corpus_ops.py
 =============
-Everything about moving data in and out of the linguistic engine:
+Everything about moving data in and out of the linguistic engines:
 discovering new videos from CURATED_CHANNELS (with optional per-channel
-filtering), downloading audio, running Whisper + the mutation_engine over
-it (analyze / analyze_phrase), and generating the research-summary
-figures. Queue/processed/failed state logs, output-path layout, and CSV
-persistence mechanics now live in corpus_io.py (imported below) -- this
-file only calls them, it doesn't own them.
+filtering), downloading audio, running Whisper + every detection branch
+over it (analyze / analyze_phrase -- mutation_engine's
+process_comprehensive_mutations, prep_engine's
+process_preposition_erosion, and any future branch added the same way),
+and generating the research-summary figures. Queue/processed/failed state
+logs, output-path layout, and CSV persistence mechanics now live in
+corpus_io.py (imported below) -- this file only calls them, it doesn't
+own them.
 """
 import os
 import re
@@ -23,7 +26,7 @@ import yt_dlp
 from tqdm import tqdm
 
 from mutation_engine import (
-    CURATED_CHANNELS, EROSION_CONFIDENCE_THRESHOLD,
+    EROSION_CONFIDENCE_THRESHOLD, TRIGGERS,
     filter_hallucinated_segments, deduplicate_overlapping_segments,
     preprocess_segment, expand_whisper_tokens, enrich_words,
     normalize_word, get_welsh_lemma, is_english_code_switch,
@@ -43,8 +46,8 @@ from mutation_engine import (
 # in among download/analyze/email code. See corpus_io.py's own docstring
 # for the full rationale.
 from corpus_io import (
-    AUDIO_DIR, SUMMARY_DIR,
-    run_paths,
+    AUDIO_DIR, SUMMARY_DIR, CURATED_CHANNELS,
+    run_paths, clean_stamp,
     load_queue, save_queue, load_processed, save_processed,
     load_failed, save_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
@@ -56,6 +59,8 @@ from corpus_io import (
 # email number. All four now reference this one import.
 from mutation_tables import EVALUABLE_STATUSES
 from youtube_access import YouTubeRateLimited, call as youtube_call
+import prep_engine
+import plural_engine
 
 
 # ========================= EMAIL NOTIFICATION =========================
@@ -124,8 +129,11 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
     Builds an organized HTML run-report email, replacing the old 3-line
     plain-text body. Sections mirror generate_research_summary()'s console
     output (same numbers, same source of truth) plus run-level metadata
-    that summary alone doesn't have: elapsed time, per-video success/
-    failure, and a channel_register breakdown.
+    that summary alone doesn't have: elapsed time and per-video success/
+    failure. (Formerly also a channel_register breakdown -- that hand-
+    assigned per-channel label is gone; see corpus_formality.py for its
+    grounded, per-video replacement, reported separately by
+    corpus_analyzer.py, not in this per-run email.)
 
     `summary` is the dict returned by generate_research_summary() (or None
     if there was no mutation data this run -- e.g. every video failed).
@@ -184,11 +192,12 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
 
         if mutation_rows:
             df = pd.DataFrame(mutation_rows)
-            if "channel_register" in df.columns:
-                reg_counts = df["channel_register"].value_counts().to_dict()
-                parts.append(section("By channel register", "".join(
-                    row(reg.capitalize(), n) for reg, n in
-                    sorted(reg_counts.items(), key=lambda kv: -kv[1]))))
+            # PATCH (Phase 3): the "By channel register" section that used
+            # to sit here is gone -- channel_register was a hand-assigned,
+            # per-channel label with no way to check whether it was
+            # actually right. See corpus_formality.py for its grounded,
+            # per-video replacement; formality-vs-erosion reporting lives
+            # in corpus_analyzer.py, not this per-run email.
 
             # PATCH: tagger_agreement + detection rule breakdowns -- without
             # these, "erosion (all)" is a single trust-everything number.
@@ -236,21 +245,13 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
                         for mut_type, r in by_type.sort_values("count", ascending=False).iterrows()
                     )))
 
-            # Erosion RATE by channel_register -- the actual formal-vs-
-            # informal research comparison this whole project is built
-            # around; previously only row COUNTS per register were shown,
-            # which says nothing about whether erosion differs between them.
-            if {"channel_register", "is_erosion"} <= set(df.columns):
-                evaluable = df[df["status"].isin(
-                    EVALUABLE_STATUSES
-                )] if "status" in df.columns else df
-                if len(evaluable):
-                    by_reg = evaluable.groupby("channel_register")["is_erosion"].agg(["sum", "count"])
-                    parts.append(section("Erosion rate by channel register", "".join(
-                        row(reg.capitalize(), f'{int(r["sum"])}/{int(r["count"])} '
-                            f'({r["sum"] / r["count"]:.1%})')
-                        for reg, r in by_reg.sort_values("count", ascending=False).iterrows()
-                    )))
+            # PATCH (Phase 3): "Erosion rate by channel_register" removed --
+            # the formal-vs-informal research comparison this project is
+            # built around now runs against the grounded, per-video
+            # formality score (corpus_formality.py) instead of a hand-
+            # assigned per-channel label, and that comparison is reported
+            # by corpus_analyzer.py against the full corpus, not
+            # recomputed per-run here against just this run's videos.
 
             # Full status distribution as percentages -- the same
             # breakdown as corpus_analyzer.py's stacked-bar chart
@@ -410,7 +411,7 @@ def generate_research_summary(mutation_rows, stamp):
     # belong alongside its video folders, not in a separate top-level tree.
     run_dir = SUMMARY_DIR / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([summary]).to_csv(run_dir / f"research_summary_{stamp}.csv", index=False)
+    pd.DataFrame([summary]).to_csv(run_dir / f"research_summary_{clean_stamp(stamp)}.csv", index=False)
 
     breakdown_rows = []
     trig_df = df[
@@ -435,7 +436,7 @@ def generate_research_summary(mutation_rows, stamp):
             })
     if breakdown_rows:
         pd.DataFrame(breakdown_rows).to_csv(
-            run_dir / f"erosion_by_trigger_type_{stamp}.csv", index=False)
+            run_dir / f"erosion_by_trigger_type_{clean_stamp(stamp)}.csv", index=False)
 
     rule_breakdown = []
     if "rule" in df.columns:
@@ -454,7 +455,7 @@ def generate_research_summary(mutation_rows, stamp):
             })
     if rule_breakdown:
         pd.DataFrame(rule_breakdown).to_csv(
-            run_dir / f"erosion_by_rule_{stamp}.csv", index=False)
+            run_dir / f"erosion_by_rule_{clean_stamp(stamp)}.csv", index=False)
 
     detection_dist = df["detection_source"].value_counts().to_dict() \
         if "detection_source" in df.columns else {}
@@ -554,11 +555,11 @@ def channel_display_name(ch_or_url):
     return _channel_short_name(ch_or_url)
 
 def prompt_channel_selection():
-    """Returns a list of CURATED_CHANNELS dicts ({"url", "channel_register"}),
+    """Returns a list of CURATED_CHANNELS dicts ({"url", "name"?, "type"?}),
     or None to mean "use all" (discover_new_videos default)."""
     print("\nAvailable channels:")
     for i, ch in enumerate(CURATED_CHANNELS, 1):
-        print(f"  {i} = {channel_display_name(ch):<30} [{ch['channel_register']}]")
+        print(f"  {i} = {channel_display_name(ch):<30}")
     print(f"  a = All channels")
     raw = input("Select channel(s) [a]: ").strip().lower() or "a"
     if raw == "a":
@@ -605,7 +606,7 @@ def _extract_direct_media_url(anchor_play_url):
     return unquote(m.group(1)) if m else anchor_play_url
 
 
-def _discover_ypod_json(source_url, channel_register, processed, queue_ids):
+def _discover_ypod_json(source_url, processed, queue_ids):
     """
     Y Pod hosts some shows (e.g. Pryd Ar Dafod) via an internal cache
     JSON rather than exposing a plain RSS feed -- reverse-engineered
@@ -634,7 +635,7 @@ def _discover_ypod_json(source_url, channel_register, processed, queue_ids):
             continue
         out.append({"id": ep_id, "url": direct_url,
                     "title": ep.get("title", "unknown"),
-                    "source": source_url, "channel_register": channel_register})
+                    "source": source_url})
     return out
 
 
@@ -647,14 +648,12 @@ def discover_new_videos(limit, channels=None):
     target_channels = channels if channels else CURATED_CHANNELS
     for ch in target_channels:
         channel_url = ch["url"]
-        channel_register = ch["channel_register"]
-        print(f"Collecting from: {channel_url} [{channel_register}]")
+        print(f"Collecting from: {channel_url}")
         # PATCH: Y Pod's internal cache JSON isn't RSS/Atom, so yt-dlp's
         # generic extractor can't enumerate it as a playlist -- branch
         # to a dedicated adapter instead of forcing it through yt-dlp.
         if ch.get("type") == "ypod_json":
-            out.extend(_discover_ypod_json(channel_url, channel_register,
-                                            processed, queue_ids))
+            out.extend(_discover_ypod_json(channel_url, processed, queue_ids))
             continue
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -672,8 +671,7 @@ def discover_new_videos(limit, channels=None):
                         out.append({"id": vid_id,
                                     "url": entry_url,
                                     "title": entry.get("title", "unknown"),
-                                    "source": channel_url,
-                                    "channel_register": channel_register})
+                                    "source": channel_url})
         except Exception as e:
             print(f" 💥 Failed collecting {channel_url}: {e}")
     seen   = set()
@@ -762,7 +760,14 @@ def download_audio(video, max_retries=3, audio_dir=None):
         return str(norm_path)
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": str(AUDIO_DIR / f"{file_stem}.%(ext)s"),
+        # PATCH: was hardcoded to AUDIO_DIR regardless of target_dir, so
+        # whenever a caller passed a nested audio_dir (this video's own
+        # folder), yt-dlp would actually write the file flat into AUDIO_DIR
+        # while raw_path/norm_path below (built from target_dir) pointed
+        # at the nested folder instead -- a real mismatch, not a naming
+        # nuance: raw_path.exists() checks and the later ffmpeg -i call
+        # would be looking in a folder the file was never written to.
+        "outtmpl": str(target_dir / f"{file_stem}.%(ext)s"),
         "postprocessors": [{"key": "FFmpegExtractAudio",
                             "preferredcodec": "mp3", "preferredquality": "192"}],
         "quiet": True, "no_warnings": True, "noprogress": True,
@@ -783,8 +788,34 @@ def download_audio(video, max_retries=3, audio_dir=None):
     if not raw_path.exists() or raw_path.stat().st_size == 0:
         def _download():
             tqdm.write(" Downloading audio...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.download([video["url"]])
+            # PATCH: WinError 32 here comes from yt-dlp's own
+            # MoveFilesAfterDownload postprocessor renaming the
+            # just-extracted .mp3 onto its own final path (same filename on
+            # both sides) -- Windows can still be holding a handle on that
+            # file from the FFmpegExtractAudio subprocess for a brief
+            # moment after it exits, which is the exact same race already
+            # handled below for raw_path.unlink() after the loudnorm step.
+            # youtube_call()'s retry loop is for network failures and has
+            # no backoff for a file-lock error, so retrying purely through
+            # it just re-hits the same still-held handle with no delay
+            # (confirmed in a real run: three "Downloading audio..." lines
+            # back-to-back, then the same WinError 32 every time). Give
+            # Windows a moment to release the handle before trying again,
+            # same as the unlink() retry does.
+            last_exc = None
+            for attempt in range(4):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return ydl.download([video["url"]])
+                except (PermissionError, OSError) as e:
+                    if getattr(e, "winerror", None) != 32 or attempt == 3:
+                        raise
+                    wait = 1.0 * (attempt + 1)
+                    tqdm.write(f" ⚠️ File still in use (WinError 32), "
+                               f"retrying in {wait:.0f}s...")
+                    time.sleep(wait)
+                    last_exc = e
+            raise last_exc
         youtube_call("audio download", _download, max_attempts=max_retries)
     tqdm.write(" Normalizing audio...")
     try:
@@ -1215,7 +1246,6 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
             "video_title":          video_meta["title"],
             "video_url":            video_meta.get("url", "local_file"),
             "source":               video_meta["source"],
-            "channel_register":     video_meta.get("channel_register", "unverified"),
             "video_duration_seconds": video_duration_seconds,
             "video_word_count":     video_word_count,
             "video_codeswitch_word_count": video_codeswitch_word_count,
@@ -1229,7 +1259,20 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
         for w in enriched[seg_start:seg_end]:
             raw_word  = w["word"]
             norm_word = normalize_word(raw_word)
-            if len(norm_word) < 2 or w.get("synthetic"):
+            # PATCH (found via direct phrase-test verification, then
+            # traced to this SEPARATE occurrence of the same bug): this
+            # loop builds words_only, the exact list handed to
+            # process_comprehensive_mutations() for every real video --
+            # `len(norm_word) < 2` was dropping single-character Welsh
+            # trigger words ("i"/"o"/"a"/"â"/"u") before mutation
+            # detection ever saw them, for every video this pipeline has
+            # ever processed. Fixing the equivalent check inside
+            # process_comprehensive_mutations() itself does NOT fix this
+            # path -- this filter runs earlier and independently, so both
+            # needed the same carve-out. A single-char word that ISN'T a
+            # recognized trigger is still dropped from words_only/word_rows/
+            # lemma_rows/pos_rows, same as before.
+            if (len(norm_word) < 2 and norm_word not in TRIGGERS) or w.get("synthetic"):
                 continue
 
             lemma      = get_welsh_lemma(raw_word)
@@ -1246,7 +1289,6 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
                 "video_title":   video_meta["title"],
                 "video_url":     video_meta.get("url", "local_file"),
                 "source":        video_meta["source"],
-                "channel_register": video_meta.get("channel_register", "unverified"),
                 "segment_start": round(seg.start, 3),
                 "segment_end":   round(seg.end, 3),
                 "word":          raw_word,
@@ -1267,7 +1309,6 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
                 "video_title":     video_meta["title"],
                 "video_url":       video_meta.get("url", "local_file"),
                 "source":          video_meta["source"],
-                "channel_register":   video_meta.get("channel_register", "unverified"),
                 "word":            raw_word,
                 "normalized_word": norm_word,
                 "lemma":           lemma,
@@ -1282,7 +1323,6 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
                 "video_title":          video_meta["title"],
                 "video_url":            video_meta.get("url", "local_file"),
                 "source":               video_meta["source"],
-                "channel_register":     video_meta.get("channel_register", "unverified"),
                 "word":                 raw_word,
                 "cysill_pos":           cysill_pos,
                 "cysill_mutation_type": cysill_mut,
@@ -1318,14 +1358,42 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
             "video_title": video_meta["title"],
             "video_url":   video_meta.get("url", "local_file"),
             "source":      video_meta["source"],
-            "channel_register": video_meta.get("channel_register", "unverified"),
+            "video_duration_seconds": video_duration_seconds,
+            "video_word_count": video_word_count,
+            "video_codeswitch_word_count": video_codeswitch_word_count,
+        })
+
+    # PATCH (Phase 5): conjugated-preposition erosion -- a separate branch/
+    # phenomenon, own detection pass over the same words_only stream (see
+    # prep_engine.py's docstring), own output rows, own CSV
+    # (vpaths["prep_mutations"] in welsh_pipeline.py -- not merged into
+    # mutation_rows, which stays exactly what it always was).
+    prep_rows = prep_engine.process_preposition_erosion(words_only)
+    for row in prep_rows:
+        row.update({
+            "video_title": video_meta["title"],
+            "video_url":   video_meta.get("url", "local_file"),
+            "source":      video_meta["source"],
+            "video_duration_seconds": video_duration_seconds,
+            "video_word_count": video_word_count,
+            "video_codeswitch_word_count": video_codeswitch_word_count,
+        })
+
+    # PATCH (Phase 6): plural-marking erosion -- third branch, same words_only
+    # stream, own output rows, own CSV (vpaths["plural_mutations"]).
+    plural_rows = plural_engine.process_plural_marking(words_only)
+    for row in plural_rows:
+        row.update({
+            "video_title": video_meta["title"],
+            "video_url":   video_meta.get("url", "local_file"),
+            "source":      video_meta["source"],
             "video_duration_seconds": video_duration_seconds,
             "video_word_count": video_word_count,
             "video_codeswitch_word_count": video_codeswitch_word_count,
         })
 
     return segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows, \
-        time.time() - start_time
+        prep_rows, plural_rows, time.time() - start_time
 
 
 def analyze_phrase(phrase):
@@ -1368,13 +1436,25 @@ def analyze_phrase(phrase):
         })
 
     mutation_rows = process_comprehensive_mutations(enriched)
-    return word_rows, lemma_rows, pos_rows, mutation_rows
+    # PATCH (Phase 5): same words stream, second detection branch -- see
+    # prep_engine.py's docstring. enriched (not word_rows) on purpose:
+    # matches what mutation_rows above is computed from, and carries the
+    # spacy_token/cysill_* fields this branch's target confidence checks
+    # need, which the flattened word_rows dicts don't keep.
+    prep_rows = prep_engine.process_preposition_erosion(enriched)
+    plural_rows = plural_engine.process_plural_marking(enriched)
+    return word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows
 
 
-def save_analysis_outputs(stamp, segments, words, lemmas, pos_rows, mutations):
+def save_analysis_outputs(stamp, segments, words, lemmas, pos_rows, mutations,
+                           prep_mutations=None, plural_mutations=None):
     paths = run_paths(stamp)
     if segments: pd.DataFrame(segments).to_csv(paths["segments"], index=False, encoding="utf-8-sig", quoting=1)
     if words:    pd.DataFrame(words).to_csv(paths["words"],    index=False, encoding="utf-8-sig", quoting=1)
     if lemmas:   pd.DataFrame(lemmas).to_csv(paths["lemmas"],  index=False, encoding="utf-8-sig", quoting=1)
     if pos_rows: pd.DataFrame(pos_rows).to_csv(paths["pos"],   index=False, encoding="utf-8-sig", quoting=1)
     if mutations:pd.DataFrame(mutations).to_csv(paths["mutations"], index=False, encoding="utf-8-sig", quoting=1)
+    if prep_mutations:
+        pd.DataFrame(prep_mutations).to_csv(paths["prep_mutations"], index=False, encoding="utf-8-sig", quoting=1)
+    if plural_mutations:
+        pd.DataFrame(plural_mutations).to_csv(paths["plural_mutations"], index=False, encoding="utf-8-sig", quoting=1)
