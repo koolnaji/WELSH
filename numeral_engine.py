@@ -7,11 +7,15 @@ SINGULAR in Welsh; a plural there is the English-style form.
 
 Gates, all applied identically to correct and eroded cases so none of them
 can tilt the rate:
-  - the trigger must be tagged as a numeral (spaCy NUM or Cysill CARD) --
+  - the trigger must be tagged as a numeral (spaCy NUM; Cysill CARD only
+    where spaCy has no token -- see spacy_tagging.tagged_as()) --
     "deg" is also soft-mutated "teg" (fair), "mil" also "animal";
-  - the next word (skipping hesitation sounds, never across a comma) must
-    be tagged NOUN, must not be the partitive "o", and must not be a
-    code-switched word (an English noun keeps English plural morphology);
+  - the next word (skipping hesitation sounds, never across a comma or an
+    utterance/segment end) must pass spacy_tagging.is_noun_target() --
+    tagged NOUN, and not a form the Bangor lexicon says can't be a noun or
+    is also a conjunction ("pump, wyt?" / "tair, achos..." were both
+    scored before this) -- must not be the partitive "o", and must not be
+    a code-switched word (an English noun keeps English plural morphology);
   - its singular/plural value must be known -- unknown means no row. Read
     by spacy_tagging.noun_number(): the Bangor lexicon's dictionary value
     first, spaCy's morph tag where the lexicon has none; number_source in
@@ -25,7 +29,7 @@ used it would silently drop this branch's data.
 Standalone: imports only spacy_tagging.py, same convention as the other
 non-mutation branches.
 """
-from spacy_tagging import noun_number
+from spacy_tagging import is_noun_target, noun_number, tagged_as
 from numeral_tables import NUMERAL_FORMS, PARTITIVE_WORDS, WELSH_FILLERS
 
 
@@ -39,11 +43,9 @@ def normalize_word(word):
     return w
 
 
-def _tagged_as(node, spacy_pos, cysill_prefixes):
-    spacy_tok = node.get("spacy_token") or {}
-    if spacy_tok.get("pos") == spacy_pos:
-        return True
-    return (node.get("cysill_pos") or "").upper().startswith(cysill_prefixes)
+def _is_numeral_word(node):
+    w = normalize_word(node["word"])
+    return w in NUMERAL_FORMS or w == "un" or w.isdigit()
 
 
 def _find_noun_target(i, words_list):
@@ -86,7 +88,13 @@ def process_numeral_agreement(words_list):
         numeral = NUMERAL_FORMS.get(normalize_word(current_node["word"]))
         if numeral is None or current_node.get("_clause_boundary_after"):
             continue
-        if not _tagged_as(current_node, "NUM", ("CARD",)):
+        # The last numeral of a compound number isn't counting the next noun:
+        # "mil naw chwech deg NAW, pethau fel yna" (1969, things like that)
+        # scored "naw pethau" as erosion (davies13.cha, 2026-09-26). Compound
+        # numbers take "o" + plural anyway ("chwe deg naw o bethau").
+        if i > 0 and _is_numeral_word(words_list[i - 1]):
+            continue
+        if not tagged_as(current_node, "NUM", ("CARD",)):
             continue
 
         target = _find_noun_target(i, words_list)
@@ -96,7 +104,7 @@ def process_numeral_agreement(words_list):
             continue
         if target.get("_code_switch"):
             continue
-        if not _tagged_as(target, "NOUN", ("N",)):
+        if not is_noun_target(target):
             continue
 
         number, number_source = noun_number(target)

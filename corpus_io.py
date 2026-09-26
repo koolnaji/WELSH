@@ -328,7 +328,7 @@ def _video_slug(meta, stamp):
     slug = slug or "untitled"
 
     folder_name = f"{stamp}_{slug}"
-    video_dir = RUNS_DIR / stamp / slug
+    video_dir = session_dir(stamp) / slug
     video_dir.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -372,7 +372,7 @@ def _preview_video_slug(meta, stamp):
     slug = slug or "untitled"
 
     folder_name = f"{stamp}_{slug}"
-    video_dir = PREVIEW_DIR / stamp / slug
+    video_dir = PREVIEW_DIR / session_dir(stamp).name / slug
     video_dir.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -385,6 +385,124 @@ def _preview_video_slug(meta, stamp):
         "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
         "numeral_mutations": video_dir / f"numeral_mutations_{folder_name}.csv",
     }
+
+
+# ========================= SESSION FOLDER NAMES =========================
+# runs/<stamp>_<what was processed>/, e.g. "20260926_140318_siarad-6" or
+# "20260926_121935_youtube-5_fireside-2". The timestamp stays first, so
+# folders still sort by time, and every FILE name keeps the bare stamp --
+# the analyzers and companion tools parse stamps from file names (or read
+# the folder name straight off the path), never rebuild this folder name.
+# An entry point calls set_session_label() once it knows what the session
+# will process; a stamp with no label falls back to plain "runs/<stamp>/".
+_session_labels = {}
+
+
+def source_kind(source):
+    """Short platform name for a video's "source" (channel/feed URL, or the
+    marker Siarad/local-MP3 runs set)."""
+    s = str(source or "").lower()
+    for marker, kind in (("siarad", "siarad"), ("youtube", "youtube"), ("youtu.be", "youtube"),
+                         ("spreaker", "spreaker"), ("fireside", "fireside"),
+                         ("anchor.fm", "anchor"), ("spotify", "anchor"), ("ypod", "ypod")):
+        if marker in s:
+            return kind
+    if s in ("local", "local_file"):
+        return "local-mp3"
+    return "other"
+
+
+def set_session_label(stamp, items=None, label=None):
+    """Name this session's folder. Either pass `label` directly, or `items`
+    (queue entries / metadata dicts with a "source") and get counts per
+    platform: 5 YouTube + 2 Fireside -> "youtube-5_fireside-2"."""
+    if label is None:
+        counts = {}
+        for item in items or []:
+            kind = source_kind(item.get("source"))
+            counts[kind] = counts.get(kind, 0) + 1
+        label = "_".join(f"{kind}-{n}" for kind, n in sorted(counts.items()))
+    label = re.sub(r"[^A-Za-z0-9_+-]", "", label)
+    if label:
+        _session_labels[stamp] = label
+
+
+def session_dir(stamp):
+    """runs/<stamp>_<label>/ -- or runs/<stamp>/ if no label was set."""
+    label = _session_labels.get(stamp)
+    return RUNS_DIR / (f"{stamp}_{label}" if label else stamp)
+
+
+_BARE_STAMP_RE = re.compile(r"^\d{8}_\d{6}$")
+
+
+def label_existing_session_dirs(apply=False):
+    """
+    One-off: give session folders created before labels existed the same
+    "<stamp>_<label>" name new sessions get, worked out from the "source"
+    column of the segments CSVs inside. Only bare-stamp folders are touched
+    (not _deleted/, not ones you renamed yourself); only FOLDERS are
+    renamed -- file names keep their stamp, so nothing that reads the data
+    changes. apply=False just prints the plan.
+        python -c "import corpus_io; corpus_io.label_existing_session_dirs()"
+        python -c "import corpus_io; corpus_io.label_existing_session_dirs(apply=True)"
+    """
+    import csv
+    changes = []
+    for folder in sorted(p for p in RUNS_DIR.iterdir() if p.is_dir()):
+        if not _BARE_STAMP_RE.match(folder.name):
+            continue
+        items = []
+        for segments_csv in folder.glob("*/segments_*.csv"):
+            try:
+                with open(segments_csv, encoding="utf-8-sig", newline="") as f:
+                    first = next(csv.DictReader(f), None)
+            except OSError:
+                first = None
+            if first:
+                items.append({"source": first.get("source")})
+        set_session_label(folder.name, items)
+        target = session_dir(folder.name)
+        if target != folder and not target.exists():
+            changes.append((folder, target))
+    if not changes:
+        print("Nothing to rename.")
+        return
+    for old, new in changes:
+        print(f"  {old.name}  ->  {new.name}")
+        if apply:
+            old.rename(new)
+    print(f"{len(changes)} folder(s) {'renamed' if apply else 'would be renamed -- rerun with apply=True'}.")
+
+
+# ---- pipeline version ----
+# The files whose code decides what an output row says. A hash of their
+# contents is stamped on every row as "pipeline_version", so data produced
+# before and after a detection change can't be pooled unnoticed --
+# corpus_analyzer.py reports every version it finds. Automatic on purpose:
+# a hand-bumped number would be forgotten. Any edit to these files,
+# comments included, gives a new version (the safe direction).
+_DETECTION_SOURCES = (
+    "corpus_ops.py", "corpus_siarad.py", "cysill_client.py", "bangor_lexicon.py",
+    "spacy_tagging.py", "mutation_engine.py", "mutation_tables.py",
+    "prep_engine.py", "prep_tables.py", "plural_engine.py", "plural_tables.py",
+    "numeral_engine.py", "numeral_tables.py",
+)
+_pipeline_version = None
+
+
+def pipeline_version():
+    global _pipeline_version
+    if _pipeline_version is None:
+        here = Path(__file__).resolve().parent
+        digest = hashlib.sha1()
+        for name in _DETECTION_SOURCES:
+            source = here / name
+            if source.exists():
+                digest.update(name.encode("utf-8"))
+                digest.update(source.read_bytes())
+        _pipeline_version = digest.hexdigest()[:10]
+    return _pipeline_version
 
 
 # ========================= JSON STATE PERSISTENCE =========================
@@ -400,6 +518,7 @@ def _preview_video_slug(meta, stamp):
 # printing would meaningfully bloat a multi-thousand-entry cache) and
 # tolerant of numpy/pandas scalar types (the `default=` fallback) that
 # can end up in a checkpoint's "enriched_words" list.
+
 def _replace_with_retry(tmp_path, path, attempts=6):
     """tmp -> final rename, retried on Windows PermissionError. Antivirus or
     the search indexer can hold a handle on a just-written file for a
@@ -753,12 +872,12 @@ def cleanup_empty_session_dir(stamp):
     as cleanup_incomplete_video_dirs(). Returns True if the folder was
     removed.
     """
-    session_dir = RUNS_DIR / stamp
-    if not session_dir.exists():
+    folder = session_dir(stamp)
+    if not folder.exists():
         return False
-    if any(session_dir.rglob("*")):
+    if any(folder.rglob("*")):
         return False
-    shutil.rmtree(session_dir, ignore_errors=True)
+    shutil.rmtree(folder, ignore_errors=True)
     tqdm.write(f"  🧹 Session {stamp} produced no results at all -- "
-               f"removed the empty runs/{stamp}/ folder.")
+               f"removed the empty runs/{folder.name}/ folder.")
     return True

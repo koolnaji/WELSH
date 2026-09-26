@@ -42,6 +42,7 @@ from corpus_io import (
     load_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
     append_output_csv, cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
+    pipeline_version, set_session_label,
 )
 from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
@@ -283,6 +284,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     # exactly as before this existed", not a startup failure.
     load_bangor_lexicon()
     print(cysill_status_line())
+    print(f"Pipeline version: {pipeline_version()}")
 
     # PATCH: model is now session-scoped (loaded lazily, cached across menu
     # loops) instead of being re-prompted/re-loaded every single choice.
@@ -516,6 +518,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 run_type = "Local MP3 batch" if save_results else "Local MP3 batch (preview)"
                 run_start_time = time.time()
                 videos_attempted = len(pending_mp3_files)
+                set_session_label(stamp, label=f"local-mp3-{len(pending_mp3_files)}")
                 keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations",
                         "plural_mutations", "numeral_mutations"]
                 for p in tqdm(pending_mp3_files, desc="Videos", unit="video"):
@@ -630,6 +633,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 run_type = "Queue processing"
                 run_start_time = time.time()
                 videos_to_process = queue[:how_many]
+                set_session_label(stamp, videos_to_process)   # runs/<stamp>_youtube-5_.../
                 remaining_queue   = queue[how_many:]
                 retry_queue       = []
                 failed_state      = load_failed()

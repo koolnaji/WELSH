@@ -8,9 +8,10 @@ but on the HUMAN transcript, so no Whisper errors -- via
 corpus_ops.analyze_segments().
 
 Usage:
-    python corpus_siarad.py <file.cha | folder of .cha files> [--redo]
+    python corpus_siarad.py <file.cha | folder of .cha files> [--limit N] [--redo]
     (a folder is searched recursively; conversations already in runs/ are
-    skipped unless --redo is given, so a stopped run can simply be restarted)
+    skipped unless --redo is given, so a stopped run can simply be restarted;
+    --limit N processes only the next N not yet done)
 
 Output, per conversation, in runs/<stamp>/Siarad_<file>/:
   - the same segments/words/lemmas/pos/mutations/prep/plural/numeral CSVs a
@@ -28,7 +29,10 @@ Conventions (confirmed against a real Siarad file, davies1.cha):
     the FULL word is used, which also settles "o'n" = oeddwn vs "o yn";
   - word@s:eng = English, @s:cym&eng = in both dictionaries (left to the
     usual heuristic), @s:eng+cym / @s:cym+eng = mixed morphology (Welsh);
-    untagged = Welsh, except in an utterance marked [- eng];
+    a bare word@s (the form the TalkBank release uses) = the utterance's
+    other language, i.e. English in a Welsh utterance;
+    untagged = decided by spelling (the pipeline's code-switch heuristic),
+    except in an utterance marked [- eng] (English);
   - dropped: pauses, retraced material (<...> [/], [//]), events and
     fragments (&=laugh, &m), unintelligible xxx/yyy/www, 0-prefixed omitted
     words, linkers/terminators, bracket codes ([?], [!], [= ...]).
@@ -49,7 +53,8 @@ import pandas as pd
 
 from corpus_io import (
     RUNS_DIR, ensure_dirs, run_stamp, _video_slug, append_output_csv,
-    cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
+    cleanup_incomplete_video_dirs, cleanup_empty_session_dir, pipeline_version,
+    set_session_label, session_dir,
 )
 from corpus_ops import analyze_segments
 from cysill_client import cysill_status_line
@@ -63,7 +68,13 @@ OUTPUT_KEYS = ["segments", "words", "lemmas", "pos", "mutations",
 DETECTION_KEYS = ("mutations", "prep_mutations", "plural_mutations", "numeral_mutations")
 
 BULLET_RE    = re.compile(r"\x15(\d+)_(\d+)\x15")
-LANG_TAG_RE  = re.compile(r"@s:([a-z&+]+)$")
+# "@s:eng" / "@s:cym&eng" (explicit), or a BARE "@s" = "the other language of
+# this utterance" -- which is what the TalkBank release actually uses
+# ("beans@s", "ting@s"). Only the explicit form was recognised at first
+# (built against the GitHub beta), so nearly every English word in the real
+# files was read as Welsh: davies1.cha came out with 20 English-tagged words
+# where Siarad averages ~4% English (2026-09-26).
+LANG_TAG_RE  = re.compile(r"@s(?::([a-z&+]+))?$")
 PAUSE_RE     = re.compile(r"\(\.+\)|\(\d+[:.]?\d*\.?\d*\)")
 RETRACE_RE   = re.compile(r"(<[^<>]*>|\S+)\s*\[/[/?-]*\]")
 REPLACE_RE   = re.compile(r"(<[^<>]*>|\S+)\s*\[:\s*([^\]]*)\]")
@@ -165,12 +176,21 @@ def clean_main_tier(main):
             continue
         if tok in DROP_TOKENS or tok.startswith(("&", "+", "#", "0")):
             continue
-        lang = "eng" if utterance_english else "cym"
+        # Untagged words are NOT assumed Welsh: transcribers leave some
+        # English-spelled words untagged ("boy", "condoms" in davies13.cha,
+        # whose transcriber tags ~350 other English words), and forcing them
+        # to Welsh made them numeral/rhai/mutation targets. None = decided by
+        # spelling, the same heuristic as YouTube data -- the orthography
+        # criterion (decision 2026-09-26). Explicit tags still win.
+        lang = "eng" if utterance_english else None
         m = LANG_TAG_RE.search(tok)
         if m:
             tag = m.group(1)
-            lang = "eng" if tag == "eng" else "cym" if tag == "cym" else \
-                   "und" if "&" in tag else "mixed"
+            if tag is None:     # bare "@s": switch to the utterance's other language
+                lang = "cym" if utterance_english else "eng"
+            else:
+                lang = "eng" if tag == "eng" else "cym" if tag == "cym" else \
+                       "und" if "&" in tag else "mixed"
             tok = tok[:m.start()]
         tok = tok.split("@")[0].strip("“”\"")
         tok = tok.replace("(", "").replace(")", "").replace("+", "")
@@ -302,8 +322,18 @@ def _already_done(path):
 def main(argv):
     redo = "--redo" in argv
     argv = [a for a in argv if a != "--redo"]
+    limit = None
+    if "--limit" in argv:
+        at = argv.index("--limit")
+        try:
+            limit = int(argv[at + 1])
+        except (IndexError, ValueError):
+            print("--limit needs a number, e.g. --limit 5")
+            return 1
+        argv = argv[:at] + argv[at + 2:]
     if len(argv) != 1:
-        print("Usage: python corpus_siarad.py <file.cha | folder of .cha files> [--redo]")
+        print("Usage: python corpus_siarad.py <file.cha | folder of .cha files> "
+              "[--limit N] [--redo]")
         return 1
     target = Path(argv[0])
     # rglob: the TalkBank zip unpacks into a Siarad/ subfolder
@@ -320,6 +350,8 @@ def main(argv):
         if not files:
             print("Nothing left to process.")
             return 0
+    if limit is not None:
+        files = files[:limit]
 
     ensure_dirs()
     load_lemma_cache()
@@ -327,10 +359,12 @@ def main(argv):
     load_spacy()
     load_bangor_lexicon()
     print(cysill_status_line())
+    print(f"Pipeline version: {pipeline_version()}")
     reset_cysill_circuit_breaker()
 
     stamp = run_stamp()
-    print(f"Processing {len(files)} Siarad file(s) into runs/{stamp}/")
+    set_session_label(stamp, label=f"siarad-{len(files)}")
+    print(f"Processing {len(files)} Siarad file(s) into runs/{session_dir(stamp).name}/")
     try:
         for f in files:
             process_file(f, stamp)

@@ -126,10 +126,13 @@ def is_noun_target(word_dict):
     NOUN (tagged_as above), and the Bangor lexicon doesn't contradict it:
     a form the lexicon knows but never as a noun ("wyt", you-are, which
     spaCy tagged NOUN in "pump, wyt [ti]?") or that it also knows as a
-    conjunction is not accepted. Words the lexicon doesn't know
+    conjunction or an adjective is not accepted. Words the lexicon doesn't know
     ("lex_pos" None) fall back to the tag alone."""
     lex_pos = word_dict.get("lex_pos")
-    if lex_pos and ("NOUN" not in lex_pos or _CONJUNCTION_POS & set(lex_pos)):
+    # ADJ too: "rhai du" / "rhai mawr" = "black ones" / "big ones" -- pronoun
+    # "rhai" + adjective, not "some" + noun (davies11.cha, 2026-09-26).
+    if lex_pos and ("NOUN" not in lex_pos or _CONJUNCTION_POS & set(lex_pos)
+                    or "ADJ" in lex_pos):
         return False
     return tagged_as(word_dict, "NOUN", ("N",))
 

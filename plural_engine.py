@@ -22,7 +22,8 @@ followed by a non-noun and so produces nothing.
 Standalone: imports only spacy_tagging.py.
 """
 from spacy_tagging import is_noun_target, noun_number
-from plural_tables import RHAI_FORMS, COLLECTIVE_NOUNS, WELSH_FILLERS
+from plural_tables import (RHAI_FORMS, COLLECTIVE_NOUNS, MASS_NOUNS,
+                           POSSESSIVE_ECHO_PRONOUNS, WELSH_FILLERS)
 
 
 def normalize_word(word):
@@ -83,6 +84,17 @@ def process_plural_marking(words_list):
             continue
 
         target_norm = normalize_word(target["word"])
+        if target_norm in MASS_NOUNS:
+            continue   # English "some" + mass noun is singular -- see MASS_NOUNS
+        # "rhai" + noun + possessive pronoun is pronoun "rhai" + a possessive
+        # phrase: "mae gyda nhw rai tad fi" = they've got some of my dad's
+        # (davies13.cha, 2026-09-26) -- not "some dads".
+        after = next((k + 1 for k in range(i + 1, min(i + 4, len(words_list)))
+                      if words_list[k] is target), None)
+        if after is not None and after < len(words_list) and \
+                not target.get("_clause_boundary_after") and \
+                normalize_word(words_list[after]["word"]) in POSSESSIVE_ECHO_PRONOUNS:
+            continue
         number, number_source = noun_number(target)
         if number == "plural" or (number == "singular" and target_norm in COLLECTIVE_NOUNS):
             rows.append(_build_plural_row(

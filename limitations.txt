@@ -259,6 +259,22 @@ clouds, but it cannot remove it. (b) Channel: within YouTube, videos from
 one channel still share production style, topic and speakers, so
 per-video points are not independent draws.
 
+2.5a Residual ambiguities that text-based detection cannot resolve
+Found reading every erosion row of Siarad davies1.cha (2026-09-26), after
+the systematic errors were fixed: (a) English homographs the transcriber
+left untagged ("y tin beans" -- "tin" is also Welsh "bottom") are scored as
+Welsh; (b) "ei" + noun is erosion if it means "his" and correct if it
+means "her" ("ei llaw"), and only wider context tells; (c) a possessive or
+article that is reduced to nothing in speech leaves the noun looking like
+an unmutated target (partly handled: a noun followed by an echo pronoun,
+"yn côl fi", is skipped); (d) fixed labels ("blwyddyn deg", Year 10)
+behave like names. The manual precision audit (mutation_manual_editing.py)
+is what quantifies how much these leave in the erosion rate.
+Note also: every mutation-branch run before pipeline versions were stamped
+(2026-09-26) dropped the article "y"/"'r" before detection, so "yn y corws"
+was read as "yn corws" -- those runs' erosion rates are inflated and must be
+re-processed, not pooled.
+
 2.5b Cysill corroboration is absent from runs where no API key was set
 A missing WELSH_LEMMATIZER key made Cysill a silent no-op: runs on the
 school laptop (from 2026-09-25) have an empty cysill_pos for every word

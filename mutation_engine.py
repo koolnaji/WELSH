@@ -137,6 +137,8 @@ from mutation_tables import (
     DIGRAPHS, WELSH_VOWELS, HESITATION_FILLERS, POS_GATED_TRIGGERS,
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
+    OEDD_CONTRACTIONS, OEDD_PERSON_ENDINGS, CLIPPED_BOD_FORMS, FIXED_EXPRESSIONS,
+    SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS,
     _LEGAL_BASE_MARK_PAIRS,
 )
 
@@ -556,9 +558,20 @@ def expand_whisper_tokens(raw_words):
     invisible to trigger detection all over again.
     """
     expanded = []
-    for w in raw_words:
+    for idx, w in enumerate(raw_words):
         surface = w["word"].strip().lower().replace("\u2019", "'")
-        if surface in WELSH_CONTRACTION_SPLITS:
+        next_word = (raw_words[idx + 1]["word"].strip().lower().strip(".,!?;:\"()[]")
+                     if idx + 1 < len(raw_words) else "")
+        if surface in OEDD_CONTRACTIONS and next_word in OEDD_PERSON_ENDINGS:
+            # "o'n i" -> "oeddwn": one real verb token, what the speaker said
+            # (see OEDD_CONTRACTIONS) -- and the form taggers recognize.
+            expanded.append({**w, "word": OEDD_CONTRACTIONS[surface]
+                             + OEDD_PERSON_ENDINGS[next_word], "synthetic": False})
+        elif (surface, next_word) in CLIPPED_BOD_FORMS:
+            # "dan ni" -> "ydan ni" (we are), see CLIPPED_BOD_FORMS
+            expanded.append({**w, "word": CLIPPED_BOD_FORMS[(surface, next_word)],
+                             "synthetic": False})
+        elif surface in WELSH_CONTRACTION_SPLITS:
             parts = WELSH_CONTRACTION_SPLITS[surface]
             for idx, part in enumerate(parts):
                 is_last = idx == len(parts) - 1
@@ -796,6 +809,11 @@ def align_with_gap_tolerance(tagger_tokens, whisper_words, window=GAP_ALIGN_WIND
 # corpus_io.py now sits below both this module and corpus_ops.py in the
 # import graph, so that duplication is no longer needed.)
 CHECKPOINT_INTERVAL_SECONDS = 30
+
+# Layer 1C-bis (feminine noun + genitive noun -> soft). Off: see the comment
+# at the layer. Set True to re-enable; it then produces rows again for both
+# outcomes, so switching it doesn't tilt anything retroactively.
+FEM_GENITIVE_RULE_ENABLED = False
 
 
 def enrich_words(all_preprocessed_words, checkpoint_key=None):
@@ -1205,10 +1223,18 @@ def layer_1_trigger_detection(trigger_word, cysill_pos=None,
             return {"trigger_detected": False, "expected_mutation": None,
                     "trigger_word": trigger, "fem_ei": False,
                     "mixed": False, "h_mutation": False}
-        if any(pos.startswith(p) for p in PREP_TAG_PREFIXES) or spacy_dep == "case":
+        # spaCy's deprel decides; Cysill only when it gave ONE reading. Cysill
+        # tags almost every "yn" "PREP+PREDYN" (it can't choose), and that
+        # string starts with "PREP", so with full Cysill coverage every
+        # predicative yn was judged against NASAL mutation -- "yn blwyddyn",
+        # "yn drwm", "yn doctor" (davies1.cha, 2026-09-26). Same fix as "a".
+        cysill_single = "+" not in pos
+        cysill_prep = cysill_single and any(pos.startswith(p) for p in PREP_TAG_PREFIXES)
+        cysill_pred = cysill_single and (pos in PREDYN_TAGS or any(
+            x in pos for x in ("VERBADJ", "VB", "ADV")))
+        if spacy_dep == "case" or (spacy_dep not in ("case:pred", "aux", "mark") and cysill_prep):
             expected_list = ["nasal"]
-        elif pos in PREDYN_TAGS or any(x in pos for x in ("VERBADJ", "VB", "ADV")) \
-                or spacy_dep in ("case:pred", "aux", "mark"):
+        elif spacy_dep in ("case:pred", "aux", "mark") or cysill_pred:
             expected_list = ["soft_limited"]
 
     # PATCH: pronoun/interjection readings (see POS_GATED_TRIGGERS). "ni" is
@@ -2327,6 +2353,15 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
     }
 
 
+def _is_verb_target(node):
+    """A verb or verb-noun by spaCy (VERB/AUX, or any VerbForm), or by Cysill
+    when its FIRST reading is a verb tag."""
+    spacy_tok = node.get("spacy_token") or {}
+    if spacy_tok.get("pos") in ("VERB", "AUX") or (spacy_tok.get("morph") or {}).get("VerbForm"):
+        return True
+    return (node.get("cysill_pos") or "").split("+")[0].upper().startswith("VB")
+
+
 def _find_lookahead_target(i, words_list, norm_current):
     """
     PATCH: the original skip condition `norm_b == norm_current` also skipped
@@ -2339,8 +2374,15 @@ def _find_lookahead_target(i, words_list, norm_current):
     while lookahead <= 3 and (i + lookahead) < len(words_list):
         possible_b = words_list[i + lookahead]
         norm_b     = normalize_word(possible_b["word"])
+        # An article or clitic in between ("yn y corws", "i'r tŷ", "a'i
+        # dad") governs the noun itself -- the trigger's mutation doesn't
+        # reach past it. These used to be skipped like fillers, so every
+        # masculine noun after "in/to/of the" scored as erosion
+        # (davies1.cha, 2026-09-26: "yn y corws", "yn y drws").
+        if norm_b in DEFINITE_ARTICLE_FORMS or possible_b.get("synthetic"):
+            break
         skip_repeat = current_is_trigger and norm_b == norm_current
-        if skip_repeat or norm_b in HESITATION_FILLERS or possible_b.get("synthetic"):
+        if skip_repeat or norm_b in HESITATION_FILLERS:
             # Never skip across a comma: the next word isn't adjacent.
             if possible_b.get("_clause_boundary_after"):
                 break
@@ -2395,6 +2437,49 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     # Mangor", "yng Nghymru"); anywhere else "ym" is the hesitation "um".
     if (norm_current == "ym" and not target_norm.startswith("m")) or \
             (norm_current == "yng" and not target_norm.startswith("ng")):
+        return None, lookahead
+    # Fixed expressions ("wrth gwrs", "i gyd", "ei gilydd"...): frozen, not
+    # a live mutation -- see FIXED_EXPRESSIONS for why both forms are listed.
+    if target_norm in FIXED_EXPRESSIONS.get(norm_current, ()):
+        # handled, not unexplained -- keeps the phantom check off it too
+        mark_consumed(target_found)
+        return None, lookahead
+    # "bach o" = "a bit of" ("mae fe wastad yn bach o anticlimax",
+    # davies1.cha): a quantifier, not the predicate adjective "bach".
+    # Skipped mutated or not ("fach o" too), so it can't tilt the rate.
+    after_target = i + lookahead + 1
+    next_node = words_list[after_target] if after_target < len(words_list) else None
+    if target_norm in ("bach", "fach") and next_node is not None and \
+            normalize_word(next_node["word"]) == "o":
+        return None, lookahead
+    # Contexts that aren't mutation environments at all, whatever the target's
+    # form -- all seen as false erosion in davies1.cha (2026-09-26):
+    #  - a preposition governs a nominal: a lone adjective/adverb after one is
+    #    not its object ("o bach" = oh dear, "i da"). A PREPOSED adjective
+    #    before its noun still counts ("i brif swyddfa").
+    #  - bod/"sy" + verb-noun is the aspect construction with "yn" dropped
+    #    ("mae cael", "sy mynd"); aspectual yn never mutates.
+    #  - "yna" before a verb is "then" ("yna mynd"); only "yna" + noun is a
+    #    mutation context.
+    #  - "pan" mutates verbs ("pan fydd"), not nouns ("pan pobl").
+    next_is_noun = next_node is not None and not target_found.get("_clause_boundary_after") \
+        and (next_node.get("spacy_token") or {}).get("pos") in ("NOUN", "PROPN")
+    # A capitalised word after a trigger is a name, whatever spaCy says ("o
+    # Bach", the place, was tagged ADJ) -- names stay in (decision 2026-09-26).
+    looks_like_name = raw_target[:1].isupper()
+    if norm_current in SOFT_PREPOSITION_TRIGGERS and not looks_like_name and (
+            target_pos == "ADV" or (target_pos == "ADJ" and not next_is_noun)):
+        return None, lookahead
+    target_is_verb = _is_verb_target(target_found)
+    if (norm_current in BOD_SURFACE_FORMS or norm_current == "yna") and target_is_verb:
+        return None, lookahead
+    # Noun + echo pronoun = possessive phrase with the possessive dropped
+    # ("yn côl fi" = in my lap): its mutation isn't this trigger's.
+    if not target_is_verb and target_pos in ("NOUN", "PROPN") and next_node is not None \
+            and not target_found.get("_clause_boundary_after") \
+            and normalize_word(next_node["word"]) in ECHO_PRONOUNS:
+        return None, lookahead
+    if norm_current == "pan" and not target_is_verb:
         return None, lookahead
 
     target_lemma = get_welsh_lemma(target_norm)
@@ -2489,7 +2574,17 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if t1.get("fem_ei"):
         return _evaluate_feminine_ei(current_node, target_found, norm_current), lookahead
     if t1.get("mixed"):
-        return _evaluate_mixed_mutation(current_node, target_found, norm_current), lookahead
+        # Mixed mutation belongs to the NEGATIVE PARTICLE, before a verb ("na
+        # fydd", "ni chaf"). Before anything else "na" is "than"/"nor"
+        # (aspirate only: "na phethau") or, opening an utterance, the answer
+        # "no" -- "na byth" (no, never) was scored as soft-mutation erosion
+        # three times in davies1.cha (2026-09-26). ni/nid/oni before a
+        # non-verb mutate nothing.
+        if _is_verb_target(target_found):
+            return _evaluate_mixed_mutation(current_node, target_found, norm_current), lookahead
+        if norm_current != "na" or i == 0 or words_list[i - 1].get("_clause_boundary_after"):
+            return None, lookahead
+        expected = ["aspirate"]
     if t1.get("h_mutation") or expected == ["h-mutation"]:
         return _evaluate_h_mutation(current_node, target_found, norm_current), lookahead
 
@@ -2701,7 +2796,11 @@ def process_comprehensive_mutations(words_list):
     i = 0
     while i < len(words_list):
         current_node  = words_list[i]
-        if current_node.get("synthetic"):
+        # Synthetic clitics carry no tags of their own and are skipped -- except
+        # the article "'r" ("i'r dref"), which is exactly what Layer 1B
+        # (article + feminine noun) needs as its trigger.
+        if current_node.get("synthetic") and \
+                normalize_word(current_node["word"]) not in DEFINITE_ARTICLE_FORMS:
             i += 1
             continue
 
@@ -2739,7 +2838,11 @@ def process_comprehensive_mutations(words_list):
         # regardless of what "jips" resolves to. A single-char word that
         # ISN'T a recognized trigger is still skipped, same as before --
         # this only carves out the ones that are.
-        if conf_current < 0.65 or (len(norm_current) <= 1 and norm_current not in TRIGGERS):
+        # The articles "y"/"r" ("'r") are single characters too and are
+        # Layer 1B's triggers -- without this exception "y ferch"/"y merch"
+        # never produced a row (phrase test, 2026-09-26).
+        if conf_current < 0.65 or (len(norm_current) <= 1 and norm_current not in TRIGGERS
+                                   and norm_current not in DEFINITE_ARTICLE_FORMS):
             i += 1
             continue
 
@@ -2842,8 +2945,14 @@ def process_comprehensive_mutations(words_list):
             # not a grammatical choice -- "Plaid Cymru"/"Radio Cymru" never
             # mutate (live: "Radio Cymru" scored as erosion), and the old
             # compounds that do ("Gŵyl Ddewi") are lexicalized, not productive.
+            # OFF since 2026-09-26 (FEM_GENITIVE_RULE_ENABLED): the mutation
+            # only happens when the second noun is ATTRIBUTIVE ("côt law"),
+            # not in a possessive/label genitive, and the parser can't tell
+            # the two apart -- all 5 erosion rows in davies1.cha were the
+            # latter ("ysgol blwyddyn [deg]", "lan pen", "wythnos mis"...).
             nsd = next_node.get("spacy_token", {}).get("dep", "") if next_node.get("spacy_token") else ""
-            if (nsp == "NOUN" or (nsp != "PROPN" and ncp.split("+")[0].startswith("N"))) and nsd == "nmod":
+            if FEM_GENITIVE_RULE_ENABLED and \
+                    (nsp == "NOUN" or (nsp != "PROPN" and ncp.split("+")[0].startswith("N"))) and nsd == "nmod":
                 row = _process_gender_trigger(
                     current_node, next_node, ["soft"],
                     norm_current, "fem_noun+genitive_noun", None, True)
@@ -3032,7 +3141,13 @@ def process_comprehensive_mutations(words_list):
                     continue
 
         # ---- Layer 2: phantom (heuristic + Cysill required) ----
-        row = _process_phantom_check(current_node, cysill_pos, conf_current)
+        # Same consumption guard as 1H/1I: a word already scored as a
+        # trigger's target is not an unexplained mutation. Without it, "i
+        # gael" produced a correct_mutation row for "gael" AND a phantom row
+        # for the same "gael" (davies1.cha, 2026-09-26, once Cysill covered
+        # every word).
+        row = (None if was_consumed(current_node)
+               else _process_phantom_check(current_node, cysill_pos, conf_current))
         if row:
             mutation_rows.append(row)
         i += 1

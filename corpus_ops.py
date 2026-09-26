@@ -58,13 +58,13 @@ from corpus_io import (
     load_queue, save_queue, load_processed, save_processed,
     load_failed, save_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
-    cleanup_incomplete_video_dirs,
+    cleanup_incomplete_video_dirs, pipeline_version, session_dir,
 )
 # PATCH: single source of truth (see mutation_tables.py for rationale) --
 # was three separate inline copies of this same 4-status list in this
 # file, plus a fourth, DIFFERENT (and wrong) computation for the headline
 # email number. All four now reference this one import.
-from mutation_tables import EVALUABLE_STATUSES
+from mutation_tables import EVALUABLE_STATUSES, DEFINITE_ARTICLE_FORMS
 from youtube_access import YouTubeRateLimited, call as youtube_call
 import prep_engine
 import plural_engine
@@ -417,7 +417,7 @@ def generate_research_summary(mutation_rows, stamp):
     # SUMMARY_DIR/<summary-type>/ -- SUMMARY_DIR is just an alias for
     # RUNS_DIR now (see corpus_io.py), and a run's own summary files
     # belong alongside its video folders, not in a separate top-level tree.
-    run_dir = SUMMARY_DIR / stamp
+    run_dir = session_dir(stamp)   # runs/<stamp>_<label>/, see corpus_io
     run_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([summary]).to_csv(run_dir / f"research_summary_{clean_stamp(stamp)}.csv", index=False)
 
@@ -849,6 +849,7 @@ def _log_download_environment():
     tqdm.write(f"  [env] deno: {shutil.which('deno') or 'NOT FOUND on PATH'} | "
                f"cookies configured: {cookie_mode}")
     tqdm.write(f"  [env] {cysill_status_line()}")
+    tqdm.write(f"  [env] pipeline version {pipeline_version()}")
 
 
 # PATCH: getaddrinfo failed / "Failed to resolve" (Windows errno 11001,
@@ -1518,7 +1519,18 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
             # needed the same carve-out. A single-char word that ISN'T a
             # recognized trigger is still dropped from words_only/word_rows/
             # lemma_rows/pos_rows, same as before.
-            if (len(norm_word) < 2 and norm_word not in TRIGGERS) or w.get("synthetic"):
+            # Articles and clitics must reach detection: dropping "y" and the
+            # split-off "'r"/"'w"/"'i" made "yn y corws" / "i'r tŷ" look like
+            # "yn corws" / "i tŷ" -- every masculine noun after "in/to the"
+            # scored as erosion, and "y ferch" never reached the article
+            # rule (davies1.cha, 2026-09-26). "y" is an ordinary word (and a
+            # DET the F-score counts -- "yr" always was); synthetic clitics
+            # have no timing/tags of their own, so they go to detection only.
+            if w.get("synthetic"):
+                words_only.append(w)
+                continue
+            if len(norm_word) < 2 and norm_word not in TRIGGERS \
+                    and norm_word not in DEFINITE_ARTICLE_FORMS:
                 continue
 
             lemma      = get_welsh_lemma(raw_word)
@@ -1652,6 +1664,13 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
             "video_word_count": video_word_count,
             "video_codeswitch_word_count": video_codeswitch_word_count,
         })
+
+    # Which detection code produced these rows -- see corpus_io.pipeline_version().
+    version = pipeline_version()
+    for rows in (segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows,
+                 prep_rows, plural_rows, numeral_rows):
+        for row in rows:
+            row["pipeline_version"] = version
 
     return segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows, \
         prep_rows, plural_rows, numeral_rows

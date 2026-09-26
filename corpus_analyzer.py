@@ -1370,6 +1370,26 @@ def load_branch_rows():
     return out
 
 
+UNVERSIONED = "unversioned (before 2026-09-26)"
+
+
+def report_pipeline_versions(df, label):
+    """Prints a warning when rows come from more than one pipeline_version
+    (corpus_io.pipeline_version()): numbers pooled across detection-code
+    versions aren't one measurement. Returns the version counts."""
+    if df is None or df.empty:
+        return pd.Series(dtype=int)
+    versions = (df["pipeline_version"].fillna(UNVERSIONED) if "pipeline_version" in df.columns
+                else pd.Series(UNVERSIONED, index=df.index))
+    counts = versions.value_counts()
+    if len(counts) > 1:
+        print(f"  ⚠️ {label}: rows from {len(counts)} different pipeline versions -- "
+              f"re-process the older videos before reporting these numbers:")
+        for version, n in counts.items():
+            print(f"      {version}: {n:,} rows")
+    return counts
+
+
 def _unit_rates(rows, keys, min_contexts):
     """Erosion rate + context count per unit (keys: video, or video+speaker)."""
     if rows is None or rows.empty or any(k not in rows.columns for k in keys):
@@ -1649,6 +1669,7 @@ def main():
     print(f"Reading from: {MUT_DIR}\n")
 
     df, batch_log = load_and_merge_mutations()
+    report_pipeline_versions(df, "Mutation corpus")
     validate_columns(df)
     df = prepare(df)
 
@@ -1704,6 +1725,7 @@ def main():
         n_video = rows["video_url"].nunique() if not rows.empty else 0
         rate = f"{rows['is_erosion'].mean():.1%}" if not rows.empty else "n/a"
         print(f"  {label:<26} {len(rows):>6,} evaluable contexts, {n_video:>4} videos, erosion {rate}")
+        report_pipeline_versions(rows, label)
     if not formality_df.empty:
         fig_branches_vs_formality(branch_rows, formality_df, ["video_url"],
                                   "branches_vs_formality.png", "video")

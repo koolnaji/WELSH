@@ -340,6 +340,52 @@ WELSH_CONTRACTION_SPLITS = {
     "o'i":  ["o", "'i"],
 }
 
+# Personal pronouns that "echo" a possessive after its noun ("fy nghôl i",
+# "ein tŷ ni"). Colloquially the possessive itself is often dropped -- "yn
+# côl fi", "i tŷ ni" (davies1.cha) -- and the mutation belonged to the
+# possessive, not to the preposition before it. "i" and "o" are left out:
+# after a noun they are far more often "to"/"of" ("darn o bapur").
+ECHO_PRONOUNS = {"fi", "ti", "di", "fe", "e", "hi", "ni", "chi", "nhw"}
+
+# The soft-mutating prepositions among TRIGGERS. A preposition governs a
+# nominal, so a lone adjective or adverb after one isn't its object (see
+# _process_word_trigger).
+SOFT_PREPOSITION_TRIGGERS = {"am", "ar", "at", "dan", "dros", "drwy", "trwy",
+                             "heb", "wrth", "gan", "i", "o", "hyd"}
+
+# Fixed expressions: lexicalised phrases whose mutation is frozen, so they
+# say nothing about whether mutation is still a live rule (decision
+# 2026-09-26: excluded). trigger -> target forms, listing BOTH the mutated
+# and the radical form of each, so "wrth gwrs" and "wrth cwrs" are skipped
+# alike and the exclusion can't tilt the rate either way.
+FIXED_EXPRESSIONS = {
+    "wrth": {"gwrs", "cwrs"},                              # of course
+    "ar":   {"gyfer", "cyfer", "gael", "cael", "goll", "coll",
+             "bwys", "pwys", "draws", "traws", "werth", "gwerth"},
+                                                           # for, available, lost, near, across, for sale
+    "o":    {"bosib", "posib", "bosibl", "posibl", "gwbl", "cwbl",
+             "gwmpas", "cwmpas", "dan", "tan", "flaen", "blaen",
+             "leiaf", "lleiaf", "bell", "pell"},           # possibly, at all, around, under, in front, at least, from afar
+    "i":    {"gyd", "cyd", "lawr", "llawr", "fyny", "myny", "maes", "faes"},
+                                                           # all, down, up, out
+    "am":   {"byth", "fyth", "ddim", "dim", "wn", "gwn"},  # forever, free, as far as (I know)
+    "ei":   {"gilydd", "cilydd"},                          # each other
+}
+
+# "o'n i" / "ro'n ni" are the past of bod -- oeddwn i / roedden ni (I was /
+# we were) -- not o + yn. The generic X'n split turned "o'n i meddwl" into
+# "o yn i meddwl", so "o" read as the preposition and "i" as "to" (davies1.cha,
+# 2026-09-26). Only before a subject pronoun: "o'n" before a noun is "o ein"
+# (of our) and keeps the generic split.
+OEDD_CONTRACTIONS    = {"o'n": "oedd", "ro'n": "roedd"}
+OEDD_PERSON_ENDINGS  = {"i": "wn", "fi": "wn", "ni": "en", "nhw": "en"}
+
+# Northern "'dan ni" = "(yd)dan ni", WE ARE -- not the preposition "dan"
+# (under), whose 1pl is "danon ni". Transcribed plain "dan" (davies10: "dan ni
+# yn alw fo", "dan ni wedi gwneud"), it was ~20 false conjugated-preposition
+# erosions in six Siarad files (2026-09-26). (clipped form, next word) -> full.
+CLIPPED_BOD_FORMS = {("dan", "ni"): "ydan", ("'dan", "ni"): "ydan"}
+
 # PATCH: known suppletive Welsh comparative/superlative adjectives. Welsh
 # lemmatizers (Cysill and simplemma) collapse comparative/superlative forms
 # to their citation (positive-grade) lemma for dictionary purposes -- e.g.
