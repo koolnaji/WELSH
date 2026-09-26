@@ -42,6 +42,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -399,13 +400,29 @@ def _preview_video_slug(meta, stamp):
 # printing would meaningfully bloat a multi-thousand-entry cache) and
 # tolerant of numpy/pandas scalar types (the `default=` fallback) that
 # can end up in a checkpoint's "enriched_words" list.
+def _replace_with_retry(tmp_path, path, attempts=6):
+    """tmp -> final rename, retried on Windows PermissionError. Antivirus or
+    the search indexer can hold a handle on a just-written file for a
+    moment, and replacing a file while it's open fails with WinError 5
+    ("Access denied") -- confirmed 2026-09-26 on a Siarad run, where the
+    checkpoint was being rewritten once per utterance."""
+    for attempt in range(attempts):
+        try:
+            tmp_path.replace(path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1 * 2 ** attempt)   # 0.1s .. 1.6s, ~3s in total
+
+
 def _write_json(path, value):
     """Atomically replace a small JSON state file to avoid corrupting it
     on a crash."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp_path.replace(path)
+    _replace_with_retry(tmp_path, path)
 
 
 def _write_json_atomic(path, value):
@@ -416,7 +433,7 @@ def _write_json_atomic(path, value):
     tmp_path.write_text(json.dumps(value, ensure_ascii=False,
                                     default=lambda o: float(o) if hasattr(o, "__float__") else str(o)),
                          encoding="utf-8")
-    tmp_path.replace(path)
+    _replace_with_retry(tmp_path, path)
 
 
 # ---- queue / processed / failed / local-processed logs ----

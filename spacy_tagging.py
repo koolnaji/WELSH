@@ -100,6 +100,40 @@ def extract_number_from_spacy(spacy_token):
     return None
 
 
+def tagged_as(word_dict, spacy_pos, cysill_prefixes):
+    """POS gate for the non-mutation branches: spaCy decides whenever it
+    tagged the word, Cysill only when spaCy has no token. It used to be
+    spaCy OR Cysill, which (a) let Cysill's ambiguous multi-tags through --
+    "yn" in "os byddai fe yn ti" (if it were you) is predicative, spaCy says
+    PART/case:pred, but Cysill's "PREP+PREDYN" starts with PREP, giving a
+    false conjugated-preposition erosion (davies1.cha, 2026-09-26) -- and
+    (b) made a row depend on whether Cysill happened to answer for that
+    chunk, which varies with its rate limit, not with the speech."""
+    spacy_tok = word_dict.get("spacy_token")
+    if spacy_tok:
+        return spacy_tok.get("pos") == spacy_pos
+    return (word_dict.get("cysill_pos") or "").upper().startswith(cysill_prefixes)
+
+
+# Lexicon POS tags for a conjunction reading. A form that is also a
+# conjunction ("achos" = because / cause) is overwhelmingly the conjunction
+# in speech: "mewn tair, achos oedd pawb..." was scored numeral + noun.
+_CONJUNCTION_POS = {"CONJ", "CCONJ", "SCONJ"}
+
+
+def is_noun_target(word_dict):
+    """Noun gate shared by numeral_engine.py and plural_engine.py. Tagged
+    NOUN (tagged_as above), and the Bangor lexicon doesn't contradict it:
+    a form the lexicon knows but never as a noun ("wyt", you-are, which
+    spaCy tagged NOUN in "pump, wyt [ti]?") or that it also knows as a
+    conjunction is not accepted. Words the lexicon doesn't know
+    ("lex_pos" None) fall back to the tag alone."""
+    lex_pos = word_dict.get("lex_pos")
+    if lex_pos and ("NOUN" not in lex_pos or _CONJUNCTION_POS & set(lex_pos)):
+        return False
+    return tagged_as(word_dict, "NOUN", ("N",))
+
+
 def noun_number(word_dict):
     """(number, source) for an enriched word already known to be a noun --
     the one number reading numeral_engine.py and plural_engine.py share, so

@@ -8,7 +8,9 @@ but on the HUMAN transcript, so no Whisper errors -- via
 corpus_ops.analyze_segments().
 
 Usage:
-    python corpus_siarad.py <file.cha | folder of .cha files>
+    python corpus_siarad.py <file.cha | folder of .cha files> [--redo]
+    (a folder is searched recursively; conversations already in runs/ are
+    skipped unless --redo is given, so a stopped run can simply be restarted)
 
 Output, per conversation, in runs/<stamp>/Siarad_<file>/:
   - the same segments/words/lemmas/pos/mutations/prep/plural/numeral CSVs a
@@ -46,7 +48,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from corpus_io import (
-    ensure_dirs, run_stamp, _video_slug, append_output_csv,
+    RUNS_DIR, ensure_dirs, run_stamp, _video_slug, append_output_csv,
     cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
 )
 from corpus_ops import analyze_segments
@@ -288,15 +290,36 @@ def process_file(path, stamp):
         cleanup_incomplete_video_dirs(vpaths, video_label=path.name)
 
 
+def _already_done(path):
+    """True if some earlier run already wrote this conversation's segments
+    CSV (runs/<stamp>/Siarad_<file>/segments_*.csv). The whole corpus is
+    tens of thousands of Cysill calls -- hours, usually several sittings --
+    so re-running the folder has to pick up where it stopped rather than
+    redo every finished file."""
+    return any(RUNS_DIR.glob(f"*/Siarad_{path.stem}/segments_*.csv"))
+
+
 def main(argv):
+    redo = "--redo" in argv
+    argv = [a for a in argv if a != "--redo"]
     if len(argv) != 1:
-        print("Usage: python corpus_siarad.py <file.cha | folder of .cha files>")
+        print("Usage: python corpus_siarad.py <file.cha | folder of .cha files> [--redo]")
         return 1
     target = Path(argv[0])
-    files = sorted(target.glob("*.cha")) if target.is_dir() else [target]
+    # rglob: the TalkBank zip unpacks into a Siarad/ subfolder
+    files = sorted(target.rglob("*.cha")) if target.is_dir() else [target]
     if not files or not all(f.exists() for f in files):
         print(f"No .cha files found at {target}")
         return 1
+    if not redo:
+        done = [f for f in files if _already_done(f)]
+        if done:
+            print(f"Skipping {len(done)} conversation(s) already in runs/ "
+                  f"(add --redo to process them again).")
+        files = [f for f in files if f not in done]
+        if not files:
+            print("Nothing left to process.")
+            return 0
 
     ensure_dirs()
     load_lemma_cache()

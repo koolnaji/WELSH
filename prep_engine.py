@@ -29,7 +29,7 @@ specifically so this branch can't independently reintroduce the double-
 counting bug found and fixed in the mutation branch (see
 mutation_engine.py's PATCH (2.2) comment for the full story).
 """
-from spacy_tagging import mark_consumed, was_consumed
+from spacy_tagging import mark_consumed, tagged_as, was_consumed
 from prep_tables import (
     PERSONS, INDEPENDENT_PRONOUNS, PREP_BARE_FORMS, PREP_CONJUGATED_FORMS,
     PREP_LEXEME_ALIASES, WELSH_FILLERS,
@@ -87,13 +87,6 @@ def _find_pronoun_target(i, words_list):
             continue
         return candidate, lookahead
     return None, lookahead
-
-
-def _tagged_as(node, spacy_pos, cysill_prefixes):
-    spacy_tok = node.get("spacy_token") or {}
-    if spacy_tok.get("pos") == spacy_pos:
-        return True
-    return (node.get("cysill_pos") or "").upper().startswith(cysill_prefixes)
 
 
 def _build_prep_row(current_node, target_node, prep, person, status,
@@ -160,7 +153,7 @@ def process_preposition_erosion(words_list):
         # "i", "o", "ni", "fi" are also pronouns/particles/interjections, so the
         # word after the preposition must actually be tagged as a pronoun --
         # applied to correct AND eroded cases alike, so it can't tilt the rate.
-        if not _tagged_as(target, "PRON", ("PRON",)):
+        if not tagged_as(target, "PRON", ("PRON",)):
             continue
 
         # Case A: current word IS a correctly-conjugated form for this
@@ -192,9 +185,12 @@ def process_preposition_erosion(words_list):
         # spelling variant checks against its lexeme's real paradigm.
         # The bare forms ("i", "o", "yn", "am"...) are homographs of pronouns,
         # interjections and particles, so they must be tagged as a
-        # preposition. Conjugated forms (Case A: "iddo", "arna", "ohono") are
-        # unambiguous words and aren't gated this way.
-        if norm in PREP_BARE_FORMS and _tagged_as(current_node, "ADP", ("PREP", "CPREP")):
+        # preposition -- by spaCy wherever it tagged the word (see
+        # spacy_tagging.tagged_as(): predicative "yn" in "os byddai fe yn ti"
+        # got through on Cysill's ambiguous "PREP+PREDYN" before). Conjugated
+        # forms (Case A: "iddo", "arna", "ohono") are unambiguous words and
+        # aren't gated this way.
+        if norm in PREP_BARE_FORMS and tagged_as(current_node, "ADP", ("PREP", "CPREP")):
             lexeme = PREP_LEXEME_ALIASES.get(norm, norm)
             valid_forms = PREP_CONJUGATED_FORMS.get(lexeme, {}).get(person)
             if valid_forms:

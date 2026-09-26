@@ -344,7 +344,10 @@ def load_and_merge_mutations():
     for f in csv_files:
         try:
             df = pd.read_csv(f, encoding="utf-8-sig")
-            m  = re.search(r"mutations_(\d{8}_\d{6})(?:_(.+))?\.csv$", f.name)
+            # (?:original_|corroborated_)? -- without it this never matched the
+            # current per-video filenames, and "batch" held the whole stem.
+            m  = re.search(r"mutations_(?:original_|corroborated_)?(\d{8}_\d{6})(?:_(.+))?\.csv$",
+                           f.name)
             batch_stamp = m.group(1) if m else f.stem
             video_slug  = m.group(2) if (m and m.group(2)) else ""
             # label column: "20260625_193337 · Hansh_clip_01" for per-video files,
@@ -365,13 +368,27 @@ def load_and_merge_mutations():
     merged      = pd.concat(frames, ignore_index=True)
     initial_len = len(merged)
 
+    # One run per video: a video processed more than once keeps only its
+    # most recent run's rows (stamps sort chronologically). Key-based
+    # de-duplication alone can't do this -- a false row that a detection fix
+    # stopped producing has no newer duplicate, so the old run's copy would
+    # survive; and it used keep="first", so even matching rows kept the
+    # OLDEST verdict.
+    if "video_url" in merged.columns and "batch" in merged.columns:
+        latest = merged.groupby("video_url", dropna=False)["batch"].transform("max")
+        merged = merged[merged["batch"] == latest]
+        superseded = initial_len - len(merged)
+        if superseded:
+            print(f"  Dropped {superseded} rows from older runs of re-processed videos.")
+
     dedup_keys   = ["video_url", "timestamp", "trigger_word", "following_word"]
     present_keys = [k for k in dedup_keys if k in merged.columns]
     if present_keys:
-        merged  = merged.drop_duplicates(subset=present_keys, keep="first")
-        dropped = initial_len - len(merged)
+        before  = len(merged)
+        merged  = merged.drop_duplicates(subset=present_keys, keep="last")
+        dropped = before - len(merged)
         if dropped:
-            print(f"  Removed {dropped} duplicate rows across runs.")
+            print(f"  Removed {dropped} duplicate rows.")
 
     print(f"\nMerged total: {len(merged)} unique mutation contexts "
           f"from {len(frames)} batch(es).\n")

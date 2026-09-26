@@ -18,6 +18,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 import json
 import hashlib
+import time
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
@@ -104,7 +105,7 @@ def yt_dlp_cookie_opts():
 from cysill_client import (
     TECHIAITH_API_KEY,
     reset_cysill_circuit_breaker,   # re-exported for welsh_pipeline.py
-    fetch_lemma, fetch_pos_for_chunk, chunk_words_for_pos,
+    fetch_lemma, fetch_pos_for_chunk, chunk_words_for_pos, tagger_text_for_chunk,
     CYSILL_CALL_FAILED,
 )
 
@@ -326,6 +327,14 @@ def get_welsh_lemma(word):
             fallback = simplemma_lemmatize(w, lang="cy")
             lemma = fallback if fallback and fallback != w else None
         except Exception:
+            lemma = None
+        # The cache once held "prpers" -- a POS tag, not a lemma -- for "i",
+        # "o" and "-fi"; Cysill's lemmatizer answers "i"/"o" correctly
+        # (checked live 2026-09-26), so it came from this fallback. For a
+        # word the lexicon knows (here: one it knows but can't settle, like
+        # "i" = i/mi), only accept one of the lexicon's own lemmas.
+        known = {e["lemma"].lower() for e in bangor_lexicon.lookup(w)}
+        if lemma and known and lemma not in known:
             lemma = None
     # PATCH: only skip caching when Cysill's call itself genuinely failed
     # (rate limit, timeout, circuit breaker) AND we still ended up with
@@ -606,13 +615,12 @@ def preprocess_segment(seg, seg_id=None):
     PATCH: each word is stamped with "_seg_id" (the index of the Whisper
     segment it came from). This is internal bookkeeping only -- output
     rows are built via explicit key-selection dicts elsewhere, so this
-    never leaks into any CSV column. It exists so chunk_words_for_pos()
-    can refuse to merge words from two different segments into the same
-    tagger chunk, even when they'd otherwise fit under the character
-    budget. Without it, a chunk boundary could fall mid-sentence or --
-    worse, in multi-speaker audio -- splice the tail of one segment onto
-    the head of the next with no signal in the text that a boundary
-    (silence gap, possible speaker change) occurred there at all.
+    never leaks into any CSV column. chunk_words_for_pos() keeps segments
+    whole inside a chunk and tagger_text_for_chunk() puts a full stop
+    between them, so a boundary (silence gap, possible speaker change) is
+    never spliced over in the text the taggers see; analyze_segments()
+    also marks each segment's last word as a clause boundary for the
+    detection engines.
     """
     raw_words = []
     for w in seg.words:
@@ -787,6 +795,7 @@ def align_with_gap_tolerance(tagger_tokens, whisper_words, window=GAP_ALIGN_WIND
 # corpus_ops.py to avoid what would have been a circular import --
 # corpus_io.py now sits below both this module and corpus_ops.py in the
 # import graph, so that duplication is no longer needed.)
+CHECKPOINT_INTERVAL_SECONDS = 30
 
 
 def enrich_words(all_preprocessed_words, checkpoint_key=None):
@@ -819,6 +828,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
     chunks   = chunk_words_for_pos(all_preprocessed_words)
     enriched = []
     start_chunk_idx = 0
+    last_checkpoint_at = time.monotonic()
 
     checkpoint_path = None
     if checkpoint_key:
@@ -838,7 +848,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
     for chunk_idx, chunk in enumerate(chunks):
         if chunk_idx < start_chunk_idx:
             continue
-        chunk_text = " ".join(w["word"] for w in chunk)
+        chunk_text = tagger_text_for_chunk(chunk)
 
         # PATCH: whole-chunk skip. If EVERY word in this chunk is either
         # (a) a single unambiguous reading in the offline Bangor lexicon,
@@ -863,9 +873,8 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
         # English word up in it would just be a different flavour of the
         # same mistake).
         #
-        # Still all-or-nothing PER CHUNK, not per word: chunks are
-        # already segment-bounded (chunk_words_for_pos() breaks at
-        # _seg_id changes), so skipping only SOME words out of a chunk's
+        # Still all-or-nothing PER CHUNK, not per word: skipping only
+        # SOME words out of a chunk's
         # text before sending the rest to Cysill would hand the live
         # tagger a span with words silently missing -- degrading
         # Cysill's own accuracy on the Welsh words that still need it,
@@ -1015,10 +1024,16 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
             # English words -- "man" is also a Welsh noun.
             is_english = (w["_code_switch"] if "_code_switch" in w
                           else is_english_code_switch(w["word"], None))
+            use_lex = bangor_lexicon.is_loaded() and not is_english
             lex = (bangor_lexicon.noun_features(normalize_word(w["word"]))
-                   if bangor_lexicon.is_loaded() and not is_english else None) or {}
+                   if use_lex else None) or {}
             entry["lex_gender"]           = lex.get("gender")
             entry["lex_number"]           = lex.get("number")
+            # Every POS the lexicon lists for this form (None if unknown to
+            # it), so a noun gate can reject what the dictionary says can't
+            # be a noun here -- spacy_tagging.is_noun_target().
+            lex_readings = bangor_lexicon.lookup(normalize_word(w["word"])) if use_lex else []
+            entry["lex_pos"]              = sorted({e["pos"] for e in lex_readings}) or None
             # Unified gender: lexicon, then spaCy, then Cysill -- but the
             # lexicon's NOUN gender only where the word is tagged a noun
             # here. "gender" is also read for adjective triggers (Layer 1G's
@@ -1036,9 +1051,22 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
                 normalize_word(w["word"]))
             enriched.append(entry)
 
-        if checkpoint_path is not None:
-            save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
-                                     len(chunks), chunk_idx + 1, enriched)
+        # At most every CHECKPOINT_INTERVAL_SECONDS, not after every chunk:
+        # each save rewrites ALL words tagged so far, and a Siarad chunk is a
+        # single utterance, so per-chunk saving meant ~1,000 ever-larger
+        # rewrites per conversation (and the WinError 5 that killed
+        # davies1.cha on 2026-09-26). A crash now loses at most that much
+        # tagging. A failed save is only a lost resume point, never a
+        # reason to lose the video.
+        if checkpoint_path is not None and \
+                time.monotonic() - last_checkpoint_at >= CHECKPOINT_INTERVAL_SECONDS:
+            try:
+                save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
+                                       len(chunks), chunk_idx + 1, enriched)
+            except OSError as e:
+                tqdm.write(f" ⚠️ Checkpoint not saved ({e}) -- continuing; this video "
+                           f"just can't resume from here if interrupted.")
+            last_checkpoint_at = time.monotonic()
 
     if checkpoint_path is not None:
         # Every chunk made it through -- the checkpoint has done its job for
@@ -1197,12 +1225,25 @@ def layer_1_trigger_detection(trigger_word, cysill_pos=None,
     if trigger == "a":
         pos       = cysill_pos or ""
         spacy_dep = spacy_token.get("dep") if spacy_token else None
-        if any(t in pos for t in REL_INT_TAGS) or "PRONREL" in pos:
-            expected_list = ["soft"]
-        elif "CONJ" in pos or spacy_dep in ("cc",):
+        # Cysill joins readings it can't choose between with "+": "a" in "a
+        # Gethin" (and Gethin) came back "CONJ+EXCL+PART+PRONREL", which hit
+        # the relative-pronoun test first and expected SOFT mutation on names
+        # after "and" (davies1.cha, 2026-09-26: a Gethin / a Mererid / a
+        # Bethan / a pan all scored as erosion). A multi-reading tag says
+        # nothing about which "a" this is, so spaCy's dep decides and Cysill
+        # only counts when it gave one reading. If neither settles it, the
+        # table default ("soft|aspirate") would still judge a g-/b-/d-word
+        # against soft -- so an undecided "a" is not a trigger at all.
+        cysill_single = "+" not in pos
+        if spacy_dep == "cc" or (cysill_single and "CONJ" in pos):
             expected_list = ["aspirate"]
-        elif spacy_dep == "nsubj":
+        elif spacy_dep == "nsubj" or (cysill_single and (
+                any(t in pos for t in REL_INT_TAGS) or "PRONREL" in pos)):
             expected_list = ["soft"]
+        else:
+            return {"trigger_detected": False, "expected_mutation": None,
+                    "trigger_word": trigger, "fem_ei": False,
+                    "mixed": False, "h_mutation": False}
 
     if trigger == "ei":
         gender = (extract_gender_from_spacy(spacy_token)
@@ -1772,6 +1813,19 @@ def classify_register_adjustment(expected, surface_mut):
 
 
 # ========================= MUTATION EVALUATION =========================
+def _tagger_mutation_matches(target_node, expected):
+    """The expected mutation types that spaCy's Mutation feature or Cysill's
+    (or the lexicon's) mutation tag positively report on this target -- the
+    taggers saying the form IS already mutated that way. Empty set when
+    neither says so (absence of a tag is not evidence of a radical)."""
+    spacy_tok = target_node.get("spacy_token") or {}
+    found = {SPACY_MUTATION_MAP.get(spacy_tok.get("mutation")),
+             target_node.get("cysill_mutation_type")} - {None}
+    if "soft" in found:
+        found.add("soft_limited")
+    return found & set(expected)
+
+
 def _evaluate_mutation_outcome(target_node, expected):
     t2 = layer_2_lemma_analysis(
         target_node["word"],
@@ -1847,6 +1901,17 @@ def _evaluate_mutation_outcome(target_node, expected):
                 status, is_erosion = "erosion_unverified", False
                 note = (f"Radical used under {expected} but both taggers absent "
                         f"-- insufficient evidence for erosion classification")
+            elif _tagger_mutation_matches(target_node, expected):
+                # The heuristic took the surface for a radical, but a tagger
+                # marks it as carrying the expected mutation -- the erosion
+                # claim is contradicted, not just unconfirmed. davies1.cha
+                # (2026-09-26): "i gartre" (gartre = soft of cartre, OOV in
+                # the lexicon as a colloquial spelling) and "ei gilydd" were
+                # both counted as erosion over spaCy's own Mutation=SM.
+                status, is_erosion = "erosion_unverified", False
+                note = (f"Looks radical under {expected}, but a tagger marks it "
+                        f"{'/'.join(sorted(_tagger_mutation_matches(target_node, expected)))}"
+                        f"-mutated -- contradicted, not counted as erosion")
             else:
                 status, is_erosion = "erosion", True
                 note = f"**EROSION**: expected {expected}, radical used"
@@ -2312,6 +2377,12 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if (target_pos == "PRON" or target_cysill.startswith("PRON")) \
             and target_norm not in ("pwy", "bwy", "mhwy"):
         return None, lookahead
+    # Function words aren't soft/nasal targets: "yna gyda", "o gyda", "sy
+    # gyda", "yna drwy", "i mewn" were all scored as erosion (davies1.cha,
+    # 2026-09-26). Aspirate is kept: "a phan", "a thrwy" are real contexts.
+    if target_pos in ("ADP", "SCONJ", "CCONJ", "PART", "AUX", "DET", "INTJ") \
+            and "aspirate" not in (expected or []):
+        return None, lookahead
     # "dyna pam" / "dyna lle" = "that's why/where": invariant question words.
     if norm_current in ("dyna", "dyma", "yna") and \
             target_norm in ("pam", "lle", "ble", "pryd", "sut", "beth", "pwy"):
@@ -2381,6 +2452,21 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         target_is_verb = (target_spacy_pos == "VERB" or target_verbform == "Vnoun"
                           or target_cysill_pos.startswith("VB"))
         if target_is_verb:
+            return None, lookahead
+
+    # Pronoun "i" (I) before a verb-noun, with the spoken "yn" dropped: "sa i
+    # credu" / "o'n i meddwl" / "sa i gwybod" (I don't think / I was
+    # thinking / I don't know). spaCy tags that "i" ADP, so the pronoun
+    # gate misses it, but it parses the verb-noun as the clause ROOT; after
+    # the preposition "i" the verb-noun is subordinate ("i gael", "i drio":
+    # advcl/xcomp/acl). All four ROOT cases in davies1.cha (2026-09-26)
+    # were the pronoun.
+    if norm_current == "i":
+        target_spacy = target_found.get("spacy_token") or {}
+        target_is_vn = (target_spacy.get("pos") == "VERB"
+                        or (target_spacy.get("morph") or {}).get("VerbForm") == "Vnoun"
+                        or "VERB" in (target_found.get("lex_pos") or []))
+        if target_spacy.get("dep") == "ROOT" and target_is_vn:
             return None, lookahead
 
     # PATCH: ll/rh soft-mutation exemption (see LL_RH_SOFT_EXEMPT_TRIGGERS_*

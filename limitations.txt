@@ -236,6 +236,14 @@ erosion asserted over an active tagger disagreement. A sensitivity
 analysis reporting erosion rates with and without disputed rows
 included would substantiate how much the headline numbers depend on
 this design choice.
+Partly addressed 2026-09-26: when spaCy's Mutation feature (or Cysill's /
+the lexicon's mutation tag) positively marks the target as carrying the
+expected mutation, the row is now erosion_unverified (not evaluable)
+instead of erosion -- e.g. "i gartre" and "ei gilydd" in Siarad davies1,
+where the heuristic misread an already-mutated colloquial or fixed form
+as a radical. This is one-directional by construction: taggers mark
+mutated forms, not radicals, so there is no mirror-image rule for
+correct_mutation rows. Other disputed rows are still counted.
 
 2.5 Register is measured from the transcript, and the most informal data
 is also the only human-transcribed data

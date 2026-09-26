@@ -339,35 +339,60 @@ def chunk_words_for_pos(all_words, max_chars=POS_CHUNK_MAX_CHARS):
     used for alignment. This guarantees the text sent to taggers matches
     the token stream we align against.
 
-    PATCH: a change in "_seg_id" between consecutive words now forces a
-    new chunk, even if the character budget has room left. Previously
-    chunking was purely character-budget-driven with no awareness of
-    Whisper segment boundaries (silence gaps, and in multi-speaker audio,
-    likely speaker changes) -- a chunk could span across one of those
-    boundaries and hand the tagger a block of text with a sentence, or
-    two different speakers' turns, silently spliced together mid-parse.
-    Words with no "_seg_id" (e.g. from analyze_phrase's synthetic word
-    list, which isn't segment-derived) all share the value None and so
-    never trigger this break -- unchanged behavior for that path.
+    Segments ("_seg_id": a Whisper segment, or one Siarad utterance) are
+    packed WHOLE into chunks up to the character budget; only a single
+    segment longer than the budget is split mid-way. The text for a chunk
+    comes from tagger_text_for_chunk(), which puts a full stop between
+    segments, so neither tagger parses two segments -- possibly two
+    speakers' turns -- as one sentence (Cysill tags it ./EOS, spaCy starts
+    a new sentence; both are dropped before alignment).
+
+    PATCH (2026-09-26): chunks used to END at every segment change, i.e.
+    one Cysill request per segment. A Siarad utterance is often 2-10
+    words, so davies1.cha needed ~970 requests; Cysill's hourly quota cut
+    it off after ~1,300 of 6,387 words (429, Retry-After 3600) and the rest
+    of the file went untagged. Packing segments brings that to ~15.
+    Words with no "_seg_id" (analyze_phrase) all share None and so form
+    one segment.
     """
-    chunks    = []
-    cur_words = []
-    cur_len   = 0
-    cur_seg   = None
-
+    segments = []
     for w in all_words:
-        word_len = len(w["word"]) + 1  # +1 for space
-        seg_id   = w.get("_seg_id")
-        seg_changed = cur_words and seg_id != cur_seg
-        over_budget = cur_words and cur_len + word_len > max_chars
-        if seg_changed or over_budget:
-            chunks.append(cur_words)
-            cur_words = []
-            cur_len   = 0
-        cur_words.append(w)
-        cur_len += word_len
-        cur_seg  = seg_id
+        if segments and w.get("_seg_id") == segments[-1][0].get("_seg_id"):
+            segments[-1].append(w)
+        else:
+            segments.append([w])
 
-    if cur_words:
-        chunks.append(cur_words)
+    chunks  = []
+    cur     = []
+    cur_len = 0
+    for seg in segments:
+        seg_len = sum(len(w["word"]) + 1 for w in seg) + 2   # +2 for the ". " separator
+        if cur and cur_len + seg_len > max_chars:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        if seg_len <= max_chars:
+            cur.extend(seg)
+            cur_len += seg_len
+            continue
+        for w in seg:   # one segment alone is over budget: split it by words
+            word_len = len(w["word"]) + 1
+            if cur and cur_len + word_len > max_chars:
+                chunks.append(cur)
+                cur, cur_len = [], 0
+            cur.append(w)
+            cur_len += word_len
+
+    if cur:
+        chunks.append(cur)
     return chunks
+
+
+def tagger_text_for_chunk(chunk):
+    """The text both taggers get for one chunk: words joined by spaces, with
+    " . " wherever "_seg_id" changes (see chunk_words_for_pos())."""
+    parts = []
+    for i, w in enumerate(chunk):
+        if i and w.get("_seg_id") != chunk[i - 1].get("_seg_id"):
+            parts.append(".")
+        parts.append(w["word"])
+    return " ".join(parts)

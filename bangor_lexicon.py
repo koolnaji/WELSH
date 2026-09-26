@@ -62,7 +62,7 @@ Usage:
        -> lecsicon_cc0.zip -> unzip -> lecsicon_cc0.txt
     2. Put lecsicon_cc0.txt next to this file (the pipeline folder) and it
        is found wherever you run from. BANGOR_LEXICON_PATH, or a path passed
-       to load(), overrides that -- see _candidate_paths().
+       to load(), is tried first -- see _candidate_paths().
 
 Per-word NOUN features (noun_features()): gender and number of a wordform
 read from its NOUN readings only, each kept only when every noun reading
@@ -94,20 +94,27 @@ _MODULE_DIR = Path(__file__).resolve().parent
 LEXICON_FILENAME = "lecsicon_cc0.txt"
 
 
-def _candidate_paths(path=None):
-    """Where load() looks, in order. An explicit path or BANGOR_LEXICON_PATH
-    is the ONLY candidate when given -- a wrong explicit setting should fail
-    loudly, not quietly load some other copy. Otherwise: next to this file,
-    then the older bangor_lexicon/ subfolder layout (beside this file, then
-    under the current directory). The old default was only the last one,
-    relative to wherever you ran from -- which is why a lexicon sitting in
-    the pipeline folder itself was never loaded."""
+def _explicit_path(path=None):
     explicit = path or os.getenv("BANGOR_LEXICON_PATH", "").strip()
-    if explicit:
-        return [Path(explicit)]
-    return [_MODULE_DIR / LEXICON_FILENAME,
-            _MODULE_DIR / "bangor_lexicon" / LEXICON_FILENAME,
-            Path("bangor_lexicon") / LEXICON_FILENAME]
+    return Path(explicit) if explicit else None
+
+
+def _candidate_paths(path=None):
+    """Where load() looks, in order: an explicit path / BANGOR_LEXICON_PATH
+    first, then next to this file, then the older bangor_lexicon/ subfolder
+    layout (beside this file, then under the current directory).
+
+    The explicit setting used to be the ONLY candidate when set. That made a
+    stale Windows setting fatal: on the school laptop a system-wide
+    BANGOR_LEXICON_PATH points at a file that doesn't exist, can't be
+    removed without admin rights, and any window started before the
+    user-level fix still sees it (2026-09-26). load() now falls through to
+    the copy beside the code and says so loudly instead."""
+    explicit = _explicit_path(path)
+    defaults = [_MODULE_DIR / LEXICON_FILENAME,
+                _MODULE_DIR / "bangor_lexicon" / LEXICON_FILENAME,
+                Path("bangor_lexicon") / LEXICON_FILENAME]
+    return ([explicit] if explicit else []) + defaults
 
 # Matches one UD-style feature=value pair at a time, INCLUDING comma-
 # separated multi-values like "Gender=Fem,Masc" (real, attested Welsh
@@ -145,6 +152,10 @@ def load(path=None):
 
     candidates = _candidate_paths(path)
     lex_path = next((p for p in candidates if p.exists()), None)
+    explicit = _explicit_path(path)
+    if lex_path is not None and explicit is not None and lex_path != explicit:
+        print(f"⚠️  BANGOR_LEXICON_PATH points to {explicit}, which doesn't exist -- "
+              f"using {lex_path} instead. Fix or remove that setting.")
     if lex_path is None:
         tried = ", ".join(str(p) for p in candidates)
         raise FileNotFoundError(

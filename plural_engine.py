@@ -11,15 +11,17 @@ plural allomorph was used -- Welsh plural formation is too irregular to
 verify "the correct plural" without a full plural lexicon.
 
 Same gates as numeral_engine.py, applied to correct and eroded cases alike:
-the next word (skipping hesitation sounds, never across a comma) must be
-tagged NOUN, must not be code-switched, and must have a known Number --
+the next word (skipping hesitation sounds, never across a comma or an
+utterance/segment end) must pass spacy_tagging.is_noun_target() (the same
+noun gate as numeral_engine.py), must not be code-switched, and must have a
+known Number --
 unknown means no row. Number comes from spacy_tagging.noun_number(), the
 same reader numeral_engine.py uses (lexicon first, then spaCy). "rhai" as a pronoun ("mae rhai yn meddwl") is
 followed by a non-noun and so produces nothing.
 
 Standalone: imports only spacy_tagging.py.
 """
-from spacy_tagging import noun_number
+from spacy_tagging import is_noun_target, noun_number
 from plural_tables import RHAI_FORMS, COLLECTIVE_NOUNS, WELSH_FILLERS
 
 
@@ -45,13 +47,6 @@ def _find_noun_target(i, words_list):
             continue
         return candidate
     return None
-
-
-def _is_noun(node):
-    spacy_tok = node.get("spacy_token") or {}
-    if spacy_tok.get("pos") == "NOUN":
-        return True
-    return (node.get("cysill_pos") or "").upper().startswith("N")
 
 
 def _build_plural_row(current_node, target_node, status, is_erosion, number_found,
@@ -84,7 +79,7 @@ def process_plural_marking(words_list):
         target = _find_noun_target(i, words_list)
         if target is None or target.get("confidence", 0.0) < 0.65:
             continue
-        if target.get("_code_switch") or not _is_noun(target):
+        if target.get("_code_switch") or not is_noun_target(target):
             continue
 
         target_norm = normalize_word(target["word"])

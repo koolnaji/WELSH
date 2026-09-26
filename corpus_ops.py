@@ -12,6 +12,7 @@ logs, output-path layout, and CSV persistence mechanics now live in
 corpus_io.py (imported below) -- this file only calls them, it doesn't
 own them.
 """
+import hashlib
 import json
 import os
 import re
@@ -884,6 +885,24 @@ def _is_dns_resolution_error(exc):
     return "getaddrinfo failed" in msg or "failed to resolve" in msg
 
 
+def _file_safe_id(video_id):
+    """
+    The id part of an audio filename. A YouTube id ("ZIpzyBNcp5U") is used
+    as-is, so existing audio files keep their names. Anything else gets a
+    short hash instead: yt-dlp's generic RSS listing (Haclediad on Fireside)
+    returns no episode id, so discover_new_videos() falls back to the
+    episode URL -- "https://aphid.fireside.fm/d/.../<uuid>.mp3#__youtubedl_
+    smuggle=..." -- whose slashes became subfolders and pushed the path past
+    Windows' 260-character limit ("unable to open for writing", 2026-09-26).
+    The queue/processed/failed logs keep the original id; only the
+    filename changes.
+    """
+    s = str(video_id)
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", s):
+        return s
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
 def download_audio(video, max_retries=3, audio_dir=None):
     # Titles are neither unique nor stable.  Keying the cache by the source id
     # prevents one video's resume artefact from being mistaken for another's.
@@ -899,7 +918,7 @@ def download_audio(video, max_retries=3, audio_dir=None):
     target_dir = Path(audio_dir) if audio_dir is not None else AUDIO_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     safe_title = clean_title_for_file(video["title"])
-    file_stem  = f"{video['id']}_{safe_title}"
+    file_stem  = f"{_file_safe_id(video['id'])}_{safe_title}"
     raw_path   = target_dir / f"{file_stem}.mp3"
     norm_path  = target_dir / f"{file_stem}_norm.mp3"
     if norm_path.exists() and norm_path.stat().st_size > 0:
@@ -1482,6 +1501,7 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
             "language_probability": round(language_probability, 4),
         })
 
+        kept_before = len(words_only)
         for w in enriched[seg_start:seg_end]:
             raw_word  = w["word"]
             norm_word = normalize_word(raw_word)
@@ -1563,6 +1583,7 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
                 "gender_unified":       gender,
                 "lex_gender":           w.get("lex_gender"),
                 "lex_number":           w.get("lex_number"),
+                "lex_pos":              "|".join(w.get("lex_pos") or []) or None,
                 "segment_text":         seg_text,
                 "word_start":           w.get("start"),
                 "word_end":             w.get("end"),
@@ -1578,6 +1599,15 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
                 "locally_resolved":     bool(w.get("locally_resolved")),
             })
             words_only.append(w)
+        # A segment end (Whisper segment, Siarad utterance) is always a
+        # boundary for every detection branch. The flag set from final
+        # punctuation sits on the segment's last word, and the filter above
+        # can drop that word -- davies1.cha: "yn y." lost "y", and "yn" was
+        # paired with the NEXT speaker's "fi" as a conjugated-preposition
+        # erosion. Marking the last KEPT word closes that gap, and also
+        # covers Whisper segments that end without punctuation.
+        if len(words_only) > kept_before:
+            words_only[-1]["_clause_boundary_after"] = True
 
     _step("Detecting mutations")
     mutation_rows = process_comprehensive_mutations(words_only)
@@ -1662,6 +1692,7 @@ def analyze_phrase(phrase):
             "gender":               w.get("gender"),
             "lex_gender":           w.get("lex_gender"),
             "lex_number":           w.get("lex_number"),
+            "lex_pos":              "|".join(w.get("lex_pos") or []) or None,
             "spacy_dep":            spacy_tok["dep"] if spacy_tok else None,
             "spacy_pos":            spacy_tok["pos"] if spacy_tok else None,
             "spacy_coarse_pos":     spacy_coarse_pos(spacy_tok),
