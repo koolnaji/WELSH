@@ -50,6 +50,9 @@ def configure(state_dir: Path) -> None:
 
 def is_rate_limit_error(exc: BaseException) -> bool:
     message = str(exc).lower()
+    # 403 is deliberately NOT treated as a rate limit: tested live 2026-09-25,
+    # it persisted through real 45s/~2min cooldowns, and the resulting
+    # run-wide cooldown then blocked every remaining video in the batch.
     return "http error 429" in message or "too many requests" in message or "rate limit" in message
 
 

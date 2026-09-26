@@ -142,6 +142,11 @@ def rebuild_words_only(pos_df):
                 "cysill_mutation_type": r.get("cysill_mutation_type"),
                 "cysill_gender":        r.get("cysill_gender"),
                 "gender":               r.get("gender_unified"),
+                # Bangor-lexicon noun features (pos_*.csv from 2026-09-26 on).
+                # An empty cell reads back as NaN, which is truthy and would
+                # beat the spaCy fallback -- only a real string counts.
+                "lex_gender":           r.get("lex_gender") if isinstance(r.get("lex_gender"), str) else None,
+                "lex_number":           r.get("lex_number") if isinstance(r.get("lex_number"), str) else None,
                 "spacy_token":          spacy_tok,
                 "synthetic":            False,
                 # PATCH: carried through from the cached pos_*.csv (see

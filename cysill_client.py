@@ -60,6 +60,22 @@ http_session = requests.Session()
 _cysill_consecutive_failures = 0
 _CYSILL_FAILURE_THRESHOLD    = 5
 _cysill_disabled_for_run     = False
+# Set once a success=True response parses to zero tokens -- see
+# fetch_pos_for_chunk(). Reported once per run, not per chunk.
+_cysill_empty_parse_warned   = False
+
+
+def cysill_status_line():
+    """One line for startup logs. A missing key is otherwise completely
+    silent: fetch_pos_for_chunk()/fetch_lemma() just return None, every
+    cysill_* column comes out empty, and nothing says why. That is exactly
+    how the 2026-09-25 run went: 0 of its word rows had a Cysill tag, while
+    the 2026-08-13 runs had roughly 800-1,500 per video."""
+    if TECHIAITH_API_KEY:
+        return "Cysill: API key set (WELSH_LEMMATIZER)"
+    return ("Cysill: NO API KEY -- WELSH_LEMMATIZER is not set in this shell, so "
+            "Cysill is skipped for the whole run (spaCy + Bangor lexicon + "
+            "heuristics only). The .env file is NOT read automatically.")
 
 
 def reset_cysill_circuit_breaker():
@@ -74,9 +90,10 @@ def reset_cysill_circuit_breaker():
     start of each top-level processing branch in main() to give each run a
     clean slate.
     """
-    global _cysill_consecutive_failures, _cysill_disabled_for_run
+    global _cysill_consecutive_failures, _cysill_disabled_for_run, _cysill_empty_parse_warned
     _cysill_consecutive_failures = 0
     _cysill_disabled_for_run     = False
+    _cysill_empty_parse_warned   = False
 
 
 def is_cysill_disabled():
@@ -238,6 +255,7 @@ def parse_pos_result_extended(result):
 
 
 def fetch_pos_for_chunk(chunk_text, max_retries=3, base_delay=1.5):
+    global _cysill_empty_parse_warned
     if not TECHIAITH_API_KEY:
         return None
     if _cysill_disabled_for_run:
@@ -256,7 +274,19 @@ def fetch_pos_for_chunk(chunk_text, max_retries=3, base_delay=1.5):
     try:
         data = resp.json()
         if isinstance(data, dict) and data.get("success") is True:
-            return parse_pos_result_extended(data.get("result"))
+            tokens = parse_pos_result_extended(data.get("result"))
+            if not tokens and chunk_text.strip():
+                # The one failure that used to be fully silent even WITH a
+                # key: the API answers success=True, but in a shape
+                # parse_pos_result_extended() doesn't read ("token/TAG[/MUT]"
+                # separated by whitespace), so every word just aligns to
+                # nothing.
+                if not _cysill_empty_parse_warned:
+                    _cysill_empty_parse_warned = True
+                    tqdm.write(f" ⚠️ Cysill POS answered success=True but no tokens could be "
+                               f"parsed -- response format may have changed. First result: "
+                               f"{str(data.get('result'))[:200]!r}")
+            return tokens
         tqdm.write(f" ⚠️ POS API success=False: {data}")
     except Exception as e:
         tqdm.write(f" ⚠️ POS API parse error: {e}")

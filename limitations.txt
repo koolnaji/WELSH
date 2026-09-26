@@ -101,36 +101,83 @@ a mid-stream 403 that heavily-viewed videos did not exhibit under
 otherwise identical conditions -- consistent with community reports
 that YouTube's anti-bot heuristics treat request patterns against
 low-traffic content as more suspicious than the same pattern against
-pre-warmed, high-traffic content, independent of token validity.
-Mitigated pragmatically by (a) forcing a single, consistent yt-dlp
-player client end-to-end (`mweb`, set via `extractor_args` in
-`download_audio()`'s `ydl_opts`) rather than letting yt-dlp select a
-metadata client and a media-fetch client independently, since a
-mismatch between the two was directly observed to 403 even with a
-valid token, and (b) a slower, audio-download-specific minimum request
-interval (`AUDIO_DOWNLOAD_MIN_INTERVAL`, threaded through
-`youtube_access.call()`'s new `min_interval` parameter) on the theory
-that request pacing itself is part of what these heuristics evaluate.
-Neither is a guaranteed fix, and the underlying asymmetry -- low-view
-content is structurally more exposed to this failure mode than viral
-content -- is not something client-flag or pacing changes can fully
-eliminate.
+pre-warmed, high-traffic content, independent of token validity. Two
+code-level mitigations were discussed at the time -- forcing a single,
+consistent yt-dlp player client end-to-end via `extractor_args`, and a
+slower, audio-download-specific minimum request interval -- but
+neither was carried into `download_audio()`; the codebase's only
+request-pacing mechanism remains the general cross-endpoint
+coordinator described in the 429 paragraph above (`youtube_access.py`,
+`MIN_REQUEST_INTERVAL`), not a player-client pin or an audio-specific
+interval. This asymmetry was addressed operationally rather than in
+code, per the update below.
 
-UNCONFIRMED, noted 2026-08-17: switching from stable to a nightly
-yt-dlp build was reported to stop producing 403s in casual testing
-(a handful of manual downloads, not a full batch run). This is
-plausible -- nightly ships extractor/signature fixes faster than
-stable's release cadence -- but has not yet been isolated against the
-`mweb`/pacing mitigation above (i.e. it is not yet known whether
-nightly alone is sufficient with those reverted, or whether all three
-are jointly necessary). Nightly builds are explicitly not
-version-pinned/semver-stable, which is in tension with the
-reproducibility concern already raised in Section 1.2 -- if the
-project ships on a nightly build, the EXACT build string
-(`yt-dlp --version`) needs to be recorded, since a later nightly could
-silently reintroduce or change this behavior. Should be confirmed
-against a full batch run, and the isolation test above, before being
-treated as the settled fix.
+RESOLVED OPERATIONALLY, as of this writing: this incident (2026-08)
+was in practice closed out by switching from a stable to a nightly
+yt-dlp build whenever a 403 storm recurs, then reverting to a pinned
+stable release once the storm clears. Since the player-client and
+pacing changes discussed above were never implemented, nightly is the
+sole operative fix here, not one factor among several -- there was
+nothing left to isolate it from. This is a manual operational practice,
+not an automated one: there is no in-code detection of a 403 storm or
+automatic yt-dlp version switch anywhere in the pipeline. Because
+nightly builds are not version-pinned/semver-stable, this remains in
+tension with the reproducibility concern raised in Section 1.2 -- any
+batch collected while running a nightly build should have the exact
+build string (`yt-dlp --version`) recorded alongside it, since a later
+nightly could change this behavior again without notice.
+requirements.txt intentionally keeps only a loose lower-bound pin
+(`yt-dlp>=2025.1.0`) for this reason, rather than pinning to a
+specific build.
+
+RECURRENCE, 2026-09-25: the same bare "HTTP Error 403: Forbidden" on
+`download_audio()` returned, already on a nightly build -- but broader
+in shape than the original diagnosis: every YouTube video attempted
+over a ~27-hour window failed with it (`failed_videos.json`), across
+channels of clearly different popularity (Hansh alongside Candelas and
+BBC National Orchestra of Wales covers), not concentrated on low-view/
+niche content the way the original 2026-08 pattern was.
+
+What was established live, 2026-09-25:
+  - A standalone, cookie-less `yt-dlp -v` call (same nightly build, no
+    PO-token provider running) downloaded one of the exact videos that
+    had just failed 3x inside the pipeline, in seconds. The video, the
+    account and the IP are not blocked.
+  - Pacing is NOT the cause. Treating the 403 as a rate limit (real
+    45s/~2min cooldowns between attempts) was tried in a live batch; the
+    403 persisted through every cooldown, and the resulting run-wide
+    cooldown then aborted the other 9 videos before they made a single
+    request. That change was reverted.
+So the failure is specific to how the pipeline invokes yt-dlp, not to
+YouTube's view of the videos. The known differences between the
+working call and the pipeline's are: (1) the pipeline passed cookies
+whenever YTDLP_COOKIES_FILE/YTDLP_COOKIES_FROM_BROWSER was set; (2) the
+pipeline's Python interpreter, yt-dlp install and PATH (deno, the
+JS-challenge runtime) are not guaranteed to be the ones a separate
+terminal uses.
+
+Resolved to (1), same day: with the change below, the same video --
+first in its batch both times, same yt-dlp build, deno found, cookie
+file configured -- downloaded cleanly, where it had 403'd on its very
+first attempt before. The configured cookie file turned out to hold no
+login cookies at all (no SAPISID/__Secure-3PAPISID/LOGIN_INFO), only
+anonymous visitor cookies. yt-dlp writes its cookie jar back into the
+file passed via cookiefile after every call, so every run re-sent the
+same accumulated visitor identity; the most likely mechanism is that
+identity being flagged, but that part is unconfirmed. One clean run is
+strong but not conclusive evidence -- confirm with a multi-video batch.
+
+Changes in `download_audio()`: it downloads without cookies first (the
+configuration proven to work) and falls back to cookies only for
+videos that report needing sign-in (age gate, bot check,
+members-only). It also prints, once per run, the yt-dlp version and
+path, the Python interpreter, whether deno is on PATH and whether
+cookies are configured; and when a download ultimately fails it prints
+yt-dlp's own verbose trace of that attempt (client selection, PO-token
+and JS-challenge status), so a future failure shows its own cause. The
+cookie-less default removes difference (1); difference (2) is detected
+by the startup line, not fixed in code. UNCONFIRMED against a full
+batch as of this writing.
 
 
 2. CORPUS_ANALYZER.PY — MUTATION EROSION RATE COMPUTATION LIMITATIONS
@@ -190,18 +237,28 @@ analysis reporting erosion rates with and without disputed rows
 included would substantiate how much the headline numbers depend on
 this design choice.
 
-2.5 Register is a proxy variable, not a directly measured one, and is
-confounded with channel/source in the current dataset
-The formal/informal/casual axis is operationalized as a property of
-the source channel, not of individual utterances or speakers. In
-practice this means channel identity and register are currently
-collinear in the corpus — e.g. all Haclediad data is casual-register
-and no other source contributes casual-register data in the same
-proportion. Any erosion-rate difference attributed to register cannot
-currently be fully separated from channel-specific factors such as
-production quality, topic domain, presenter demographics, or
-recording conditions, since register and channel are not
-independently varied in the sampling design.
+2.5 Register is measured from the transcript, and the most informal data
+is also the only human-transcribed data
+The old hand-assigned, per-channel register label is gone. Register is
+now the Heylighen-Dewaele F-score, computed per video from POS
+proportions (corpus_formality.py) and, for Siarad, also per speaker.
+It is still an indirect measure, and two confounds remain. (a) Transcript
+type: Siarad scores come from human transcripts, YouTube scores from
+Whisper output, and Siarad supplies most of the least formal speech, so
+source, transcript type and register are partly collinear. The analyzer
+colours points by source so an offset between the two shows as two
+clouds, but it cannot remove it. (b) Channel: within YouTube, videos from
+one channel still share production style, topic and speakers, so
+per-video points are not independent draws.
+
+2.5b Cysill corroboration is absent from runs where no API key was set
+A missing WELSH_LEMMATIZER key made Cysill a silent no-op: runs on the
+school laptop (from 2026-09-25) have an empty cysill_pos for every word
+(0 of the Yr Orsedd run's word rows), while the 2026-08-13 runs had
+roughly 800-1,500 Cysill-tagged words per video. Rows from keyless runs can never reach
+the Cysill-corroborated confidence tiers, so mixing them with August
+data changes the confidence mix by date, not by speech. Startup now
+prints the key status and every video prints its tagger coverage.
 
 2.6 Denominator definition has changed over the project's lifetime
 The set of statuses counted as "evaluable" for erosion-rate purposes

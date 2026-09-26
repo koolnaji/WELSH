@@ -12,18 +12,24 @@ logs, output-path layout, and CSV persistence mechanics now live in
 corpus_io.py (imported below) -- this file only calls them, it doesn't
 own them.
 """
+import json
 import os
 import re
+import shutil
 import smtplib
 import subprocess
+import sys
 import time
+import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 import pandas as pd
 import requests
 import yt_dlp
+from yt_dlp.version import __version__ as YTDLP_VERSION
 from tqdm import tqdm
+from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 
 from mutation_engine import (
     EROSION_CONFIDENCE_THRESHOLD, TRIGGERS,
@@ -61,6 +67,7 @@ from mutation_tables import EVALUABLE_STATUSES
 from youtube_access import YouTubeRateLimited, call as youtube_call
 import prep_engine
 import plural_engine
+import numeral_engine
 
 
 # ========================= EMAIL NOTIFICATION =========================
@@ -639,6 +646,61 @@ def _discover_ypod_json(source_url, processed, queue_ids):
     return out
 
 
+def _discover_rss_feed(source_url, processed, queue_ids):
+    """
+    Parses a standard RSS 2.0 podcast feed's XML directly, bypassing
+    yt-dlp's generic/flat extraction entirely for discovery.
+
+    Added after confirming live (fetched this project's Spreaker feed
+    directly and read the raw XML) that the feed itself is well-formed,
+    standard RSS with a real, distinct <link> AND <enclosure url="..."/>
+    per <item> -- but yt-dlp's extract_flat=True handling of it was
+    returning the FEED's own url for every single entry instead of each
+    episode's (confirmed live: every queued "episode" from this feed
+    resolved to source_url itself, so download_audio() fetched the same
+    underlying audio regardless of which entry was requested, producing
+    byte-identical transcripts under different titles across a whole
+    batch -- see discover_new_videos()'s entry_url == channel_url guard,
+    which now catches and skips this rather than queueing the duplicate,
+    but that guard alone leaves this feed producing zero usable
+    episodes). Root cause looks like a yt-dlp extractor/version quirk
+    specific to how it flat-lists this feed, not anything wrong with the
+    feed or with _resolve_entry_url()'s own logic -- reading the feed's
+    own advertised <enclosure> URL directly sidesteps it, the same
+    approach _discover_ypod_json() already uses for Y Pod's other feed,
+    just standard RSS XML instead of a proprietary JSON cache.
+
+    Uses the numeric episode id embedded in the guid/enclosure URL
+    (".../episode/<id>/...") as the stable id, same convention as
+    _discover_ypod_json()'s ep_id extraction -- falls back to the raw
+    guid/URL if that pattern isn't found, so a feed with a different URL
+    shape still degrades gracefully rather than raising.
+    """
+    out = []
+    try:
+        resp = requests.get(source_url, timeout=20)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        print(f" 💥 Failed collecting {source_url}: {e}")
+        return out
+    for item in root.iter("item"):
+        enclosure = item.find("enclosure")
+        audio_url = enclosure.get("url") if enclosure is not None else None
+        if not audio_url:
+            continue
+        guid_el = item.find("guid")
+        guid = (guid_el.text or "").strip() if guid_el is not None else ""
+        m = re.search(r"/episode/(\d+)", guid) or re.search(r"/episode/(\d+)", audio_url)
+        ep_id = m.group(1) if m else (guid or audio_url)
+        if ep_id in processed or ep_id in queue_ids:
+            continue
+        title_el = item.find("title")
+        title = (title_el.text or "unknown").strip() if title_el is not None else "unknown"
+        out.append({"id": ep_id, "url": audio_url, "title": title, "source": source_url})
+    return out
+
+
 def discover_new_videos(limit, channels=None):
     out = []
     opts = {"quiet": True, "extract_flat": True, "no_warnings": True}
@@ -655,6 +717,13 @@ def discover_new_videos(limit, channels=None):
         if ch.get("type") == "ypod_json":
             out.extend(_discover_ypod_json(channel_url, processed, queue_ids))
             continue
+        # PATCH: standard RSS feeds route through direct XML parsing --
+        # see _discover_rss_feed()'s own docstring for why (yt-dlp's flat
+        # extraction was confirmed live to misresolve every entry on this
+        # feed to the feed's own URL).
+        if ch.get("type") == "rss_feed":
+            out.extend(_discover_rss_feed(channel_url, processed, queue_ids))
+            continue
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
@@ -667,6 +736,30 @@ def discover_new_videos(limit, channels=None):
                     # _resolve_entry_url()'s docstring.
                     vid_id    = entry.get("id") or entry.get("url")
                     entry_url = _resolve_entry_url(entry, channel_url)
+                    # PATCH: guard against a flat-extraction entry whose
+                    # resolved url is the FEED's own url rather than a
+                    # per-episode one. Confirmed live against a Spreaker
+                    # RSS feed: every queued episode ended up with
+                    # entry_url == channel_url (visible downstream as
+                    # every row's video_url/source column being the bare
+                    # show-feed link, identical across "different"
+                    # episodes) -- since id/title still varied per entry
+                    # (pulled correctly from the feed listing), each
+                    # queued separately, but download_audio() handed the
+                    # same feed url plausibly resolves to the same
+                    # (first/latest) episode every time, producing
+                    # byte-identical transcripts under different titles.
+                    # Treating this the same as an unresolved entry (skip,
+                    # don't queue) stops a guaranteed duplicate from
+                    # silently entering the corpus; the warning also
+                    # serves as a live diagnostic for whether this is
+                    # really what's happening on a given feed.
+                    if entry_url and entry_url == channel_url:
+                        print(f" ⚠️  Skipping '{entry.get('title', vid_id)}' -- "
+                              f"resolved to the feed URL itself, not a "
+                              f"per-episode URL. Extraction didn't return a "
+                              f"distinct url for this entry.")
+                        continue
                     if vid_id and entry_url and vid_id not in processed and vid_id not in queue_ids:
                         out.append({"id": vid_id,
                                     "url": entry_url,
@@ -694,14 +787,67 @@ def discover_new_videos(limit, channels=None):
 # logger sends yt-dlp's messages through tqdm.write() so they print cleanly
 # above whichever bar is currently active instead of colliding with it.
 class _YtdlpTqdmLogger:
+    # debug/info are chatty, so they're buffered instead of printed --
+    # _print_ytdlp_trace() dumps them only when a download ultimately fails.
+    def __init__(self):
+        self.lines = []
     def debug(self, msg):
-        pass  # yt-dlp's internal debug/info channel is very chatty; drop it
+        self.lines.append(msg)
     def info(self, msg):
-        pass
+        self.lines.append(msg)
     def warning(self, msg):
         tqdm.write(f"  ⚠️ yt-dlp: {msg}")
     def error(self, msg):
-        tqdm.write(f"  ⚠️ yt-dlp: {msg}")
+        # In verbose mode yt-dlp also sends tracebacks through this channel;
+        # print only the real ERROR line and keep the traceback in the trace.
+        if "ERROR:" in msg:
+            tqdm.write(f"  ⚠️ yt-dlp: {msg}")
+        else:
+            self.lines.append(msg)
+
+
+def _print_ytdlp_trace(logger):
+    if logger is None or not logger.lines:
+        return
+    tqdm.write("  --- yt-dlp trace (last failed attempt) ---")
+    for line in logger.lines:
+        tqdm.write(f"    {line[:220]}")
+    tqdm.write("  --- end trace ---")
+
+
+_AUTH_REQUIRED_MARKERS = ("sign in", "log in", "login required", "members-only",
+                          "members only", "private video")
+
+
+def _is_auth_required_error(exc):
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _AUTH_REQUIRED_MARKERS)
+
+
+_download_env_logged = False
+
+
+def _log_download_environment():
+    # One line per process answering the questions a 403 always raises:
+    # which yt-dlp/Python is actually running, can yt-dlp find its JS
+    # runtime, and are cookies configured. Printed once, at the first
+    # download of a run, so it lands at the top of every batch log.
+    global _download_env_logged
+    if _download_env_logged:
+        return
+    _download_env_logged = True
+    cookie_opts = yt_dlp_cookie_opts()
+    if "cookiefile" in cookie_opts:
+        cookie_mode = f"file ({cookie_opts['cookiefile']})"
+    elif "cookiesfrombrowser" in cookie_opts:
+        cookie_mode = f"browser ({cookie_opts['cookiesfrombrowser'][0]})"
+    else:
+        cookie_mode = "none"
+    tqdm.write(f"  [env] yt-dlp {YTDLP_VERSION} ({yt_dlp.__file__})")
+    tqdm.write(f"  [env] python {sys.executable}")
+    tqdm.write(f"  [env] deno: {shutil.which('deno') or 'NOT FOUND on PATH'} | "
+               f"cookies configured: {cookie_mode}")
+    tqdm.write(f"  [env] {cysill_status_line()}")
 
 
 # PATCH: getaddrinfo failed / "Failed to resolve" (Windows errno 11001,
@@ -770,8 +916,10 @@ def download_audio(video, max_retries=3, audio_dir=None):
         "outtmpl": str(target_dir / f"{file_stem}.%(ext)s"),
         "postprocessors": [{"key": "FFmpegExtractAudio",
                             "preferredcodec": "mp3", "preferredquality": "192"}],
-        "quiet": True, "no_warnings": True, "noprogress": True,
-        "logger": _YtdlpTqdmLogger(), "retries": 3,
+        # verbose feeds yt-dlp's [pot]/[jsc]/client-selection lines into the
+        # buffering logger (set per attempt below), so a failed download can
+        # print exactly how yt-dlp tried to fetch it -- see _print_ytdlp_trace().
+        "quiet": True, "noprogress": True, "verbose": True, "retries": 3,
         # PATCH: without this, yt-dlp silently skips downloading its EJS
         # JS-challenge solver script even when a runtime (deno/node/etc)
         # is installed -- it now requires this explicit opt-in before
@@ -783,10 +931,24 @@ def download_audio(video, max_retries=3, audio_dir=None):
         # runtime); ejs:npm is deno/bun-only and needs GitHub reachable
         # regardless, so github is strictly the safer choice here.
         "remote_components": ["ejs:github"],
-        **yt_dlp_cookie_opts(),
+        # PATCH: cookies are deliberately NOT in the base opts. Confirmed
+        # 2026-09-25: the same video, first in its batch both times, got a
+        # 403 on every attempt with the cookie file and downloaded cleanly
+        # without it. The configured file held no login cookies -- only
+        # anonymous visitor cookies, which yt-dlp writes back into the
+        # cookie file after every call, so each run re-sent the same
+        # visitor identity (likely flagged; mechanism unconfirmed).
+        # Cookies are now only a fallback for videos that genuinely
+        # require sign-in (age gate, bot check, members-only) -- see the
+        # retry after youtube_call() below.
     }
+    cookie_opts = yt_dlp_cookie_opts()
+    _log_download_environment()
     if not raw_path.exists() or raw_path.stat().st_size == 0:
-        def _download():
+        last_logger = None
+
+        def _download(extra_opts):
+            nonlocal last_logger
             tqdm.write(" Downloading audio...")
             # PATCH: WinError 32 here comes from yt-dlp's own
             # MoveFilesAfterDownload postprocessor renaming the
@@ -804,8 +966,10 @@ def download_audio(video, max_retries=3, audio_dir=None):
             # same as the unlink() retry does.
             last_exc = None
             for attempt in range(4):
+                last_logger = _YtdlpTqdmLogger()
+                opts = {**ydl_opts, **extra_opts, "logger": last_logger}
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
                         return ydl.download([video["url"]])
                 except (PermissionError, OSError) as e:
                     if getattr(e, "winerror", None) != 32 or attempt == 3:
@@ -816,7 +980,21 @@ def download_audio(video, max_retries=3, audio_dir=None):
                     time.sleep(wait)
                     last_exc = e
             raise last_exc
-        youtube_call("audio download", _download, max_attempts=max_retries)
+
+        try:
+            youtube_call("audio download", lambda: _download({}),
+                         max_attempts=max_retries)
+        except Exception as e:
+            if not (cookie_opts and _is_auth_required_error(e)):
+                _print_ytdlp_trace(last_logger)
+                raise
+            tqdm.write("  Sign-in required for this video -- retrying with configured cookies.")
+            try:
+                youtube_call("audio download (cookies)", lambda: _download(cookie_opts),
+                             max_attempts=max_retries)
+            except Exception:
+                _print_ytdlp_trace(last_logger)
+                raise
     tqdm.write(" Normalizing audio...")
     try:
         subprocess.run(
@@ -1145,6 +1323,11 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
         "vad_parameters": dict(threshold=0.6, min_silence_duration_ms=800,
                                max_speech_duration_s=20),
         "no_repeat_ngram_size": 5,
+        # Feeding each window's output back in as the next window's prompt is
+        # Whisper's documented cause of repetition loops (a ~90s "Ie. Ie. Ie."
+        # loop replaced real speech, 2026-09-26). Cost: initial_prompt below
+        # now only steers the first window; language is still forced to cy.
+        "condition_on_previous_text": False,
         "compression_ratio_threshold": 2.0,
         "no_speech_threshold": 0.6,
         "initial_prompt": "Cymraeg. Welsh language speech from S4C, Hansh, "
@@ -1177,6 +1360,47 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
     segments = _shift_and_trim_padded_segments(segments, sample_bounds)
     segments = filter_hallucinated_segments(segments)
     segments = deduplicate_overlapping_segments(segments)
+
+    # PATCH: stable per-video key for enrich_words()'s chunk-level
+    # checkpointing -- id, then url, then the audio path as a last resort.
+    checkpoint_key = str(video_meta.get("id") or video_meta.get("url") or audio_path)
+    rows = analyze_segments(
+        segments, video_meta,
+        video_duration_seconds=video_duration_seconds,
+        language=info.language, language_probability=info.language_probability,
+        checkpoint_key=checkpoint_key, step=_step)
+    return (*rows, time.time() - start_time)
+
+
+def _report_tagger_coverage(enriched):
+    """One line per video saying how many words each tag source actually
+    covered, so a source that silently answered nothing shows up as a 0
+    here instead of only as empty columns found later in the CSVs."""
+    n = len(enriched)
+    n_cysill = sum(1 for w in enriched if w.get("cysill_pos"))
+    n_sent = sum(1 for w in enriched if not w.get("locally_resolved"))
+    n_spacy = sum(1 for w in enriched if w.get("spacy_aligned"))
+    n_lex = sum(1 for w in enriched if w.get("lex_number") or w.get("lex_gender"))
+    tqdm.write(f"   Tagger coverage: spaCy {n_spacy}/{n}, Cysill {n_cysill}/{n}, "
+               f"lexicon noun gender/number {n_lex}/{n}")
+    if TECHIAITH_API_KEY and not is_cysill_disabled() and n_sent and not n_cysill:
+        tqdm.write("   ⚠️ Cysill key is set, but no word got a Cysill tag in this video.")
+
+
+def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
+                     language_probability, checkpoint_key, step=None):
+    """
+    Everything after transcription: preprocessing, Cysill/spaCy tagging and
+    every detection branch, for any list of segment-like objects (.start,
+    .end, .text, .words; each word .word/.start/.end/.probability, and an
+    optional .lang from a human-annotated transcript). Split out of analyze()
+    so human-transcribed corpora (corpus_siarad.py) go through exactly the
+    same tagging and detection as Whisper output.
+
+    Returns (segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows,
+    prep_rows, plural_rows, numeral_rows).
+    """
+    _step = step or (lambda label: print(f" {label}..."))
 
     # Pre-process: expand contractions, strip edge punctuation
     # Build one flat list of preprocessed words across all segments,
@@ -1218,24 +1442,26 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
         1 for w in all_preprocessed
         if is_english_code_switch(w["word"], None)
     )
+    # _code_switch: the per-word decision the detection branches read. A
+    # human language tag wins where there is one (Siarad: "eng" -> English,
+    # "cym"/"mixed" -> Welsh); otherwise -- Whisper output, and Siarad's
+    # "und" (in both dictionaries) -- the same heuristic as above. The count
+    # above deliberately stays heuristic-only, so the code-switch RATE is
+    # measured identically for every source.
+    for w in all_preprocessed:
+        lang = w.get("_lang")
+        if lang == "eng":
+            w["_code_switch"] = True
+        elif lang in ("cym", "mixed"):
+            w["_code_switch"] = False
+        else:
+            w["_code_switch"] = is_english_code_switch(w["word"], None)
 
-    # Enrich: Cysill + spaCy via unified gap-tolerant alignment
+    # Enrich: Cysill + spaCy via unified gap-tolerant alignment. Re-running
+    # the SAME video (same checkpoint_key) resumes from its last chunk.
     _step("Tagging + aligning (Cysill + spaCy)")
-    # PATCH: stable per-video key for enrich_words()'s chunk-level
-    # checkpointing (see that function's own docstring for why this
-    # matters -- an interrupted run inside "Tagging + aligning" used to
-    # lose ALL of a video's tagging progress, not just the stuck chunk).
-    # Preference order: video id (queue videos always have one) -> url
-    # (queue videos' actual source URL, or the local mp3 path for local
-    # files, per the meta dict welsh_pipeline.py builds for that branch)
-    # -> audio_path itself as a last resort so checkpointing degrades
-    # gracefully instead of silently disabling itself if video_meta ever
-    # arrives without either field. Whichever key is used, re-running the
-    # SAME video (same id/url/path) on a later run is what makes
-    # resumption find its checkpoint again -- a genuinely different video
-    # naturally gets a different key and starts fresh.
-    checkpoint_key = str(video_meta.get("id") or video_meta.get("url") or audio_path)
     enriched = enrich_words(all_preprocessed, checkpoint_key=checkpoint_key)
+    _report_tagger_coverage(enriched)
 
     # Build output rows
     segment_rows, word_rows, lemma_rows, pos_rows, words_only = [], [], [], [], []
@@ -1252,8 +1478,8 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
             "segment_start":        round(seg.start, 3),
             "segment_end":          round(seg.end, 3),
             "segment_text":         seg_text,
-            "language":             info.language,
-            "language_probability": round(info.language_probability, 4),
+            "language":             language,
+            "language_probability": round(language_probability, 4),
         })
 
         for w in enriched[seg_start:seg_end]:
@@ -1295,7 +1521,7 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
                 "word_start":    w.get("start", seg.start),
                 "word_end":      w.get("end", seg.end),
                 "confidence":    conf,
-                "language":      info.language,
+                "language":      language,
                 "cysill_pos":    cysill_pos,
                 "cysill_coarse_pos": cpos_coarse,
                 "gender":        gender,
@@ -1316,7 +1542,7 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
                 "word_start":      w.get("start"),
                 "word_end":        w.get("end"),
                 "confidence":      conf,
-                "language":        info.language,
+                "language":        language,
                 "cysill_pos":      cysill_pos,
             })
             pos_rows.append({
@@ -1335,11 +1561,13 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
                 "spacy_coarse_pos":     spos_coarse,
                 "pos_compatible":       pos_ok,
                 "gender_unified":       gender,
+                "lex_gender":           w.get("lex_gender"),
+                "lex_number":           w.get("lex_number"),
                 "segment_text":         seg_text,
                 "word_start":           w.get("start"),
                 "word_end":             w.get("end"),
                 "confidence":           conf,
-                "language":             info.language,
+                "language":             language,
                 # PATCH: carries enrich_words()'s locally_resolved flag into
                 # the cache file so rerun_rules.py (and any future re-analysis)
                 # can tell a genuine Cysill answer apart from a Bangor-lexicon/
@@ -1382,7 +1610,10 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
     # PATCH (Phase 6): plural-marking erosion -- third branch, same words_only
     # stream, own output rows, own CSV (vpaths["plural_mutations"]).
     plural_rows = plural_engine.process_plural_marking(words_only)
-    for row in plural_rows:
+    # numeral + noun number agreement -- the "no English counterpart" partner
+    # of plural_rows (see numeral_tables.py).
+    numeral_rows = numeral_engine.process_numeral_agreement(words_only)
+    for row in plural_rows + numeral_rows:
         row.update({
             "video_title": video_meta["title"],
             "video_url":   video_meta.get("url", "local_file"),
@@ -1393,7 +1624,7 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
         })
 
     return segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows, \
-        prep_rows, plural_rows, time.time() - start_time
+        prep_rows, plural_rows, numeral_rows
 
 
 def analyze_phrase(phrase):
@@ -1403,6 +1634,8 @@ def analyze_phrase(phrase):
                       re.findall(r"\b[\w''\-]+\b", phrase, flags=re.UNICODE))]
 
     expanded  = expand_whisper_tokens(fake_words)
+    for w in expanded:
+        w["_code_switch"] = is_english_code_switch(w["word"], None)
     enriched  = enrich_words(expanded)
 
     word_rows, lemma_rows, pos_rows = [], [], []
@@ -1427,6 +1660,8 @@ def analyze_phrase(phrase):
             "cysill_mutation_type": w.get("cysill_mutation_type"),
             "cysill_coarse_pos":    cysill_coarse_pos(cysill_pos),
             "gender":               w.get("gender"),
+            "lex_gender":           w.get("lex_gender"),
+            "lex_number":           w.get("lex_number"),
             "spacy_dep":            spacy_tok["dep"] if spacy_tok else None,
             "spacy_pos":            spacy_tok["pos"] if spacy_tok else None,
             "spacy_coarse_pos":     spacy_coarse_pos(spacy_tok),
@@ -1443,11 +1678,13 @@ def analyze_phrase(phrase):
     # need, which the flattened word_rows dicts don't keep.
     prep_rows = prep_engine.process_preposition_erosion(enriched)
     plural_rows = plural_engine.process_plural_marking(enriched)
-    return word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows
+    numeral_rows = numeral_engine.process_numeral_agreement(enriched)
+    return word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows, numeral_rows
 
 
 def save_analysis_outputs(stamp, segments, words, lemmas, pos_rows, mutations,
-                           prep_mutations=None, plural_mutations=None):
+                           prep_mutations=None, plural_mutations=None,
+                           numeral_mutations=None):
     paths = run_paths(stamp)
     if segments: pd.DataFrame(segments).to_csv(paths["segments"], index=False, encoding="utf-8-sig", quoting=1)
     if words:    pd.DataFrame(words).to_csv(paths["words"],    index=False, encoding="utf-8-sig", quoting=1)
@@ -1458,3 +1695,5 @@ def save_analysis_outputs(stamp, segments, words, lemmas, pos_rows, mutations,
         pd.DataFrame(prep_mutations).to_csv(paths["prep_mutations"], index=False, encoding="utf-8-sig", quoting=1)
     if plural_mutations:
         pd.DataFrame(plural_mutations).to_csv(paths["plural_mutations"], index=False, encoding="utf-8-sig", quoting=1)
+    if numeral_mutations:
+        pd.DataFrame(numeral_mutations).to_csv(paths["numeral_mutations"], index=False, encoding="utf-8-sig", quoting=1)

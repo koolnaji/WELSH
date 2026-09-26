@@ -133,7 +133,7 @@ from mutation_tables import (
     PREPOSED_ADJECTIVE_LEXICON, COMPOUND_NOUN_SECOND_ELEMENT,
     OBJ_DEPS, PHANTOM_CONTEXT_TAGS, KNOWN_HOMOGRAPH_COLLISIONS,
     PREP_TAG_PREFIXES, PREDYN_TAGS, REL_INT_TAGS, VOCAT_DEPS,
-    DIGRAPHS, WELSH_FILLERS, WELSH_VOWELS,
+    DIGRAPHS, WELSH_VOWELS, HESITATION_FILLERS, POS_GATED_TRIGGERS,
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
     _LEGAL_BASE_MARK_PAIRS,
@@ -161,6 +161,14 @@ def initial_cluster(word):
 
 def mutation_type_from_surface(word):
     return MUTATION_MAP.get(initial_cluster(word))
+
+def _is_code_switch(node, norm_word, lemma):
+    """The per-word decision set in corpus_ops.analyze_segments() (a human
+    language tag wins over the heuristic); falls back to the heuristic for
+    word lists that never went through it (e.g. the phrase tester)."""
+    flag = node.get("_code_switch")
+    return is_english_code_switch(norm_word, lemma) if flag is None else flag
+
 
 def is_english_code_switch(word, techiaith_lemma):
     w = normalize_word(word)
@@ -250,7 +258,8 @@ def load_bangor_lexicon():
     """
     try:
         bangor_lexicon.load()
-        print(f"✅ Bangor lexicon loaded ({bangor_lexicon.wordform_count():,} wordforms).")
+        print(f"✅ Bangor lexicon loaded ({bangor_lexicon.wordform_count():,} wordforms) "
+              f"from {bangor_lexicon.loaded_path()}.")
         return True
     except FileNotFoundError as e:
         print(f"⚠️  {e}")
@@ -285,26 +294,24 @@ def get_welsh_lemma(word):
     # place).
     if is_english_code_switch(w, None):
         return None
-    if w in LEMMA_CACHE:
-        return LEMMA_CACHE[w]
-    # PATCH: Bangor lexicon lookup BEFORE hitting the live Cysill
-    # lemmatizer endpoint -- same "cache-first, network as fallback"
-    # shape as the LEMMA_CACHE check just above, just pre-seeded with
-    # ~497k wordforms instead of only whatever this run has already
-    # looked up. Deliberately uses the lemma-unambiguous check (96.3%
-    # coverage, measured against the real file), not a full-entry
-    # lookup -- see bangor_lexicon.lemma_if_unambiguous()'s own
-    # docstring for why picking among genuinely ambiguous readings here
-    # would be a guess, not a lookup. is_loaded() is checked rather than
-    # calling load() here, so a missing/not-yet-downloaded lexicon file
-    # degrades to "skip this step" rather than crashing every lemma
-    # lookup in the pipeline -- see bangor_lexicon.load()'s own error
-    # message for how to fetch and place the file.
+    # PATCH: Bangor lexicon lookup BEFORE the LEMMA_CACHE and the live
+    # Cysill lemmatizer. Deliberately uses the lemma-unambiguous check
+    # (96.3% coverage, measured against the real file), not a full-entry
+    # lookup -- see bangor_lexicon.lemma_if_unambiguous()'s own docstring
+    # for why picking among genuinely ambiguous readings here would be a
+    # guess, not a lookup. Checked before the cache, not after: any run
+    # without the lexicon loaded (until 2026-09-26 the loader only looked in
+    # ./bangor_lexicon/, so a copy in the pipeline folder was never found)
+    # cached simplemma's answers, which would otherwise outrank the
+    # dictionary forever. is_loaded() is checked rather than calling load()
+    # here, so a missing lexicon file degrades to "skip this step".
     if bangor_lexicon.is_loaded():
         bangor_lemma = bangor_lexicon.lemma_if_unambiguous(w)
         if bangor_lemma:
             LEMMA_CACHE[w] = bangor_lemma
             return bangor_lemma
+    if w in LEMMA_CACHE:
+        return LEMMA_CACHE[w]
     lemma = None
     cysill_call_failed = False
     # PATCH: route through fetch_lemma so retry/reconnect logic applies
@@ -412,7 +419,38 @@ def filter_hallucinated_segments(segments):
                   f"({len(implausible)}/{len(words)}) -- dropped")
             continue
         clean.append(seg)
-    return clean
+    return _drop_repeated_short_runs(clean)
+
+
+# PATCH: Whisper can loop on one short token across a whole stretch of
+# audio -- confirmed live 2026-09-26: 53 "Ie." segments, mostly one unbroken
+# run of ~70s standing in for ~90s of real speech. Each segment is a single
+# word, so the per-segment repeat check above (which exempts 1-2 word
+# segments) never sees it. Genuine backchannels are interleaved with the
+# other speaker's segments, so they don't form consecutive runs like this.
+REPEATED_SHORT_SEGMENT_RUN = 4
+
+
+def _drop_repeated_short_runs(segments):
+    def key(seg):
+        words = seg.text.strip().lower().strip(".,!?;: ").split()
+        return " ".join(words) if 0 < len(words) <= 2 else None
+
+    kept, i = [], 0
+    while i < len(segments):
+        k = key(segments[i])
+        j = i + 1
+        if k is not None:
+            while j < len(segments) and key(segments[j]) == k:
+                j += 1
+        if k is not None and j - i >= REPEATED_SHORT_SEGMENT_RUN:
+            kept.append(segments[i])
+            tqdm.write(f" 🚫 Repeated-segment loop at {segments[i].start:.1f}s-"
+                       f"{segments[j - 1].end:.1f}s: '{k}' x{j - i} -- kept 1")
+        else:
+            kept.extend(segments[i:j])
+        i = j
+    return kept
 
 
 def deduplicate_overlapping_segments(segments, overlap_threshold=0.80):
@@ -530,7 +568,11 @@ def expand_whisper_tokens(raw_words):
             # Whisper already split it off as its own token -- just
             # canonicalize the spelling so it survives downstream and
             # matches TRIGGERS["yn"].
-            expanded.append({**w, "word": "yn", "synthetic": False})
+            # _from_contraction: a contracted 'n is never the preposition
+            # "yn" before a pronoun (that fuses: ynddo, ynddi) and is often
+            # not "yn" at all ("o'n i" = oeddwn i) -- prep_engine skips it.
+            expanded.append({**w, "word": "yn", "synthetic": False,
+                             "_from_contraction": True})
         elif surface.endswith("'n") and len(surface) > 2:
             # Fused "X'n" token (e.g. "mae'n") -- split into stem + "yn",
             # both real (non-synthetic) tokens. Same boundary-ownership
@@ -538,8 +580,10 @@ def expand_whisper_tokens(raw_words):
             # actually been followed by trailing punctuation.
             stem = surface[:-2]
             expanded.append({**w, "word": stem, "synthetic": False,
-                              "_clause_boundary_after": False})
-            expanded.append({**w, "word": "yn", "synthetic": False})
+                              "_clause_boundary_after": False,
+                              "_contraction_stem": True})
+            expanded.append({**w, "word": "yn", "synthetic": False,
+                             "_from_contraction": True})
         else:
             expanded.append({**w, "synthetic": False})
     return expanded
@@ -601,6 +645,8 @@ def preprocess_segment(seg, seg_id=None):
             "synthetic":  False,
             "_seg_id":    seg_id,
             "_clause_boundary_after": clause_boundary_after,
+            # human language tag from an annotated transcript (Siarad), else None
+            "_lang":      getattr(w, "lang", None),
         })
     return expand_whisper_tokens(raw_words)
 
@@ -963,8 +1009,27 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
             # spaCy fields
             entry["spacy_token"]          = spacy_tok  # full dict or None
             entry["spacy_aligned"]        = spacy_tok is not None
-            # Unified gender: spaCy primary, Cysill fallback
-            entry["gender"]               = (extract_gender_from_spacy(spacy_tok)
+            # Bangor lexicon noun gender/number (bangor_lexicon.noun_features):
+            # a dictionary fact about the noun form, so it outranks spaCy's
+            # morph guess wherever the lexicon gives one. Never looked up for
+            # English words -- "man" is also a Welsh noun.
+            is_english = (w["_code_switch"] if "_code_switch" in w
+                          else is_english_code_switch(w["word"], None))
+            lex = (bangor_lexicon.noun_features(normalize_word(w["word"]))
+                   if bangor_lexicon.is_loaded() and not is_english else None) or {}
+            entry["lex_gender"]           = lex.get("gender")
+            entry["lex_number"]           = lex.get("number")
+            # Unified gender: lexicon, then spaCy, then Cysill -- but the
+            # lexicon's NOUN gender only where the word is tagged a noun
+            # here. "gender" is also read for adjective triggers (Layer 1G's
+            # feminine ordinal), where a feminine noun homograph must not
+            # count. (Target-side reads in _process_gender_trigger are safe
+            # without this: every rule there that requires a feminine
+            # target also requires it to be a noun.)
+            noun_here = ((spacy_tok or {}).get("pos") in ("NOUN", "PROPN")
+                         or (entry["cysill_pos"] or "").split("+")[0].startswith("N"))
+            entry["gender"]               = ((entry["lex_gender"] if noun_here else None)
+                                              or extract_gender_from_spacy(spacy_tok)
                                               or entry["cysill_gender"])
             # Collision check
             entry["collision_note"]       = KNOWN_HOMOGRAPH_COLLISIONS.get(
@@ -1100,11 +1165,34 @@ def layer_1_trigger_detection(trigger_word, cysill_pos=None,
     if trigger == "yn":
         pos       = cysill_pos or ""
         spacy_dep = spacy_token.get("dep") if spacy_token else None
+        spacy_pos = spacy_token.get("pos") if spacy_token else None
+        # PATCH: cy_ud_cy_ccg separates the three "yn"s by deprel -- "aux"+AUX
+        # is the aspect marker before a verb-noun ("mae hi'n canu"), which
+        # never mutates; "case:pred" is the predicate particle (soft); "case"
+        # is the preposition "in" (nasal). aux used to map to soft_limited,
+        # scoring every radical verb-noun after aspectual yn as erosion
+        # (confirmed live 2026-09-26: 28 of 42 erosion rows in one video).
+        # aux+PART is left alone: one real predicate "yn gwmni" was tagged so.
+        if spacy_dep == "aux" and spacy_pos == "AUX":
+            return {"trigger_detected": False, "expected_mutation": None,
+                    "trigger_word": trigger, "fem_ei": False,
+                    "mixed": False, "h_mutation": False}
         if any(pos.startswith(p) for p in PREP_TAG_PREFIXES) or spacy_dep == "case":
             expected_list = ["nasal"]
         elif pos in PREDYN_TAGS or any(x in pos for x in ("VERBADJ", "VB", "ADV")) \
-                or spacy_dep in ("aux", "mark"):
+                or spacy_dep in ("case:pred", "aux", "mark"):
             expected_list = ["soft_limited"]
+
+    # PATCH: pronoun/interjection readings (see POS_GATED_TRIGGERS). "ni" is
+    # far more often the pronoun "we" than the negative particle in speech --
+    # confirmed live: every "ni" in a 9-minute clip was tagged PRON, and
+    # pronoun "i" ("o'n i", "I was") was starting mutation contexts too.
+    if trigger in POS_GATED_TRIGGERS:
+        spacy_pos = spacy_token.get("pos") if spacy_token else None
+        if spacy_pos in ("PRON", "INTJ") or (cysill_pos or "").upper().startswith("PRON"):
+            return {"trigger_detected": False, "expected_mutation": None,
+                    "trigger_word": trigger, "fem_ei": False,
+                    "mixed": False, "h_mutation": False}
 
     if trigger == "a":
         pos       = cysill_pos or ""
@@ -1391,7 +1479,23 @@ def reverse_mutation_candidates(surface, expected_mutations=None):
                 if surface_cluster != mutated_initial:
                     continue
                 candidates.add(radical_initial + surface[len(mutated_initial):])
-            elif mutated_initial == "" and radical_initial == "g" and surface[0] in WELSH_VOWELS:
+            # PATCH: guard against single-letter surfaces. Without a
+            # length floor, ANY vowel-initial surface (including Welsh's
+            # closed-class one-letter function words -- "i" (to/I), "o"
+            # (of/from), "a" (and), "e" (he), "y" (the)) gets offered as a
+            # plausible g-deletion target, since the pattern only checks
+            # "is this vowel-initial", never "is this word already
+            # complete on its own". Confirmed live: the pronoun "i" after
+            # the preposition "yn" (in) was reconstructed as a candidate
+            # radical "gi" and credited as a correct g-deletion mutation
+            # -- while the prep_engine.py branch, walking the same word
+            # pair, correctly identified it as erosion (bare "yn"+"i"
+            # instead of the fused "ynddof"). Genuine g-deletion targets
+            # are real content words (gwaith->waith, gwybod->wybod,
+            # gwario->wario) and are never a single letter, so this loses
+            # no real coverage.
+            elif (mutated_initial == "" and radical_initial == "g"
+                  and len(surface) >= 2 and surface[0] in WELSH_VOWELS):
                 candidates.add("g" + surface)
 
     if "h-mutation" in allowed and surface.startswith("h") and len(surface) > 1:
@@ -1500,6 +1604,33 @@ def raw_has_radical_evidence(target_node, t2):
 
     # A differing spaCy lemma is evidence for a possible mutated form
     # (e.g. gi -> ci), not evidence that the surface is radical.
+
+    # PATCH: Evidence 3 -- t2["lemma"] (i.e. get_welsh_lemma(raw), this
+    # function's `lemma` above) is NEVER spaCy's lemma guess -- its own
+    # call chain only ever consults the suppletive table, LEMMA_CACHE,
+    # the Bangor lexicon, Cysill, or simplemma (see get_welsh_lemma()'s
+    # docstring/call sites). The "spaCy echoes the surface as its own
+    # lemma for unknown words" failure mode this function's own docstring
+    # warns about is a DIFFERENT code path entirely -- spaCy's lemma is
+    # only ever added as a *candidate* in radical_candidates_for_target(),
+    # gated by its own verify=True cross-check there. Requiring
+    # cysill_aligned above for evidence 1/2 was therefore stricter than
+    # the actual risk: it silently discarded a perfectly valid lemma match
+    # whenever Cysill happened not to answer (rate-limited, circuit
+    # breaker, disabled) even though Bangor/simplemma already confirmed
+    # it. Confirmed live: "mynd"/"meddwl"/"mor" (all common m-initial
+    # verbs/adverbs, get_welsh_lemma() correctly resolving lemma==surface
+    # via simplemma) were falling through to mutation_type_from_surface()'s
+    # bare initial-letter guess, which reports "nasal" for ANY m-initial
+    # word (since m is also what nasal-mutated b becomes) -- even though
+    # m is not itself in the p/t/c/b/d/g nasal-mutation target set, so
+    # nasal mutation can never have applied to these words at all. Trusting
+    # the independently-resolved lemma here (regardless of which tagger
+    # answered) stops the erosion evaluator from ever reaching that
+    # ambiguous surface-guess for a word already known to be its own
+    # radical.
+    if lemma and raw == lemma:
+        return True
 
     return False
 
@@ -2144,7 +2275,10 @@ def _find_lookahead_target(i, words_list, norm_current):
         possible_b = words_list[i + lookahead]
         norm_b     = normalize_word(possible_b["word"])
         skip_repeat = current_is_trigger and norm_b == norm_current
-        if skip_repeat or norm_b in WELSH_FILLERS or possible_b.get("synthetic"):
+        if skip_repeat or norm_b in HESITATION_FILLERS or possible_b.get("synthetic"):
+            # Never skip across a comma: the next word isn't adjacent.
+            if possible_b.get("_clause_boundary_after"):
+                break
             lookahead += 1
         else:
             target_found = possible_b
@@ -2159,8 +2293,41 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
 
     expected = t1["expected_mutation"]
     target_norm = normalize_word(target_found["word"])
+    # Acronyms are spoken as letter names ("BBC", "S4C") and never mutate;
+    # Whisper writes them in capitals, which is the only reliable signal
+    # left after normalize_word() lowercases everything.
+    raw_target = target_found["word"]
+    if len(raw_target) >= 2 and raw_target.isupper():
+        return None, lookahead
+
+    # PATCH: context guards found in a live audit, 2026-09-26. Each of these
+    # is a trigger/target pairing that is not a mutation environment at all,
+    # which previously landed as uncounted "mismatch" rows but now counts as
+    # erosion whenever the target is a known radical form.
+    target_tok = target_found.get("spacy_token") or {}
+    target_pos = target_tok.get("pos", "")
+    target_cysill = (target_found.get("cysill_pos") or "").upper()
+    # Pronouns don't mutate here ("am dy bres" -> "dy"; "o ti" -> "ti"). The
+    # interrogative "pwy" does ("i bwy"), so it stays.
+    if (target_pos == "PRON" or target_cysill.startswith("PRON")) \
+            and target_norm not in ("pwy", "bwy", "mhwy"):
+        return None, lookahead
+    # "dyna pam" / "dyna lle" = "that's why/where": invariant question words.
+    if norm_current in ("dyna", "dyma", "yna") and \
+            target_norm in ("pam", "lle", "ble", "pryd", "sut", "beth", "pwy"):
+        return None, lookahead
+    # "cyn" is mostly "before" ("cyn mynd", "cyn cinio"), which doesn't
+    # mutate; only equative "cyn" + adjective ("cyn gynted") does.
+    if norm_current == "cyn" and target_pos != "ADJ" and not target_cysill.startswith("ADJ"):
+        return None, lookahead
+    # "ym"/"yng" are the preposition "in" only before an m-/ng- word ("ym
+    # Mangor", "yng Nghymru"); anywhere else "ym" is the hesitation "um".
+    if (norm_current == "ym" and not target_norm.startswith("m")) or \
+            (norm_current == "yng" and not target_norm.startswith("ng")):
+        return None, lookahead
+
     target_lemma = get_welsh_lemma(target_norm)
-    if is_english_code_switch(target_norm, target_lemma):
+    if _is_code_switch(target_found, target_norm, target_lemma):
         return _build_cs_row(current_node, target_found, t1,
                              norm_current, conf_current), lookahead
 
@@ -2201,10 +2368,18 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     # is itself a verb, this is the aspect construction, not a mutation
     # environment -- skip evaluation entirely rather than counting the
     # correct radical form as erosion.
+    # PATCH: VerbForm=Vnoun added -- cy_ud_cy_ccg tags most verb-nouns
+    # NOUN, not VERB (see the head_verbform note in parse_spacy_doc), so
+    # without it this check only fired when Cysill answered. Confirmed
+    # live 2026-09-26: with Cysill silent, "yn gwrando"/"yn cael"/"yn
+    # mynd" etc. were all scored as erosion.
     if norm_current == "yn" and expected:
-        target_spacy_pos  = (target_found.get("spacy_token", {}) or {}).get("pos", "")
+        target_spacy      = target_found.get("spacy_token", {}) or {}
+        target_spacy_pos  = target_spacy.get("pos", "")
+        target_verbform   = (target_spacy.get("morph") or {}).get("VerbForm")
         target_cysill_pos = (target_found.get("cysill_pos") or "").split("+")[0].strip().upper()
-        target_is_verb = (target_spacy_pos == "VERB") or target_cysill_pos.startswith("VB")
+        target_is_verb = (target_spacy_pos == "VERB" or target_verbform == "Vnoun"
+                          or target_cysill_pos.startswith("VB"))
         if target_is_verb:
             return None, lookahead
 
@@ -2300,13 +2475,14 @@ def _process_gender_trigger(current_node, target_node, expected, trigger_label,
         return None
     target_norm = normalize_word(target_node["word"])
     target_lemma = get_welsh_lemma(target_norm)
-    if is_english_code_switch(target_norm, target_lemma):
+    if _is_code_switch(target_node, target_norm, target_lemma):
         return _build_cs_row(
             current_node, target_node, None, trigger_label,
             current_node.get("confidence", 0.0),
             rule_name=rule_name, expected_override=expected)
     spacy_tok     = target_node.get("spacy_token")
-    target_gender = (extract_gender_from_spacy(spacy_tok) or target_node.get("cysill_gender"))
+    target_gender = (target_node.get("lex_gender") or extract_gender_from_spacy(spacy_tok)
+                     or target_node.get("cysill_gender"))
     if require_target_gender is not None and target_gender != require_target_gender:
         return None
     # PATCH: feminine-singular-noun mutation rules (definite_article+fem_noun
@@ -2317,7 +2493,8 @@ def _process_gender_trigger(current_node, target_node, expected, trigger_label,
     # and we don't want to silently stop evaluating rows we're actually
     # uncertain about.
     if require_target_not_plural:
-        target_number = (extract_number_from_spacy(spacy_tok) or target_node.get("cysill_number"))
+        target_number = (target_node.get("lex_number") or extract_number_from_spacy(spacy_tok)
+                         or target_node.get("cysill_number"))
         if target_number == "plural":
             return None
     # PATCH: ll/rh soft-mutation exemption -- this check previously only
@@ -2502,7 +2679,9 @@ def process_comprehensive_mutations(words_list):
             norm_current, cysill_pos=cysill_pos,
             cysill_gender=current_node.get("cysill_gender"),
             spacy_token=spacy_tok)
-        if t1["trigger_detected"]:
+        # no_clause_boundary: Layers 1B-1E already required it; 1A didn't, so
+        # "O, ti'n..." (interjection + comma) scored "o" -> "ti" as a context.
+        if t1["trigger_detected"] and no_clause_boundary:
             row, consumed = _process_word_trigger(
                 i, words_list, current_node, norm_current, t1, conf_current)
             if row:
@@ -2547,7 +2726,8 @@ def process_comprehensive_mutations(words_list):
         # 1B), since it's current_node -- "ffrindiau" -- whose gender is
         # being checked in this condition in the first place.
         spacy_pos = spacy_tok["pos"] if spacy_tok else ""
-        trigger_number = extract_number_from_spacy(spacy_tok) or current_node.get("cysill_number")
+        trigger_number = (current_node.get("lex_number") or extract_number_from_spacy(spacy_tok)
+                          or current_node.get("cysill_number"))
         if gender == "feminine" and trigger_number != "plural" and \
                 (spacy_pos in ("NOUN", "PROPN") or
                 cysill_pos.split("+")[0].startswith("N")) and \
@@ -2572,8 +2752,12 @@ def process_comprehensive_mutations(words_list):
             # dependency "nmod" (nominal modifier) relation, not just
             # adjacency, to avoid firing on unrelated NOUN-NOUN sequences
             # (e.g. across a clause boundary or coordinated nouns).
+            # PROPN excluded: a name after a feminine noun is a frozen name,
+            # not a grammatical choice -- "Plaid Cymru"/"Radio Cymru" never
+            # mutate (live: "Radio Cymru" scored as erosion), and the old
+            # compounds that do ("Gŵyl Ddewi") are lexicalized, not productive.
             nsd = next_node.get("spacy_token", {}).get("dep", "") if next_node.get("spacy_token") else ""
-            if (nsp in ("NOUN", "PROPN") or ncp.split("+")[0].startswith("N")) and nsd == "nmod":
+            if (nsp == "NOUN" or (nsp != "PROPN" and ncp.split("+")[0].startswith("N"))) and nsd == "nmod":
                 row = _process_gender_trigger(
                     current_node, next_node, ["soft"],
                     norm_current, "fem_noun+genitive_noun", None, True)
@@ -2709,7 +2893,11 @@ def process_comprehensive_mutations(words_list):
         # TARGET earlier this pass (see mark_consumed() above / the Layer
         # 1A block) -- otherwise the same physical mutation event gets
         # built into a second, independent row here.
+        # pos check: only a nominal can be a direct object -- an ADJ tagged
+        # "obj" is a parse error (live: "Croes y mawr" misheard for "Croeso
+        # mawr" scored "mawr" as an eroded object).
         if not was_consumed(current_node) and spacy_tok and spacy_tok.get("dep") in OBJ_DEPS and \
+                spacy_tok.get("pos") in ("NOUN", "PROPN", "NUM") and \
                 spacy_tok.get("head_dep") in ("ROOT", "ccomp", "xcomp") and \
                 spacy_tok.get("head_verbform") != "Vnoun":
             t2 = layer_2_lemma_analysis(

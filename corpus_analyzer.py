@@ -11,30 +11,25 @@ Usage:
 
 Output (all written to welsh_analysis/analysis/):
     - merged_mutations.csv          : all runs merged, deduped, with batch tag
-    Register axis is three-tier, most to least formal: formal (e.g. BBC
-    Radio Cymru) > informal (e.g. Hansh/S4C, produced-but-informal content)
-    > casual (fully spontaneous, unscripted peer conversation, e.g.
-    podcasts like Haclediad). One erosion_by_type/erosion_by_rule/
-    erosion_over_batches figure set is produced per tier:
-    - figures/formal_erosion_by_type.png   : erosion rate per mutation type (formal register only)
-    - figures/informal_erosion_by_type.png : erosion rate per mutation type (informal register only)
-    - figures/casual_erosion_by_type.png   : erosion rate per mutation type (casual register only)
-    - figures/formal_erosion_by_rule.png   : erosion rate per detection rule (formal register only)
-    - figures/informal_erosion_by_rule.png : erosion rate per detection rule (informal register only)
-    - figures/casual_erosion_by_rule.png   : erosion rate per detection rule (casual register only)
+    - video_formality.csv / speaker_formality.csv : F-score etc. (corpus_formality.py)
+    - figures/erosion_by_type.png, erosion_by_rule.png, erosion_over_batches.png
     - figures/erosion_by_channel.png: erosion rate per source channel
     - figures/codeswitch_by_channel.png: code-switch rate per channel
     - figures/status_distribution.png  : full status breakdown (stacked bar)
     - figures/tagger_agreement.png  : heuristic vs tagger agreement
-    - figures/formal_erosion_over_batches.png   : erosion rate trend across runs (formal register only)
-    - figures/informal_erosion_over_batches.png : erosion rate trend across runs (informal register only)
-    - figures/casual_erosion_over_batches.png   : erosion rate trend across runs (casual register only)
+    - figures/collision_flags.png
+    - figures/erosion_vs_formality.png, erosion_vs_codeswitch.png : mutation branch, per video
+    - figures/branches_vs_formality.png        : all four branches, rate vs F-score, per video
+    - figures/branches_by_formality_band.png   : all four branches pooled by F-score third
+    - figures/speaker_branches_vs_formality.png, speaker_branches_by_formality_band.png :
+      the same two, one point per Siarad speaker
     - utterance_export.csv          : flat utterance-level rows for future joining
 """
 
 import re
 import sys
 import csv
+import math
 import shutil
 from pathlib import Path
 from datetime import datetime
@@ -1298,6 +1293,189 @@ def fig_erosion_vs_codeswitch(df, formality_df):
     _save(fig, "erosion_vs_codeswitch.png")
 
 
+# ========================= ALL BRANCHES vs FORMALITY =========================
+# (label, per-video CSV prefix, prediction). The three "erode" branches have
+# no English counterpart; "rhai + plural" does, and is the control.
+BRANCHES = [
+    ("Mutation",                "mutations",         "erode"),
+    ("Conjugated prepositions", "prep_mutations",    "erode"),
+    ("Numeral + singular noun", "numeral_mutations", "erode"),
+    ("rhai + plural noun",      "plural_mutations",  "resist"),
+]
+
+
+def load_branch_rows():
+    """
+    {branch label: evaluable rows} across every run under runs/. One run
+    per video: if a video was processed more than once, only rows from its
+    most recent runs/<stamp>/ folder are kept (stamps sort chronologically),
+    so a re-run replaces a video's data instead of being added on top of it.
+    Mutation folders use the same one-file-per-folder rule as
+    load_and_merge_mutations() (corroborated, else original, else legacy).
+    Every branch writes "correct_mutation"/"erosion" statuses, so
+    EVALUABLE_STATUSES applies to all four. Siarad rows keep their
+    "speaker" column.
+    """
+    out = {}
+    for label, prefix, _ in BRANCHES:
+        files = [p for p in MUT_DIR.rglob(f"{prefix}_*.csv")
+                 if "_deleted" not in p.parts and not p.name.endswith("_precaption_backup.csv")]
+        if prefix == "mutations":
+            by_dir = {}
+            for p in files:
+                by_dir.setdefault(p.parent, []).append(p)
+            files = []
+            for fs in by_dir.values():
+                corroborated = [f for f in fs if f.name.startswith("mutations_corroborated_")]
+                original     = [f for f in fs if f.name.startswith("mutations_original_")]
+                files.extend(corroborated or original or fs)
+        frames = []
+        for p in files:
+            try:
+                d = pd.read_csv(p, encoding="utf-8-sig")
+            except Exception as e:
+                print(f"  ⚠️ Could not read {p.name}: {e}")
+                continue
+            if d.empty or "video_url" not in d.columns or "is_erosion" not in d.columns:
+                continue
+            stamp = re.search(r"\d{8}_\d{6}", p.name)
+            frames.append(d.assign(_run=stamp.group(0) if stamp else ""))
+        if not frames:
+            out[label] = pd.DataFrame()
+            continue
+        rows = pd.concat(frames, ignore_index=True)
+        latest = rows.groupby("video_url")["_run"].transform("max")
+        rows = rows[rows["_run"] == latest]
+        if "status" in rows.columns:
+            rows = rows[rows["status"].isin(EVALUABLE_STATUSES)]
+        rows = rows.assign(is_erosion=rows["is_erosion"].map(lambda v: str(v).strip().lower() == "true"))
+        out[label] = rows
+    return out
+
+
+def _unit_rates(rows, keys, min_contexts):
+    """Erosion rate + context count per unit (keys: video, or video+speaker)."""
+    if rows is None or rows.empty or any(k not in rows.columns for k in keys):
+        return pd.DataFrame()
+    rates = rows.groupby(keys).agg(erosion_rate=("is_erosion", "mean"),
+                                   contexts=("is_erosion", "size")).reset_index()
+    return rates[rates["contexts"] >= min_contexts]
+
+
+def _wilson_interval(k, n, z=1.96):
+    if not n:
+        return float("nan"), float("nan")
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return centre - half, centre + half
+
+
+def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, min_contexts=5):
+    """
+    2x2 scatter + regression, one panel per branch: erosion rate per unit
+    (video, or Siarad speaker) against its F-score. Points are coloured by
+    transcript type -- Siarad (human) vs Whisper -- so an offset between the
+    two sources shows up as two clouds, not as a slope. A panel with fewer
+    than 3 units reaching min_contexts says so instead of fitting a line;
+    the sparse branches usually need fig_branches_by_formality_band().
+    """
+    if formality_df.empty or "f_score" not in formality_df.columns:
+        print(f"  [skip] {filename} -- no formality data")
+        return
+    fscores = formality_df[keys + ["f_score", "source"]].dropna(subset=["f_score"])
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), sharex=True)
+    for ax, (label, _prefix, prediction) in zip(axes.flat, BRANCHES):
+        pts = _unit_rates(branch_rows.get(label), keys, min_contexts)
+        pts = pts.merge(fscores, on=keys, how="inner") if not pts.empty else pts
+        title = f"{label} (predicted to {prediction})"
+        if len(pts) < 3:
+            ax.set_title(title, fontweight="bold")
+            ax.text(0.5, 0.5, f"too few {unit}s: {len(pts)} with >= {min_contexts} contexts",
+                    ha="center", va="center", transform=ax.transAxes, color="grey")
+            continue
+        pts["erosion_rate_pct"] = pts["erosion_rate"] * 100
+        sns.regplot(data=pts, x="f_score", y="erosion_rate_pct", ax=ax, scatter=False,
+                    line_kws={"color": "#C44E52"})
+        kind = pts["source"].eq("siarad").map({True: "Siarad (human transcript)",
+                                               False: "Whisper transcript"})
+        for name, grp in pts.groupby(kind):
+            ax.scatter(grp["f_score"], grp["erosion_rate_pct"], s=grp["contexts"].clip(upper=200),
+                       alpha=0.6, label=name)
+        r = pts["f_score"].corr(pts["erosion_rate_pct"])
+        ax.set_title(f"{title}\n{unit}s={len(pts)}, r={r:.2f}", fontweight="bold")
+        ax.set_xlabel("F-score (higher = more formal)")
+        ax.set_ylabel("Erosion rate (%)")
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+        ax.legend(fontsize=8)
+    fig.suptitle(f"Erosion rate vs. formality, per {unit} (point size = contexts)",
+                 fontweight="bold")
+    fig.tight_layout()
+    _save(fig, filename)
+
+
+def fig_branches_by_formality_band(branch_rows, formality_df, keys, filename, unit):
+    """
+    The hypothesis in one chart: units (videos, or Siarad speakers) split
+    into F-score thirds, every branch's contexts pooled within each third,
+    erosion rate plotted with a Wilson 95% interval. Pooling is what lets
+    the sparse numeral/rhai branches show at all -- a single video rarely
+    has 5 of them. Prediction: the "erode" lines rise toward the informal
+    end, the "resist" line stays flat.
+    """
+    if formality_df.empty or "f_score" not in formality_df.columns:
+        print(f"  [skip] {filename} -- no formality data")
+        return
+    units = formality_df[keys + ["f_score"]].dropna(subset=["f_score"]).copy()
+    if len(units) < 3:
+        print(f"  [skip] {filename} -- need at least 3 {unit}s with an F-score (found {len(units)})")
+        return
+    # rank first so tied F-scores can't produce duplicate band edges
+    units["band"] = pd.qcut(units["f_score"].rank(method="first"), 3, labels=False)
+    band_labels = [f"F {g['f_score'].min():.0f}-{g['f_score'].max():.0f}\n"
+                   f"({['least formal', 'middle', 'most formal'][b]} third)"
+                   for b, g in units.groupby("band")]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plotted = 0
+    for offset, (label, _prefix, prediction) in zip((-0.09, -0.03, 0.03, 0.09), BRANCHES):
+        rows = branch_rows.get(label)
+        if rows is None or rows.empty or any(k not in rows.columns for k in keys):
+            continue
+        banded = rows.merge(units[keys + ["band"]], on=keys, how="inner")
+        if banded.empty:
+            continue
+        xs, ys, lo, hi, ns = [], [], [], [], []
+        for band, grp in banded.groupby("band"):
+            n, k = len(grp), int(grp["is_erosion"].sum())
+            low, high = _wilson_interval(k, n)
+            xs.append(band + offset)
+            ys.append(100 * k / n)
+            lo.append(100 * (k / n - low))
+            hi.append(100 * (high - k / n))
+            ns.append(n)
+        ax.errorbar(xs, ys, yerr=[lo, hi], marker="o", capsize=4,
+                    linestyle="--" if prediction == "resist" else "-",
+                    label=f"{label} ({prediction})")
+        for x, y, n in zip(xs, ys, ns):
+            ax.annotate(f"n={n}", (x, y), textcoords="offset points", xytext=(6, 4), fontsize=7)
+        plotted += 1
+    if not plotted:
+        plt.close(fig)
+        print(f"  [skip] {filename} -- no branch rows matched a {unit} with an F-score")
+        return
+    ax.set_xticks(range(len(band_labels)))
+    ax.set_xticklabels(band_labels)
+    ax.set_ylabel("Erosion rate (%, pooled, 95% Wilson CI)")
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    ax.set_title(f"Erosion by formality band, per branch ({len(units)} {unit}s split into thirds)",
+                 fontweight="bold", pad=12)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    _save(fig, filename)
+
+
 # ========================= SUMMARY TABLE =========================
 def print_corpus_summary(df, batch_log):
     total     = len(df)
@@ -1502,6 +1680,31 @@ def main():
         fig_erosion_vs_codeswitch(df, formality_df)
     else:
         print("  [skip] no formality data computed -- see corpus_formality.py output above")
+
+    print("\nAll four branches vs. formality...")
+    branch_rows = load_branch_rows()
+    for label, rows in branch_rows.items():
+        n_video = rows["video_url"].nunique() if not rows.empty else 0
+        rate = f"{rows['is_erosion'].mean():.1%}" if not rows.empty else "n/a"
+        print(f"  {label:<26} {len(rows):>6,} evaluable contexts, {n_video:>4} videos, erosion {rate}")
+    if not formality_df.empty:
+        fig_branches_vs_formality(branch_rows, formality_df, ["video_url"],
+                                  "branches_vs_formality.png", "video")
+        fig_branches_by_formality_band(branch_rows, formality_df, ["video_url"],
+                                       "branches_by_formality_band.png", "video")
+
+    # Siarad only: the same two figures with each SPEAKER as the unit.
+    speaker_df = corpus_formality.build_speaker_formality_table()
+    if not speaker_df.empty:
+        speaker_path = OUT_DIR / "speaker_formality.csv"
+        speaker_df.to_csv(speaker_path, index=False, encoding="utf-8-sig")
+        speakers = speaker_df[speaker_df["pos_tagged_word_count"] >= corpus_formality.MIN_SPEAKER_WORDS]
+        print(f"Speaker formality saved: {speaker_path.name} ({len(speaker_df):,} speakers, "
+              f"{len(speakers):,} with >= {corpus_formality.MIN_SPEAKER_WORDS} tagged words)")
+        fig_branches_vs_formality(branch_rows, speakers, ["video_url", "speaker"],
+                                  "speaker_branches_vs_formality.png", "speaker")
+        fig_branches_by_formality_band(branch_rows, speakers, ["video_url", "speaker"],
+                                       "speaker_branches_by_formality_band.png", "speaker")
 
     export_utterance_level(df)
 

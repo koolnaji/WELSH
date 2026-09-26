@@ -95,7 +95,7 @@ INDEPENDENT_PRONOUNS = {
     # same spirit as "yn"'s note above, not exhaustively proven safe
     # against every possible input.
     "1sg":   {"i", "fi", "mi"},
-    "2sg":   {"ti"},
+    "2sg":   {"ti", "chdi"},
     "3sg_m": {"fe", "fo", "e", "o"},
     "3sg_f": {"hi"},
     "1pl":   {"ni"},
@@ -247,4 +247,8 @@ PREP_CONJUGATED_FORMS = {
 # ========================= DUPLICATED, STANDALONE-CONVENTION HELPERS =====
 # Small and stable enough to duplicate rather than import -- keeps this
 # branch independent of mutation_engine.py/mutation_tables.py's internals.
-WELSH_FILLERS = {"ym", "er", "ah", "iawn", "gwybod", "chdi", "te", "ffeil"}
+# Hesitation sounds only. "iawn"/"gwybod"/"te" are real words, and skipping
+# them let "(o'n) iawn i ddweud" pair "yn" with "i"; "chdi" is the northern
+# 2sg pronoun (now in INDEPENDENT_PRONOUNS). mutation_tables.WELSH_FILLERS
+# keeps the longer list because corpus_formality uses it as a filler measure.
+WELSH_FILLERS = {"ym", "er", "ah"}

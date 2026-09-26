@@ -191,6 +191,16 @@ REL_INT_TAGS      = {"PRONREL", "PART", "EXCL"}
 DIGRAPHS      = ["ngh", "mh", "nh", "dd", "ff", "ll", "ph", "rh", "th",
                  "ch", "ng", "ts", "j"]
 WELSH_FILLERS = {"ym", "er", "ah", "iawn", "gwybod", "chdi", "te", "ffeil"}
+# What mutation detection may skip between a trigger and its target. The
+# longer WELSH_FILLERS above stays as corpus_formality's filler measure, but
+# "iawn"/"gwybod"/"te"/"chdi" are real words -- skipping them attached a
+# trigger to the wrong word ("(o')n iawn i ddweud" -> "yn" + "i").
+HESITATION_FILLERS = {"ym", "er", "ah"}
+
+# Triggers that are also pronouns ("i" I/me, "o"/"fe" he, "mi" me, "ni" we)
+# or interjections ("o", "na" = no). When spaCy tags one as PRON or INTJ it
+# is not the trigger sense and must not start a mutation context.
+POS_GATED_TRIGGERS = {"ni", "i", "o", "fe", "mi", "na"}
 WELSH_VOWELS  = {"a", "e", "i", "o", "u", "w", "y", "â", "ê", "î", "ô", "û", "ŵ", "ŷ"}
 
 # High-confidence English function words and common spoken insertions.

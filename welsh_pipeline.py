@@ -29,6 +29,7 @@ from mutation_engine import (
     load_spacy, reset_cysill_circuit_breaker, load_lemma_cache,
     save_lemma_cache, load_bangor_lexicon,
 )
+from cysill_client import cysill_status_line
 # PATCH: BASE_DIR/LOCAL_MP3_DIR/PREVIEW_DIR, ensure_dirs/run_stamp/
 # _video_slug/_preview_video_slug, every queue/processed/failed state log,
 # and the CSV-append helper (previously a local `_append` closure defined
@@ -40,7 +41,7 @@ from corpus_io import (
     load_queue, save_queue, load_processed, save_processed,
     load_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
-    append_output_csv, cleanup_incomplete_video_dirs,
+    append_output_csv, cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
 )
 from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
@@ -281,6 +282,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     # once here rather than lazily. A missing file just means "run
     # exactly as before this existed", not a startup failure.
     load_bangor_lexicon()
+    print(cysill_status_line())
 
     # PATCH: model is now session-scoped (loaded lazily, cached across menu
     # loops) instead of being re-prompted/re-loaded every single choice.
@@ -514,7 +516,8 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 run_type = "Local MP3 batch" if save_results else "Local MP3 batch (preview)"
                 run_start_time = time.time()
                 videos_attempted = len(pending_mp3_files)
-                keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations", "plural_mutations"]
+                keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations",
+                        "plural_mutations", "numeral_mutations"]
                 for p in tqdm(pending_mp3_files, desc="Videos", unit="video"):
                     meta = {"title": p.stem, "url": str(p), "source": "local"}
                     # PATCH: see matching comment in the choice "3" loop --
@@ -527,12 +530,13 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     vpaths = None
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, preps, plurs, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
                         vpaths = _video_slug(meta, stamp) if save_results else _preview_video_slug(meta, stamp)
-                        h = [True] * 7   # fresh header flags per video (new file each time)
+                        outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums]
+                        h = [True] * len(outputs)   # fresh header flags per video (new file each time)
                         any_written = False
-                        for data, key, hi in zip([segs, words, lemmas, pos_r, muts, preps, plurs], keys, range(7)):
+                        for data, key, hi in zip(outputs, keys, range(len(outputs))):
                             if data:
                                 append_output_csv(pd.DataFrame(data), vpaths[key], h, hi)
                                 any_written = True
@@ -641,7 +645,8 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # Reading the module attribute after calling load_spacy() below
                 # gets the live value.
                 nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
-                keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations", "plural_mutations"]
+                keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations",
+                        "plural_mutations", "numeral_mutations"]
                 for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                     # PATCH: defined before the try block (not just inside it)
                     # so the except block below can tell whether _video_slug()
@@ -728,11 +733,12 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
 
                         mp3_path = download_audio(video, audio_dir=vpaths["audio_dir"])
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, preps, plurs, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
-                        h = [True] * 7   # fresh header flags per video (new file each time)
+                        outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums]
+                        h = [True] * len(outputs)   # fresh header flags per video (new file each time)
                         any_written = False
-                        for data, key, hi in zip([segs, words, lemmas, pos_r, muts, preps, plurs], keys, range(7)):
+                        for data, key, hi in zip(outputs, keys, range(len(outputs))):
                             if data:
                                 append_output_csv(pd.DataFrame(data), vpaths[key], h, hi)
                                 any_written = True
@@ -806,9 +812,10 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     save_lemma_cache()
                     continue
                 if phrase:
-                    word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows = analyze_phrase(phrase)
+                    word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows, numeral_rows = analyze_phrase(phrase)
                     all_mutation_rows = mutation_rows
-                    save_analysis_outputs(stamp, [], word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows)
+                    save_analysis_outputs(stamp, [], word_rows, lemma_rows, pos_rows, mutation_rows,
+                                          prep_rows, plural_rows, numeral_rows)
 
             elif choice == "5":
                 manage_queue()
@@ -898,6 +905,15 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
             summary = generate_research_summary(all_mutation_rows, stamp)
             # PATCH: persist lemma cache at end of every run
             save_lemma_cache()
+            # PATCH: session-level counterpart to cleanup_incomplete_video_dirs()
+            # (called per-video, further up, on individual failures) -- if
+            # every video this session attempted failed, each one's own
+            # folder is already gone, but runs/<stamp>/ itself is left
+            # behind, now empty. This is a no-op whenever the session
+            # produced any real output at all (choice 4's phrase-test path
+            # never writes under RUNS_DIR in the first place, so it's
+            # harmless there too).
+            cleanup_empty_session_dir(stamp)
             print(f"\nResults saved in: {BASE_DIR}")
 
             if notify_on_completion:

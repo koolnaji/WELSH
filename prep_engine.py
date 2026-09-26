@@ -74,16 +74,26 @@ def _find_pronoun_target(i, words_list):
     """Lookahead for the next non-filler, non-synthetic word -- mirrors
     mutation_engine._find_lookahead_target's shape (same reasoning: absorb
     a filler word or two between the preposition and its pronoun without
-    losing the match, don't look arbitrarily far ahead)."""
+    losing the match, don't look arbitrarily far ahead). Never skips across
+    a comma/clause boundary."""
     lookahead = 1
     while lookahead <= 3 and (i + lookahead) < len(words_list):
         candidate = words_list[i + lookahead]
         norm = normalize_word(candidate["word"])
         if candidate.get("synthetic") or norm in WELSH_FILLERS:
+            if candidate.get("_clause_boundary_after"):
+                return None, lookahead
             lookahead += 1
             continue
         return candidate, lookahead
     return None, lookahead
+
+
+def _tagged_as(node, spacy_pos, cysill_prefixes):
+    spacy_tok = node.get("spacy_token") or {}
+    if spacy_tok.get("pos") == spacy_pos:
+        return True
+    return (node.get("cysill_pos") or "").upper().startswith(cysill_prefixes)
 
 
 def _build_prep_row(current_node, target_node, prep, person, status,
@@ -130,9 +140,16 @@ def process_preposition_erosion(words_list):
         norm = normalize_word(current_node["word"])
         if len(norm) < 1:
             continue
+        # PATCH: false-positive guards, all confirmed live 2026-09-26 -- every
+        # erosion this branch had produced came from one of these:
+        #   - a "yn" split out of a contraction ("o'n i" = oeddwn i, "I was");
+        #   - a comma right after the trigger ("O, ti'n..." -- interjection);
+        #   - the stem of a split contraction read as a pronoun ("i o'n").
+        if current_node.get("_from_contraction") or current_node.get("_clause_boundary_after"):
+            continue
 
         target, lookahead = _find_pronoun_target(i, words_list)
-        if target is None:
+        if target is None or target.get("_contraction_stem"):
             continue
         if target.get("confidence", 0.0) < 0.65:
             continue
@@ -140,6 +157,11 @@ def process_preposition_erosion(words_list):
         person = _person_for_pronoun(target_norm)
         if person is None:
             continue  # next word isn't a recognized independent pronoun -- not this phenomenon
+        # "i", "o", "ni", "fi" are also pronouns/particles/interjections, so the
+        # word after the preposition must actually be tagged as a pronoun --
+        # applied to correct AND eroded cases alike, so it can't tilt the rate.
+        if not _tagged_as(target, "PRON", ("PRON",)):
+            continue
 
         # Case A: current word IS a correctly-conjugated form for this
         # exact person, under some preposition (exact match, or the same
@@ -168,7 +190,11 @@ def process_preposition_erosion(words_list):
         # PREP_CONJUGATED_FORMS's own docstring). Resolved through
         # PREP_LEXEME_ALIASES first (currently only trwy -> drwy) so a
         # spelling variant checks against its lexeme's real paradigm.
-        if norm in PREP_BARE_FORMS:
+        # The bare forms ("i", "o", "yn", "am"...) are homographs of pronouns,
+        # interjections and particles, so they must be tagged as a
+        # preposition. Conjugated forms (Case A: "iddo", "arna", "ohono") are
+        # unambiguous words and aren't gated this way.
+        if norm in PREP_BARE_FORMS and _tagged_as(current_node, "ADP", ("PREP", "CPREP")):
             lexeme = PREP_LEXEME_ALIASES.get(norm, norm)
             valid_forms = PREP_CONJUGATED_FORMS.get(lexeme, {}).get(person)
             if valid_forms:

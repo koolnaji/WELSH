@@ -194,8 +194,14 @@ CURATED_CHANNELS = [
     {"url": "https://feeds.fireside.fm/haclediad/rss", "name": "Haclediad"},
     # Colli'r Plot (Y Pod) -- four novelists chatting about books and
     # whatever else, unscripted. RSS feed via its Spreaker host.
+    # PATCH: "type": "rss_feed" routes this through corpus_ops.py's
+    # _discover_rss_feed() (direct XML parsing) instead of yt-dlp's
+    # generic extraction -- confirmed live that yt-dlp's extract_flat
+    # misresolved every entry on this specific feed to the feed's own
+    # URL instead of each episode's, silently producing duplicate audio
+    # across an entire batch. See _discover_rss_feed()'s own docstring.
     {"url": "https://www.spreaker.com/show/5059223/episodes/feed",
-     "name": "Colli'r Plot"},
+     "name": "Colli'r Plot", "type": "rss_feed"},
     # Pryd ar Dafod (Y Pod) -- casual food-and-chat interview podcast.
     # Confirmed working: Anchor/Spotify-for-Podcasters publishes a
     # standard public RSS feed for this show, so it goes through the
@@ -273,6 +279,7 @@ def run_paths(stamp):
         "mutations":PHRASE_TEST_DIR / f"mutations_{stamp}.csv",
         "prep_mutations": PHRASE_TEST_DIR / f"prep_mutations_{stamp}.csv",
         "plural_mutations": PHRASE_TEST_DIR / f"plural_mutations_{stamp}.csv",
+        "numeral_mutations": PHRASE_TEST_DIR / f"numeral_mutations_{stamp}.csv",
     }
 
 
@@ -337,6 +344,7 @@ def _video_slug(meta, stamp):
         # PATCH (Phase 6): same pattern for the plural-marking branch (see
         # plural_engine.py's docstring).
         "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
+        "numeral_mutations": video_dir / f"numeral_mutations_{folder_name}.csv",
         "captions_dir": video_dir,
         "audio_dir":    video_dir,
     }
@@ -374,6 +382,7 @@ def _preview_video_slug(meta, stamp):
         "mutations":video_dir / f"mutations_original_{folder_name}.csv",
         "prep_mutations": video_dir / f"prep_mutations_{folder_name}.csv",
         "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
+        "numeral_mutations": video_dir / f"numeral_mutations_{folder_name}.csv",
     }
 
 
@@ -705,3 +714,34 @@ def cleanup_incomplete_video_dirs(vpaths, video_label="video"):
                    f"removed {len(removed)} empty/partial folder(s) from this "
                    f"attempt: {', '.join(removed)}")
     return bool(removed)
+
+
+# PATCH: the session-level counterpart to cleanup_incomplete_video_dirs()
+# above. That function cleans up ONE video's own folder when its attempt
+# produced nothing -- but if EVERY video in a queue-processing/local-MP3
+# session fails, each gets individually cleaned and the parent
+# runs/<stamp>/ folder is left behind, now genuinely empty, for a human
+# to notice and delete by hand. Call this once, right after a session's
+# main loop finishes (not after single ad-hoc actions like a phrase
+# test, which never write under RUNS_DIR at all -- this is a safe no-op
+# for those, since RUNS_DIR/stamp simply won't exist).
+def cleanup_empty_session_dir(stamp):
+    """
+    If runs/<stamp>/ ended up completely empty -- nothing anywhere in
+    its tree, recursively -- removes the folder itself. Only fires when
+    the session genuinely produced zero output: if even one video
+    succeeded (even with zero mutation rows found -- a legitimate
+    result, not a choke), its segments/words/pos CSVs are still sitting
+    there and this is a no-op, same "don't touch real data" discipline
+    as cleanup_incomplete_video_dirs(). Returns True if the folder was
+    removed.
+    """
+    session_dir = RUNS_DIR / stamp
+    if not session_dir.exists():
+        return False
+    if any(session_dir.rglob("*")):
+        return False
+    shutil.rmtree(session_dir, ignore_errors=True)
+    tqdm.write(f"  🧹 Session {stamp} produced no results at all -- "
+               f"removed the empty runs/{stamp}/ folder.")
+    return True

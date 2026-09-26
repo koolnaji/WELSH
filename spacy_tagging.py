@@ -100,6 +100,21 @@ def extract_number_from_spacy(spacy_token):
     return None
 
 
+def noun_number(word_dict):
+    """(number, source) for an enriched word already known to be a noun --
+    the one number reading numeral_engine.py and plural_engine.py share, so
+    the matched pair can never read number two different ways. Order: the
+    Bangor lexicon's dictionary value ("lex_number", set by enrich_words()),
+    then spaCy's morph tag, then Cysill. number may also be "collective" or
+    None; source is None when nothing answered."""
+    for value, source in ((word_dict.get("lex_number"), "lexicon"),
+                          (extract_number_from_spacy(word_dict.get("spacy_token")), "spacy"),
+                          (word_dict.get("cysill_number"), "cysill")):
+        if value:
+            return value, source
+    return None, None
+
+
 def parse_spacy_doc(text):
     if SPACY_NLP is None:
         return None

@@ -60,12 +60,21 @@ Usage:
     1. Download the data (~4MB zipped, ~56MB unzipped):
        https://github.com/techiaith/lecsicon-cymraeg-bangor
        -> lecsicon_cc0.zip -> unzip -> lecsicon_cc0.txt
-    2. Place it wherever you like and either pass the path to load(), or
-       set the BANGOR_LEXICON_PATH environment variable before the first
-       call -- loading is lazy and happens once per process either way.
+    2. Put lecsicon_cc0.txt next to this file (the pipeline folder) and it
+       is found wherever you run from. BANGOR_LEXICON_PATH, or a path passed
+       to load(), overrides that -- see _candidate_paths().
+
+Per-word NOUN features (noun_features()): gender and number of a wordform
+read from its NOUN readings only, each kept only when every noun reading
+agrees. Gender and number are dictionary facts about a noun form, so where
+the lexicon answers, it outranks spaCy's statistical morph guess (see
+enrich_words() in mutation_engine.py). These go into their own lex_gender/
+lex_number fields -- never into cysill_*, which stays reserved for what the
+live Cysill API actually said.
 """
 import os
 import re
+import sys
 from pathlib import Path
 
 from mutation_tables import MUTATION_TAG_MAP, SPACY_MUTATION_MAP
@@ -81,7 +90,24 @@ from mutation_tables import MUTATION_TAG_MAP, SPACY_MUTATION_MAP
 BANGOR_MUTATION_MAP = dict(SPACY_MUTATION_MAP)          # SM/NM/AM -> soft/nasal/aspirate
 BANGOR_MUTATION_MAP["HM"] = MUTATION_TAG_MAP["TH"]       # HM -> "h-mutation"
 
-DEFAULT_LEXICON_PATH = Path(os.getenv("BANGOR_LEXICON_PATH", "bangor_lexicon/lecsicon_cc0.txt"))
+_MODULE_DIR = Path(__file__).resolve().parent
+LEXICON_FILENAME = "lecsicon_cc0.txt"
+
+
+def _candidate_paths(path=None):
+    """Where load() looks, in order. An explicit path or BANGOR_LEXICON_PATH
+    is the ONLY candidate when given -- a wrong explicit setting should fail
+    loudly, not quietly load some other copy. Otherwise: next to this file,
+    then the older bangor_lexicon/ subfolder layout (beside this file, then
+    under the current directory). The old default was only the last one,
+    relative to wherever you ran from -- which is why a lexicon sitting in
+    the pipeline folder itself was never loaded."""
+    explicit = path or os.getenv("BANGOR_LEXICON_PATH", "").strip()
+    if explicit:
+        return [Path(explicit)]
+    return [_MODULE_DIR / LEXICON_FILENAME,
+            _MODULE_DIR / "bangor_lexicon" / LEXICON_FILENAME,
+            Path("bangor_lexicon") / LEXICON_FILENAME]
 
 # Matches one UD-style feature=value pair at a time, INCLUDING comma-
 # separated multi-values like "Gender=Fem,Masc" (real, attested Welsh
@@ -93,6 +119,7 @@ DEFAULT_LEXICON_PATH = Path(os.getenv("BANGOR_LEXICON_PATH", "bangor_lexicon/lec
 _MORPH_FEATURE_RE = re.compile(r"([A-Za-z]+)=([A-Za-z]+(?:,[A-Za-z]+)*)")
 
 _lexicon = None  # wordform -> list of {"lemma", "pos", "morph"} dicts, loaded lazily
+_loaded_path = None
 
 
 def _parse_morph(morph_str):
@@ -112,21 +139,27 @@ def load(path=None):
     (everything still runs, just slower and hitting Cysill as much as
     before) than a loud one at startup.
     """
-    global _lexicon
+    global _lexicon, _loaded_path
     if _lexicon is not None:
         return
 
-    lex_path = Path(path) if path else DEFAULT_LEXICON_PATH
-    if not lex_path.exists():
+    candidates = _candidate_paths(path)
+    lex_path = next((p for p in candidates if p.exists()), None)
+    if lex_path is None:
+        tried = ", ".join(str(p) for p in candidates)
         raise FileNotFoundError(
-            f"Bangor lexicon not found at {lex_path}. Download it from "
+            f"Bangor lexicon not found (looked in: {tried}). Download it from "
             f"https://github.com/techiaith/lecsicon-cymraeg-bangor "
-            f"(lecsicon_cc0.zip -> unzip -> lecsicon_cc0.txt) and place it "
-            f"there, or pass an explicit path to load(), or set the "
-            f"BANGOR_LEXICON_PATH environment variable."
+            f"(lecsicon_cc0.zip -> unzip -> lecsicon_cc0.txt) and put it in "
+            f"{_MODULE_DIR}, or set BANGOR_LEXICON_PATH to its full path."
         )
 
     lexicon = {}
+    # The same few thousand feature strings ("Gender=Masc|Number=Sing", ...)
+    # repeat across ~830k lines; parsing each once and sharing the dict (and
+    # interning the POS tag) keeps the loaded lexicon to a fraction of the
+    # RAM a fresh dict per line would take. Nothing mutates these dicts.
+    morph_cache = {}
     with open(lex_path, "r", encoding="utf-8-sig") as f:
         for line in f:
             line = line.rstrip("\r\n")
@@ -135,16 +168,25 @@ def load(path=None):
             parts = line.split("\t")
             if len(parts) < 3:
                 continue  # malformed line -- skip rather than abort the whole load
-            wordform, lemma, pos = parts[0], parts[1], parts[2]
-            morph = _parse_morph(parts[3]) if len(parts) > 3 else {}
+            wordform, lemma, pos = parts[0], parts[1], sys.intern(parts[2])
+            morph_str = parts[3] if len(parts) > 3 else ""
+            morph = morph_cache.get(morph_str)
+            if morph is None:
+                morph = morph_cache[morph_str] = _parse_morph(morph_str)
             lexicon.setdefault(wordform, []).append(
                 {"lemma": lemma, "pos": pos, "morph": morph})
 
     _lexicon = lexicon
+    _loaded_path = lex_path
 
 
 def is_loaded():
     return _lexicon is not None
+
+
+def loaded_path():
+    """The file load() actually read, or None."""
+    return _loaded_path
 
 
 def wordform_count():
@@ -242,3 +284,35 @@ def resolved_tag_if_unambiguous(word):
     mutation_type = BANGOR_MUTATION_MAP.get(morph.get("Mutation"))
 
     return {"mutation_type": mutation_type, "gender": gender, "number": number}
+
+
+_NOUN_GENDER = {"Masc": "masculine", "Fem": "feminine", "Fem,Masc": "epicene"}
+_NOUN_NUMBER = {"Sing": "singular", "Plur": "plural", "Coll": "collective"}
+
+
+def noun_features(word):
+    """
+    {"gender", "number"} for this wordform read from its NOUN readings only,
+    or None when it has no noun reading. Each feature is kept only when
+    every noun reading that carries it agrees; otherwise that feature is
+    None and the caller falls back to spaCy, whose context can pick the
+    right homograph. Checked against the real file:
+      - "plant" -> plural, "ferch" -> feminine singular, "pobl" -> singular
+      - "gŵn"   -> number None (soft-mutated "cŵn", plural, vs "gŵn"
+                   "gown", singular)
+      - "mil"   -> number singular, gender None (nasal-mutated "bil",
+                   masculine, vs "mil", epicene)
+    "epicene" (Gender=Fem,Masc: either gender is standard) is returned as
+    such, not as None, so a feminine-noun mutation rule cannot fire on it
+    via a spaCy guess. "collective" (Number=Coll) is neither singular nor
+    plural, so the numeral/rhai tests skip it instead of scoring it.
+    """
+    nouns = [e["morph"] for e in lookup(word) if e["pos"] == "NOUN"]
+    if not nouns:
+        return None
+    genders = {m["Gender"] for m in nouns if "Gender" in m}
+    numbers = {m["Number"] for m in nouns if "Number" in m}
+    return {
+        "gender": _NOUN_GENDER.get(next(iter(genders))) if len(genders) == 1 else None,
+        "number": _NOUN_NUMBER.get(next(iter(numbers))) if len(numbers) == 1 else None,
+    }

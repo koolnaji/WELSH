@@ -38,10 +38,25 @@ score is computed entirely independently of the phenomenon it will later
 be correlated against; that correlation happens downstream in
 corpus_analyzer.py, not here.
 
+Siarad (corpus_siarad.py) writes the same per-conversation CSVs, so each
+recording gets a video-level row here like any YouTube video. Its rows also
+carry a "speaker" column, so speaker_formality.csv additionally scores each
+Siarad SPEAKER separately -- the unit erosion actually belongs to, and
+~150 data points instead of ~70 recordings. Per-speaker rows join the
+speakers_*.csv metadata (age, sex) and the transcriber's own English tags
+(english_tagged_rate -- not the heuristic behind video-level
+codeswitch_rate, so the two columns are not interchangeable).
+
+Comparability caveat: Siarad F-scores come from human transcripts, YouTube
+ones from Whisper output. Same tagger, same formula, but different
+transcript types -- corpus_analyzer.py colours points by source so any
+offset between the two is visible rather than read as a register effect.
+
 Usage:
     python corpus_formality.py
         -- scans every video already under runs/, computes all of the
-           above per video, writes video_formality.csv to OUT_DIR. Safe
+           above per video (and per speaker where there is one), writes
+           video_formality.csv and speaker_formality.csv to OUT_DIR. Safe
            to re-run any time (e.g. after a new batch) -- always
            recomputed fresh from whatever's on disk, nothing incremental
            to go stale.
@@ -100,6 +115,23 @@ def _find_sibling_csv(video_dir, prefix, pos_csv_stem):
     return candidate if candidate.exists() else None
 
 
+def _pos_column(pos_df):
+    """
+    The per-word POS the F-score counts. spaCy primary (spacy_pos, the raw
+    UD tag -- has the DET/INTJ granularity Cysill's own tagset doesn't
+    distinguish; cysill_coarse_pos folds interjections/particles both into
+    "PART"), falling back to cysill_coarse_pos only for rows spaCy never
+    tagged at all. A row that falls back this way and happens to be a
+    genuine interjection will be undercounted on the context-dependent
+    side -- a known, minor limitation of Cysill's tagset, not a bug in
+    this scoring.
+    """
+    if "spacy_pos" in pos_df.columns:
+        valid_spacy = pos_df["spacy_pos"].notna() & (pos_df["spacy_pos"] != "none")
+        return pos_df["spacy_pos"].where(valid_spacy, pos_df.get("cysill_coarse_pos"))
+    return pos_df.get("cysill_coarse_pos")
+
+
 def compute_video_formality(video_dir):
     """
     Returns one dict of formality metrics for this video, or None if the
@@ -124,18 +156,7 @@ def compute_video_formality(video_dir):
     source      = pos_df["source"].iloc[0] if "source" in pos_df.columns else None
 
     # ---- F-score: POS counts already in pos_*.csv ----
-    # spaCy primary (spacy_pos, the raw UD tag -- has the DET/INTJ
-    # granularity Cysill's own tagset doesn't distinguish; cysill_coarse_pos
-    # folds interjections/particles both into "PART"), falling back to
-    # cysill_coarse_pos only for rows spaCy never tagged at all. A row
-    # that falls back this way and happens to be a genuine interjection
-    # will be undercounted on the context-dependent side -- a known,
-    # minor limitation of Cysill's tagset, not a bug in this scoring.
-    if "spacy_pos" in pos_df.columns:
-        valid_spacy = pos_df["spacy_pos"].notna() & (pos_df["spacy_pos"] != "none")
-        pos_col = pos_df["spacy_pos"].where(valid_spacy, pos_df.get("cysill_coarse_pos"))
-    else:
-        pos_col = pos_df.get("cysill_coarse_pos")
+    pos_col = _pos_column(pos_df)
     pos_counts = pos_col.value_counts().to_dict() if pos_col is not None else {}
     total_tagged = int(sum(pos_counts.values()))
     f_score = _f_score_from_pos_counts(pos_counts, total_tagged)
@@ -226,6 +247,70 @@ def build_video_formality_table():
     return df
 
 
+# Below this many tagged words a speaker's F-score is too noisy to plot --
+# the table keeps every speaker; corpus_analyzer.py applies this cut.
+MIN_SPEAKER_WORDS = 100
+
+
+def compute_speaker_formality(video_dir):
+    """
+    One row per speaker for a folder whose pos_*.csv carries a "speaker"
+    column (Siarad), else []. Same F-score as the video level, just counted
+    per speaker, plus that speaker's metadata from speakers_*.csv.
+    """
+    pos_csvs = sorted(video_dir.glob("pos_*.csv"))
+    if not pos_csvs:
+        return []
+    try:
+        pos_df = pd.read_csv(pos_csvs[0], encoding="utf-8-sig")
+    except Exception as e:
+        print(f"  ⚠️ Couldn't read {pos_csvs[0].name}: {e}")
+        return []
+    if pos_df.empty or "speaker" not in pos_df.columns or "video_url" not in pos_df.columns:
+        return []
+
+    meta = {}
+    speakers_csv = _find_sibling_csv(video_dir, "speakers", pos_csvs[0].stem)
+    if speakers_csv is not None:
+        try:
+            for r in pd.read_csv(speakers_csv, encoding="utf-8-sig").to_dict("records"):
+                meta[r["speaker"]] = r
+        except Exception as e:
+            print(f"  ⚠️ Couldn't read {speakers_csv.name}: {e}")
+
+    pos_col = _pos_column(pos_df)
+    rows = []
+    for speaker, index in pos_df.dropna(subset=["speaker"]).groupby("speaker").groups.items():
+        counts = pos_col.loc[index].value_counts().to_dict() if pos_col is not None else {}
+        total = int(sum(counts.values()))
+        f_score = _f_score_from_pos_counts(counts, total)
+        m = meta.get(speaker, {})
+        word_count = m.get("word_count")
+        english = m.get("english_tagged_words")
+        rows.append({
+            "video_url":             pos_df["video_url"].iloc[0],
+            "source":                pos_df["source"].iloc[0] if "source" in pos_df.columns else None,
+            "speaker":               speaker,
+            "f_score":               round(f_score, 2) if f_score is not None else None,
+            "pos_tagged_word_count": total,
+            "age":                   m.get("age"),
+            "sex":                   m.get("sex"),
+            # The transcriber's @s:eng tags, not the video-level heuristic.
+            "english_tagged_rate":   round(english / word_count, 4) if word_count else None,
+        })
+    return rows
+
+
+def build_speaker_formality_table():
+    rows = []
+    for video_dir in _discover_video_dirs():
+        rows.extend(compute_speaker_formality(video_dir))
+    if not rows:
+        return pd.DataFrame()
+    # latest run wins, same rule as the video table
+    return pd.DataFrame(rows).drop_duplicates(subset=["video_url", "speaker"], keep="last")
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print("Computing per-video formality scores...")
@@ -247,6 +332,15 @@ def main():
         by_source = df.dropna(subset=["f_score"]).groupby("source")["f_score"].agg(["mean", "count"])
         for src, r in by_source.sort_values("mean", ascending=False).iterrows():
             print(f"  {src:<60} mean={r['mean']:.1f}  n={int(r['count'])}")
+
+    speaker_df = build_speaker_formality_table()
+    if not speaker_df.empty:
+        speaker_path = OUT_DIR / "speaker_formality.csv"
+        speaker_df.to_csv(speaker_path, index=False, encoding="utf-8-sig")
+        usable = speaker_df[speaker_df["pos_tagged_word_count"] >= MIN_SPEAKER_WORDS]
+        print(f"\n{len(speaker_df)} speaker(s) scored ({len(usable)} with "
+              f">= {MIN_SPEAKER_WORDS} tagged words). Written to: {speaker_path}")
+        print(usable["f_score"].describe().round(2).to_string())
 
 
 if __name__ == "__main__":

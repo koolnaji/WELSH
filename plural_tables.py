@@ -1,41 +1,33 @@
 """
 plural_tables.py
 =================
-Pure data: the plural-demonstrative triggers the plural_* branch detects
-retention/erosion of plural marking after. No functions, no logic, no
-side effects -- same spirit as mutation_tables.py.
+Pure data for the plural_* branch: plural marking after "rhai" ("some").
 
-This is the "HAS an English counterpart" data point in this project's
-hypothesis (contrast mutation_tables.py's TRIGGERS/RADICAL_TO_MUTATED,
-and prep_tables.py's PREP_CONJUGATED_FORMS -- both "has NO counterpart"
-phenomena). Both Welsh and English obligatorily mark plurality on the
-noun -- different mechanism (Welsh's varied suffixation/apophony vs.
-English's regular -s), same grammatical requirement. An English-dominant
-bilingual's other language REINFORCES "you must mark this," rather than
-undermining it the way it does for mutation or conjugated prepositions
-(neither of which has any English counterpart at all) -- predicted by
-this project's hypothesis to RESIST erosion, in direct contrast to the
-other two branches.
+This is the "HAS an English counterpart" data point: Welsh "rhai" and
+English "some" both take a PLURAL noun ("rhai llyfrau" / "some books"), so
+English reinforces the Welsh requirement rather than undermining it --
+predicted to RESIST erosion. It is the partner of the numeral_* branch
+(numeral + SINGULAR noun, no English counterpart): both measure the same
+thing, the noun's singular/plural tag, so their rates are directly
+comparable.
 
-PLURAL_DEMONSTRATIVE_TRIGGERS is a closed, deliberately small set: "y
-rhain" (these) and "y rheina"/"y rheiny" (those -- both spellings
-attested) -- TWO-WORD triggers, architecturally different from the
-single-word TRIGGERS dict in mutation_tables.py or the single-word
-PREP_BARE_FORMS in prep_tables.py, which is why plural_engine.py can't
-reuse mutation_engine.layer_1_trigger_detection's shape and instead does
-its own small bigram scan (see that module's own docstring).
+PATCH (2026-09-26): the original trigger, "y rhain"/"y rheina"/"y rheiny" +
+noun, was a design error -- "y rhain" is a pronoun ("these ones") and is
+almost never followed by a noun ("these dogs" is "y cŵn 'ma/hyn"), so the
+branch produced zero rows on every real transcript.
 """
 
-# (first_word, second_word) -> plain-English gloss, for the note field on
-# any row this trigger produces.
-PLURAL_DEMONSTRATIVE_TRIGGERS = {
-    ("y", "rhain"):  "these",
-    ("y", "rheina"): "those",
-    ("y", "rheiny"): "those",
-}
+# "rai" is the soft-mutated form ("i rai pobl").
+RHAI_FORMS = {"rhai", "rai"}
+
+# Grammatically singular nouns with plural meaning that are standard after
+# "rhai" ("rhai pobl" = some people) -- their singular tag is not erosion.
+COLLECTIVE_NOUNS = {"pobl", "bobl"}
 
 # ========================= DUPLICATED, STANDALONE-CONVENTION HELPERS =====
 # Small and stable enough to duplicate rather than import -- keeps this
 # branch independent of mutation_engine.py/mutation_tables.py's internals
 # (see prep_tables.py's own comment on this same convention).
-WELSH_FILLERS = {"ym", "er", "ah", "iawn", "gwybod", "chdi", "te", "ffeil"}
+# Hesitation sounds only -- "iawn"/"gwybod"/"te"/"chdi" are real words and
+# skipping them attaches the trigger to the wrong word (same fix as prep_tables).
+WELSH_FILLERS = {"ym", "er", "ah"}

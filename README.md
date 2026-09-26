@@ -1,20 +1,54 @@
-# Welsh mutation analysis pipeline
+# Welsh grammatical erosion pipeline
 
-An interactive pipeline for transcribing Welsh audio, detecting initial
-consonant mutations, checking candidate findings against YouTube captions,
-reviewing results by hand, and producing corpus-wide figures.
+An interactive pipeline for transcribing Welsh audio and testing whether
+specific grammatical structures erode under sustained English-contact
+pressure -- and whether that erosion tracks a structure's *typological
+foreignness* to English specifically, not just informality in general.
+
+## The hypothesis this pipeline tests
+
+Dominant-language contact pressure erodes the structures the dominant
+language has no equivalent machinery for *faster* than structures it does
+have some counterpart for. Four grammatical phenomena are measured
+against that prediction:
+
+| Branch | Phenomenon | English counterpart? | Predicted |
+|---|---|---|---|
+| `mutation_*` | Initial consonant mutation (soft/nasal/aspirate) | None at all | Erodes |
+| `prep_*` | Conjugated prepositions ("arna i" vs. "ar fi") | None -- English prepositions never conjugate | Erodes |
+| `numeral_*` | Singular noun after a numeral ("tri chi", not "tri cŵn") | None -- English uses a plural | Erodes (toward the English plural) |
+| `plural_*` | Plural noun after "rhai" ("rhai llyfrau") | Yes -- English "some books" | Resists erosion |
+
+`numeral_*` and `plural_*` are a matched pair: both measure the same
+thing -- the singular/plural tag on the noun -- so tagger errors hit both
+sides equally and their rates compare directly.
+
+**Data sources.** YouTube/podcast audio (transcribed by Whisper) and the
+Bangor Siarad corpus (`corpus_siarad.py`): 40 hours of informal
+conversation between 153 Welsh-English bilinguals aged roughly 18-72,
+recorded 2005-08 at their homes or workplaces with no researcher present,
+with human transcripts, speaker age/sex, and human code-switch tags. Every
+Siarad detection row carries a `speaker` column that joins to that
+conversation's `speakers_*.csv`.
+
+A fourth module, `corpus_formality.py`, replaces a hand-assigned
+formal/informal/casual channel label with a grounded, continuous,
+per-video formality score computed from the transcript itself (POS-class
+balance, filler rate, lexical diversity) -- so "does erosion track
+formality" is an actual regression against a measured variable, not a
+comparison between three researcher-picked buckets.
 
 ## What this actually does, in one paragraph
 
-Point it at Welsh-language audio (a local MP3, or a YouTube channel you've
-added to a queue). It transcribes with Whisper, tags every word with two
-independent part-of-speech taggers (the Cysill API and a local spaCy
-parser), and uses that to work out where a mutation-triggering word (like
-"yn", "ei", "mae") is followed by a word that *should* be mutated -- then
-checks whether it actually was, in what the speaker said. Where YouTube
-captions exist, it cross-checks its own findings against them. Everything
-lands in CSVs you can review by hand, or summarize into corpus-wide
-figures.
+Point it at Welsh-language audio (a local MP3, or a YouTube channel
+you've added to a queue). It transcribes with Whisper, tags every word
+with two independent part-of-speech taggers (the Cysill API and a local
+spaCy parser), and runs all four detection branches above over the same
+tagged word stream -- each producing its own findings (mutation-, prep-,
+numeral- and plural-specific CSVs) from the same transcript pass. Where YouTube
+captions exist, mutation findings are cross-checked against them.
+Everything lands in CSVs you can review by hand, or summarize into
+corpus-wide figures, including an erosion-vs-formality regression.
 
 ## Setup
 
@@ -35,16 +69,20 @@ figures.
 5. Optionally, download Techiaith's Bangor lexicon
    (`lecsicon_cc0.zip` from
    [techiaith/lecsicon-cymraeg-bangor](https://github.com/techiaith/lecsicon-cymraeg-bangor),
-   CC0), unzip it, and place `lecsicon_cc0.txt` somewhere on disk (or set
-   `BANGOR_LEXICON_PATH` to point at it -- see **Environment variables**
-   below). This is a local, offline lookup used to resolve lemmas and
-   unambiguous POS/mutation/gender info without hitting the Cysill API,
-   cutting down on the 429 rate-limiting that endpoint runs into on real
-   corpus-sized runs. The pipeline continues without it, falling back to
-   Cysill/spaCy/simplemma exactly as before.
-6. Copy `.env.example` to your preferred environment-variable setup and
-   fill in what you need (see **Environment variables** below). Only
-   `WELSH_ANALYSIS_DIR` affects core functionality; the rest are optional.
+   CC0), unzip it, and put `lecsicon_cc0.txt` in the pipeline folder (next
+   to `bangor_lexicon.py`), or set `BANGOR_LEXICON_PATH` to its full path.
+   Startup prints `✅ Bangor lexicon loaded (... wordforms) from <path>`
+   when it is found. It resolves lemmas, and noun gender/number from the
+   dictionary (which outrank spaCy's guess wherever the lexicon has one),
+   without hitting the Cysill API. The pipeline continues without it,
+   falling back to Cysill/spaCy/simplemma.
+6. Set the environment variables you need (see **Environment variables**
+   below) in the shell you run the pipeline from -- e.g. `export
+   WELSH_LEMMATIZER=...` in Git Bash, or in `~/.bashrc` so every session
+   has it. **Nothing reads `.env` automatically**; `.env.example` is only a
+   list of the variables. Only `WELSH_ANALYSIS_DIR` affects core
+   functionality; the rest are optional. Startup prints a `Cysill:` line
+   saying whether the key was found.
 7. Set up a PO token provider for yt-dlp (see **YouTube PO tokens**
    below). Without this, audio downloads may intermittently or
    persistently fail with `HTTP Error 403: Forbidden` even when
@@ -138,7 +176,7 @@ See `sample_audio_window()` and `_shift_and_trim_padded_segments()` in
 sees the extracted clip and counts from 0:00 of *that file* -- without
 correction, every timestamp in the mutations/words CSVs would be off by
 however much got trimmed off the front, and caption corroboration in
-`fetch_captions.py` (which aligns against the real caption track's real
+`mutation_captions.py` (which aligns against the real caption track's real
 timestamps) would silently misalign on every sampled run. Every segment
 and word timestamp is shifted back to true-video time immediately after
 transcription, before anything else touches it -- so the `timestamp`
@@ -232,22 +270,29 @@ fetching player data with one client but requesting a token for
 another (visible in `-v` output as e.g. `Downloading android vr
 player API JSON` followed by `Generating a gvs PO Token for web_safari
 client`) -- that mismatch has been observed to 403 partway through an
-otherwise-successful-looking download. This repo's `download_audio()`
-now pins `extractor_args: {"youtube": {"player_client": ["mweb"]}}`
-for exactly this reason. Even with a matched client and a valid token,
-low-view/niche-channel videos (this project's actual corpus) have been
-observed to 403 more readily than heavily-viewed videos under
-otherwise identical conditions -- plausibly because YouTube's anti-bot
-heuristics weight traffic-pattern legitimacy signals that low-view
-content simply doesn't have. `AUDIO_DOWNLOAD_MIN_INTERVAL` in
-`corpus_ops.py` slows audio-download pacing specifically as a
-mitigation; there's no code-level fix that fully eliminates this
-asymmetry.
+otherwise-successful-looking download.
+
+**Known issue, not yet fixed in this codebase (flagging honestly rather
+than claiming otherwise):** a pinned `player_client` (e.g. forcing
+`extractor_args: {"youtube": {"player_client": ["mweb"]}}` in
+`download_audio()`) and a slower, audio-download-specific request
+interval have both been discussed as mitigations for this and for a
+separate, confirmed asymmetry -- low-view/niche-channel videos (this
+project's actual corpus) 403 more readily than heavily-viewed videos
+under otherwise identical conditions, plausibly because YouTube's
+anti-bot heuristics weight traffic-pattern legitimacy signals that
+low-view content simply doesn't have. **Neither mitigation is currently
+implemented in `corpus_ops.py`/`youtube_access.py`** -- some project
+documentation elsewhere describes them as already live, but a direct
+check of this repo's actual `download_audio()` and
+`youtube_access.call()` found no `player_client` pinning and no
+audio-specific pacing parameter. Treat this as an open item, not a
+solved one, until someone actually adds it here and this note is
+updated.
 
 **Unconfirmed as of 2026-08-17**: a nightly yt-dlp build was reported
-to stop producing these 403s in quick manual testing, without the
-`mweb`/pacing mitigations above necessarily being required. This has
-not been isolated or confirmed at batch scale -- see `limitations.txt`
+to stop producing these 403s in quick manual testing. This has not
+been isolated or confirmed at batch scale -- see `limitations.txt`
 Section 1.4 before relying on it alone. If you do switch to nightly,
 record the exact build (`yt-dlp --version`) somewhere durable, since
 nightly builds aren't version-pinned and a later build could
@@ -258,9 +303,9 @@ reintroduce this behavior without warning.
 | Variable | Required? | Purpose |
 |---|---|---|
 | `WELSH_ANALYSIS_DIR` | No | Where all output lives (audio, transcripts, mutations, summaries, queue/cache files). Defaults to `~/welsh_analysis` if unset. |
-| `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. |
-| `BANGOR_LEXICON_PATH` | No | Path to the downloaded `lecsicon_cc0.txt` file (see **Setup** step 5). Without it, lemma/POS/mutation-type/gender lookups go straight to Cysill/spaCy/simplemma, same as before this existed. Defaults to `bangor_lexicon/lecsicon_cc0.txt` (relative to wherever you run the pipeline from) if unset. |
-| `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` | No | Authenticates yt-dlp's requests (audio download, caption listing/download, channel discovery) the same way a logged-in browser tab would. YouTube rate-limits anonymous requests to its caption/timedtext endpoint hard (`HTTP Error 429: Too Many Requests`), and the resulting block has been reported to last on the order of hours -- authenticating avoids tripping it in the first place, rather than just retrying through it. `YTDLP_COOKIES_FILE` points at a `cookies.txt` (Netscape format, e.g. exported via a "Get cookies.txt LOCALLY" browser extension -- portable between machines, and the more reliable option on Windows, see below); `YTDLP_COOKIES_FROM_BROWSER` names a browser (`chrome`, `firefox`, ...) to read cookies live from instead, machine-local only. If both are set, the file wins. Leave both blank to run fully anonymous, exactly as before this existed. **Windows + Chrome-family browsers:** newer Chrome versions' "app-bound encryption" is known to break yt-dlp's live cookie decryption on Windows (see [yt-dlp#15401](https://github.com/yt-dlp/yt-dlp/issues/15401)) -- if `YTDLP_COOKIES_FROM_BROWSER=chrome` fails to decrypt, either try `firefox` instead or switch to `YTDLP_COOKIES_FILE`. |
+| `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. A missing key used to be completely silent; startup now prints a `Cysill:` status line, and every video prints a `Tagger coverage:` line with how many words spaCy, Cysill and the lexicon each covered. |
+| `BANGOR_LEXICON_PATH` | No | Full path to `lecsicon_cc0.txt` (see **Setup** step 5). Only needed if the file is not in the pipeline folder: unset, the loader looks next to `bangor_lexicon.py`, then in a `bangor_lexicon/` subfolder there, then in `./bangor_lexicon/`. When set, it is the only place looked. |
+| `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` | No | Authenticates yt-dlp's caption listing/download requests the same way a logged-in browser tab would. Audio downloads deliberately run without cookies and use them only as a fallback for videos that require sign-in (age gate, bot check, members-only) -- sending the cookie file on downloads produced persistent `HTTP Error 403` that went away without it (see `limitations.txt` Section 1.4). Note that yt-dlp writes cookies back into this file after every call, so point it at a copy used only by this pipeline, never your only export of a logged-in session. Channel discovery never uses cookies. YouTube rate-limits anonymous requests to its caption/timedtext endpoint hard (`HTTP Error 429: Too Many Requests`), and the resulting block has been reported to last on the order of hours -- authenticating avoids tripping it in the first place, rather than just retrying through it. `YTDLP_COOKIES_FILE` points at a `cookies.txt` (Netscape format, e.g. exported via a "Get cookies.txt LOCALLY" browser extension -- portable between machines, and the more reliable option on Windows, see below); `YTDLP_COOKIES_FROM_BROWSER` names a browser (`chrome`, `firefox`, ...) to read cookies live from instead, machine-local only. If both are set, the file wins. Leave both blank to run fully anonymous, exactly as before this existed. **Windows + Chrome-family browsers:** newer Chrome versions' "app-bound encryption" is known to break yt-dlp's live cookie decryption on Windows (see [yt-dlp#15401](https://github.com/yt-dlp/yt-dlp/issues/15401)) -- if `YTDLP_COOKIES_FROM_BROWSER=chrome` fails to decrypt, either try `firefox` instead or switch to `YTDLP_COOKIES_FILE`. |
 | `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after Queue & Processing -> b (Process queue) or Testing -> b (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
 
 Never commit real values for any of these -- keep them in your actual
@@ -272,27 +317,49 @@ environment/shell profile/`.env`, not in source files.
 either a module it imports, or a standalone companion tool you can also
 run on its own from the command line.
 
-**Core pipeline (imported by `welsh_pipeline.py`):**
+**Naming convention:** files are prefixed by which branch owns them --
+`mutation_*.py` (consonant mutation), `prep_*.py` (conjugated
+prepositions), `plural_*.py` (plural marking). Unprefixed files are
+shared infrastructure or cross-branch analysis, used by every branch,
+owned by none of them. Each branch's `_tables.py` is pure linguistic
+data (no logic); its `_engine.py`/`engine.py` is the detection logic. A
+branch's engine never imports another branch's tables or engine
+directly -- shared capabilities (tagging output, the consumption-tracking
+guard that stops two rules double-counting the same word) live in
+`spacy_tagging.py` instead, so branches stay independent of each other's
+internals and a new branch can be added the same way without touching
+the existing ones.
 
-- `mutation_engine.py` -- the linguistic engine: takes transcribed words
-  and POS tags, works out what mutation *should* apply where, and compares
-  it to what actually happened. This is where "erosion" gets decided.
-- `mutation_tables.py` -- every mutation rule, trigger word, and lexicon
-  the engine knows about, as plain data (no logic). If you're checking or
-  adding a linguistic rule, this is the file to open.
+**Shared infrastructure (imported by every branch):**
+
+- `corpus_io.py` -- the single source of truth for "where does this
+  project's state/output actually live": directory layout, the
+  `runs/<stamp>/<slug>/` per-video path scheme, every JSON state log
+  (queue/processed/failed), lemma-cache and checkpoint persistence, and
+  `CURATED_CHANNELS` (the list of channels/feeds `discover_new_videos`
+  scans -- relocated here from `mutation_engine.py`, since channel
+  discovery isn't mutation-specific).
+- `corpus_ops.py` -- file I/O and orchestration: the video queue,
+  processed/failed logs, audio download, and the `analyze()`/
+  `analyze_phrase()` functions that run Whisper plus *every* detection
+  branch (mutation, prep, plural) over one video or phrase end to end,
+  plus the completion email. Also owns `TRANSCRIBE_PRESETS` (see
+  **Transcription presets** above) and `sample_audio_window()` (see
+  **Sampling long videos** above).
+- `spacy_tagging.py` -- loads the Welsh spaCy model, turns its output
+  into plain data the rest of the pipeline uses, and hosts a few small
+  generic capabilities every branch needs: `extract_gender_from_spacy`/
+  `extract_number_from_spacy` (reading UD morph features into this
+  project's shared vocabulary), and `mark_consumed`/`was_consumed` (the
+  guard that stops a word already scored by one rule from being
+  independently re-scored by another rule walking the same word
+  stream).
 - `cysill_client.py` -- talks to the Cysill API (POS tags, lemmas), with
   retries and a circuit breaker that falls back to spaCy-only if Cysill is
   down for a whole run. Once tripped, later calls return instantly and
   silently rather than re-attempting or re-announcing failure -- a long
   run doesn't get slower or noisier just because Cysill went down early
   in it.
-- `spacy_tagging.py` -- loads the Welsh spaCy model and turns its output
-  into plain data the rest of the pipeline uses.
-- `corpus_ops.py` -- file I/O: the video queue, processed/failed logs,
-  audio download, the `analyze()` function that runs one video end to end,
-  and the completion email. Also owns `TRANSCRIBE_PRESETS` (see
-  **Transcription presets** above) and `sample_audio_window()` (see
-  **Sampling long videos** above).
 - `bangor_lexicon.py` -- optional, local, offline lookup against
   Techiaith's own Bangor lexicon (~830k wordforms). Loaded once at
   startup if available (see **Setup** step 5); resolves most lemmas, and
@@ -300,6 +367,12 @@ run on its own from the command line.
   going through the Cysill API at all. Never populates `cysill_pos`
   itself (different tag scheme, no published mapping) -- only the
   translated `cysill_mutation_type`/`cysill_gender` fields, and lemmas.
+  Per word, it also gives noun gender and number from the word's noun
+  readings (`lex_gender`/`lex_number` in `pos_*.csv`), kept only when all
+  noun readings agree. These come before spaCy for the feminine-noun
+  mutation rules and for the numeral/rhai number check (`number_source`
+  in those CSVs says which one decided). Epicene nouns (`Gender=Fem,Masc`)
+  come back as `epicene`, so no feminine-noun rule fires on them.
   Also recognizes English code-switch words and skips sending them to
   Cysill at all, rather than letting a Welsh-only tagger guess at them.
 
@@ -313,40 +386,106 @@ run on its own from the command line.
   `corpus_analyzer.py`: `cysill_pos` being empty doesn't mean "Cysill had
   nothing to say," it can also mean "this word never needed asking."
 
-**Standalone companions (each also runs directly; most are called
-automatically at the right point in the main workflow -- exceptions
-noted below):**
+**Mutation branch (no English counterpart -- predicted to erode):**
 
-- `fetch_captions.py` -- downloads a video's YouTube captions and checks
-  them against a mutations CSV already produced for that video. Aligns
-  the whole video's Whisper word stream (from `words_*.csv`, which has
-  per-word timestamps) against the whole caption track in one pass,
-  rather than comparing small time windows -- more robust to Whisper's
-  and the caption track's segments being chunked completely
-  independently of each other. Retries with backoff on YouTube 429s, and
-  trips a circuit breaker (same pattern as `cysill_client.py`'s) after a
-  few consecutive whole-video caption failures in one run, disabling
-  captions for the rest of that run rather than retrying into a block
-  that won't clear mid-run -- see `YTDLP_COOKIES_FILE`/
-  `YTDLP_COOKIES_FROM_BROWSER` above for avoiding the block in the first
-  place. Either way, transcription/mutation output for the video itself
-  is unaffected -- captions are corroboration-only.
-- `manual_editing.py` -- an interactive terminal tool for reviewing
-  mutation rows one at a time: confirm or overturn each finding, flag
-  anything uncertain, leave notes, search, or just skim a summary.
+- `mutation_engine.py` -- the linguistic engine: takes transcribed words
+  and POS tags, works out what mutation *should* apply where, and compares
+  it to what actually happened. This is where "erosion" gets decided.
+- `mutation_tables.py` -- every mutation rule, trigger word, and lexicon
+  the engine knows about, as plain data (no logic). If you're checking or
+  adding a linguistic rule, this is the file to open.
+- `mutation_captions.py` -- downloads a video's YouTube captions and
+  checks them against a mutations CSV already produced for that video.
+  Aligns the whole video's Whisper word stream (from `words_*.csv`,
+  which has per-word timestamps) against the whole caption track in one
+  pass, rather than comparing small time windows -- more robust to
+  Whisper's and the caption track's segments being chunked completely
+  independently of each other. YouTube-request retry/backoff/pacing is
+  delegated entirely to `youtube_access.py`'s shared coordinator (see
+  below) -- this file does not keep its own separate circuit breaker.
+  Transcription/mutation output for the video itself is unaffected by a
+  caption failure either way -- captions are corroboration-only.
+- `mutation_manual_editing.py` -- an interactive terminal tool for
+  reviewing mutation rows one at a time: confirm or overturn each
+  finding, flag anything uncertain, leave notes, search, or just skim a
+  summary.
+- `mutation_rerun_rules.py` -- re-evaluates already-transcribed videos
+  against an updated rule in `mutation_engine.py`/`mutation_tables.py`,
+  without re-transcribing or re-hitting Cysill. Writes a
+  `*_rerun_candidate.csv` comparison file by default; `--commit` applies
+  it, never overwriting a `manual_reviewed=True` row.
+
+**Preposition branch (no English counterpart -- predicted to erode):**
+
+- `prep_engine.py` -- detects conjugated Welsh prepositions ("arna i")
+  against the eroded, analytic pattern English already has natively
+  ("ar fi" -- bare preposition + independent pronoun). The colloquial
+  dropping of a conjugated form's final unstressed `-f` (e.g. spoken
+  "arna" for citation-form "arnaf") is treated as ordinary phonology, not
+  erosion, via a general rule applied at match time -- not something
+  worth conflating with the actual phenomenon under study.
+- `prep_tables.py` -- the conjugated-preposition paradigms this branch
+  checks against, as plain data, cross-checked against multiple sources
+  (see the file's own comments for exactly which forms came from where,
+  and which cells are inferred rather than directly sourced).
+
+**Numeral branch (no English counterpart -- predicted to erode):**
+
+- `numeral_engine.py` -- a numeral directly followed by a noun ("tri
+  chi", "dwy flynedd") should take the singular; a plural there is the
+  English pattern. The partitive "tri o'r plant" is native and skipped, as
+  is "un" (singular in English too). The trigger must be tagged as a
+  numeral and the target as a non-code-switched noun with a known number.
+- `numeral_tables.py` -- numeral forms (including mutated ones), as data.
+
+**Plural-marking branch (has an English counterpart -- predicted to
+resist erosion):**
+
+- `plural_engine.py` -- after "rhai" ("some"), checks whether the
+  following noun carries plural marking at all (not which allomorph --
+  Welsh plural formation is too irregular to verify the exact form).
+  Welsh and English both require a plural here, so this is the partner
+  of the numeral branch. ("rhai pobl" is standard despite "pobl" being
+  grammatically singular.) The original trigger, "y rhain" + noun, never
+  fired on real speech -- "y rhain" is a pronoun ("these ones").
+- `plural_tables.py` -- trigger forms and collective-noun exceptions.
+
+**Human-transcribed corpus:**
+
+- `corpus_siarad.py` -- `python corpus_siarad.py <file.cha | folder>`
+  runs Bangor Siarad CHAT transcripts through the same tagging and
+  detection as audio (via `corpus_ops.analyze_segments()`), writing the
+  usual CSVs plus `speakers_*.csv` (age, sex, per-speaker notes, English
+  word counts) and `utterances_*.csv` (raw and cleaned text, %gls/%eng
+  tiers). Transcripts: TalkBank (Bangor/Siarad, the cited version) or
+  bangortalk.org.uk; GPLv3, cite Deuchar, Webb-Davies & Donnelly (2009),
+  doi:10.21415/T5088V. Word times are interpolated within each utterance
+  (CHAT only times whole utterances). Siarad rows land under `runs/`
+  alongside video rows -- filter on `source == "siarad"` to separate them.
+
+**Cross-branch analysis:**
+
 - `corpus_analyzer.py` -- reads every mutations CSV you've ever produced,
-  merges them, and generates corpus-wide figures and a text summary.
-- `validate_against_chat.py` -- **not** wired into the main menu, run by
-  hand. Compares Whisper's own transcript for a Bangor Siarad corpus
-  recording against that recording's human-made CHAT-format (`.cha`)
-  ground-truth transcript, using the same whole-video alignment engine as
-  `fetch_captions.py`. Useful as a spot-check on genuinely spontaneous,
-  overlapping, multi-speaker audio -- the one place in this project with
-  a real ground-truth transcript to measure Whisper against, rather than
-  assuming it degrades gracefully the way it does on scripted/produced
-  sources. Always run with `--dump-clean` on a new file first (its CHAT
-  annotation cleanup hasn't been validated against a real downloaded
-  Bangor Siarad file yet -- see the script's own docstring).
+  merges them, and generates corpus-wide figures and a text summary,
+  including the erosion-vs-formality-score regression (see below).
+- `corpus_formality.py` -- computes a grounded, continuous, per-video
+  formality score retroactively from transcript data already collected
+  (no re-transcription needed): the Heylighen & Dewaele (1999) F-score
+  from POS-class balance, filler-word rate, lexical diversity, and mean
+  words per segment. Replaces a hand-assigned, per-channel
+  formal/informal/casual label that had no way to be independently
+  checked. Code-switch rate is computed and reported alongside this, but
+  deliberately kept as its own separate figure/column, not folded into
+  the formality score -- see the module's own docstring for why mixing
+  the two would muddy what an erosion-formality correlation actually
+  reflects.
+- `youtube_access.py` -- the single shared coordinator for *every*
+  yt-dlp request in a run (captions, audio downloads, channel discovery
+  alike): paced inter-request timing, escalating jittered backoff on a
+  429, and a rate-limit cooldown that persists to disk and survives a
+  process restart, not just the rest of the current run -- since a
+  YouTube 429 block has been reported to last on the order of hours,
+  longer than any single run.
 
 ## Workflow
 
@@ -358,17 +497,17 @@ The usual path: **1a** (discover) -> **1b** (process queue) -> **1d**
 (review by hand) -> **2a** (generate figures).
 
 **1 -- Queue & Processing**
-- **a** Discover new videos -- scans `CURATED_CHANNELS` (in `mutation_engine.py`) for anything new, adds it to `video_queue.json`. Doesn't download or transcribe.
-- **b** Process queue -- transcribes, analyzes, and (YouTube sources only) caption-corroborates. Failed videos retry up to 3x (`failed_videos.json`) before being given up on. Sends a completion email if configured.
+- **a** Discover new videos -- scans `CURATED_CHANNELS` (in `corpus_io.py`) for anything new, adds it to `video_queue.json`. Doesn't download or transcribe.
+- **b** Process queue -- transcribes, then runs all three detection branches (mutation, prep, plural) and (YouTube sources only) caption-corroborates the mutation findings. Failed videos retry up to 3x (`failed_videos.json`) before being given up on. Sends a completion email if configured.
 - **c** Manage queue -- view, filter, or remove queued videos.
-- **d** Manually review mutations -- launches `manual_editing.py` (`--help` for its filtering options).
-- **e** Re-run mutation rule(s) -- launches `rerun_rules.py` to re-evaluate already-transcribed videos after a rule change, without re-transcribing or re-hitting Cysill.
+- **d** Manually review mutations -- launches `mutation_manual_editing.py` (`--help` for its filtering options).
+- **e** Re-run mutation rule(s) -- launches `mutation_rerun_rules.py` to re-evaluate already-transcribed videos after a rule change, without re-transcribing or re-hitting Cysill.
 
 **2 -- Analysis**
-- **a** Run corpus analyzer -- merges every mutations file ever produced into corpus-wide figures + a summary. Read-only; also runnable directly as `python corpus_analyzer.py`.
+- **a** Run corpus analyzer -- merges every mutations file ever produced into corpus-wide figures + a summary, including the erosion-vs-formality regression (`corpus_formality.py`). Read-only; also runnable directly as `python corpus_analyzer.py`.
 
 **3 -- Testing**
-- **a** Test a Welsh phrase -- no audio, no transcription wait.
+- **a** Test a Welsh phrase -- no audio, no transcription wait. Runs all three detection branches on the typed phrase.
 - **b** Analyze local MP3 files -- point it at a folder of MP3s (no captions to corroborate against). Asks **save** (real corpus, same as 1b) or **preview** (writes to `mp3_previews/` instead, never marked processed) -- use preview to sanity-check an unfamiliar audio source before committing it.
 
 ## Where your data ends up
@@ -392,12 +531,14 @@ WELSH_ANALYSIS_DIR/
 │       ├── lemmas_<stamp>_<slug>.csv
 │       ├── pos_<stamp>_<slug>.csv
 │       ├── mutations_original_<stamp>_<slug>.csv       the actual findings, as first detected --
-│       │                                                 this is what manual_editing.py and
+│       │                                                 this is what mutation_manual_editing.py and
 │       │                                                 corpus_analyzer.py read; never modified
 │       │                                                 by corroboration
 │       ├── mutations_corroborated_<stamp>_<slug>.csv   only present once captions are fetched --
 │       │                                                 corroboration's cross-checked result,
 │       │                                                 written to this separate file
+│       ├── prep_mutations_<stamp>_<slug>.csv           conjugated-preposition branch findings
+│       ├── plural_mutations_<stamp>_<slug>.csv         plural-marking branch findings
 │       ├── <video_id>_<title>.mp3          raw audio -- plus a `_sample<start>-<end>s.mp3`
 │       │                                     variant next to it if trimmed by --sample-minutes
 │       │                                     (see **Sampling long videos**)
@@ -412,11 +553,15 @@ WELSH_ANALYSIS_DIR/
 ├── runs/_deleted/                          the pipeline's own soft-delete archive
 ├── test_audio/                             drop local MP3s here for Testing -> b
 ├── analysis/                               Analysis -> a's output: merged_mutations.csv,
-│   └── figures/                              utterance_export.csv, and chart images
+│                                              utterance_export.csv, video_formality.csv
+│                                              (per-video formality scores, corpus_formality.py),
+│                                              and asr_divergence.csv
+│   └── figures/                              chart images, including erosion_vs_formality.png
+│                                              and erosion_vs_codeswitch.png
 ├── phrase_tests/                           Testing -> a's ad-hoc "test a Welsh phrase"
 │                                              output -- deliberately kept outside runs/ so it
 │                                              never gets swept into the real corpus by
-│                                              Analysis -> a or rerun_rules.py
+│                                              Analysis -> a or mutation_rerun_rules.py
 ├── mp3_previews/                           Testing -> b's output when you choose "preview" instead
 │                                              of "save" -- same quarantine idea as phrase_tests/,
 │                                              never marked processed, never swept into the corpus
@@ -441,17 +586,25 @@ older code or docs that describe `transcriptions/`, `mutations/`,
 pre-migration layout; `migrate_to_new_structure.py` is what moved
 everything into the flat structure shown above.
 
-Running `fetch_captions.py` directly from the command line (rather than
-through the main pipeline) has no run/video context to nest into, so it
-still saves flat into `runs/` at the top level -- that's expected for
-ad-hoc standalone use, not a bug.
+Running `mutation_captions.py` directly from the command line (rather
+than through the main pipeline) has no run/video context to nest into,
+so it still saves flat into `runs/` at the top level -- that's expected
+for ad-hoc standalone use, not a bug.
 
 Corroboration never modifies a video's `mutations_original_*.csv` --
 running it (which happens automatically whenever captions are fetched)
 writes its cross-checked result to a separate `mutations_corroborated_*.csv`
 instead, so the original, pre-corroboration findings are always still
-there to compare against. `corpus_analyzer.py` and `manual_editing.py`
+there to compare against. `corpus_analyzer.py` and `mutation_manual_editing.py`
 both know to prefer the corroborated file when one exists.
+
+`prep_mutations_*.csv` and `plural_mutations_*.csv` are each a single
+file per video (no original/corroborated split -- caption corroboration
+is currently mutation-specific only) and are not yet merged into
+`corpus_analyzer.py`'s corpus-wide figures; reading them directly, or
+extending `corpus_analyzer.py` to aggregate them the same way it does
+mutation findings, is the natural next step once those two branches have
+been validated against real corpus audio.
 
 ## State and recovery
 
