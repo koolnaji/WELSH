@@ -137,6 +137,24 @@ def is_noun_target(word_dict):
     return tagged_as(word_dict, "NOUN", ("N",))
 
 
+def noun_phrase_interrupted(words_list, trigger_index, target):
+    """True when the noun after a numeral/"rhai" isn't the head of a finished
+    noun phrase -- shared by numeral_engine.py and plural_engine.py, so the
+    matched pair skips exactly the same contexts:
+      - a self-correction: the next word repeats the noun or extends it
+        ("rai nos nos nosweithiau Llun" -- the speaker's final word is the
+        correct plural; davies2.cha, 2026-09-27);
+      - "fath â"/"fath ag" = "like" ("rai fath â isdeitlau" = ones like
+        subtitles)."""
+    k = next((k for k in range(trigger_index + 1, min(trigger_index + 5, len(words_list)))
+              if words_list[k] is target), None)
+    if k is None or k + 1 >= len(words_list) or target.get("_clause_boundary_after"):
+        return False
+    noun = (target.get("word") or "").lower().strip(".,!?;:'\"")
+    nxt = (words_list[k + 1].get("word") or "").lower().strip(".,!?;:'\"")
+    return bool(noun) and (nxt.startswith(noun) or nxt in ("â", "ag"))
+
+
 def noun_number(word_dict):
     """(number, source) for an enriched word already known to be a noun --
     the one number reading numeral_engine.py and plural_engine.py share, so

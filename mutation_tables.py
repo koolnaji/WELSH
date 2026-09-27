@@ -347,6 +347,24 @@ WELSH_CONTRACTION_SPLITS = {
 # after a noun they are far more often "to"/"of" ("darn o bapur").
 ECHO_PRONOUNS = {"fi", "ti", "di", "fe", "e", "hi", "ni", "chi", "nhw"}
 
+# Discourse particles, never mutation targets: "yn te"/"yn de" = the tag
+# "isn't it?" (yntê), "ydy ta" = "then" -- not the noun "te" (tea). ~11 false
+# erosions in fusser12.cha alone (2026-09-27).
+DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê"}
+
+# Adjectives that never undergo soft mutation ("mae'n braf").
+NEVER_MUTATING = {"braf"}
+
+# Possessive determiners: after these, a noun + echo pronoun ("ei gŵr hi") is
+# the NORMAL possessive, not a dropped possessive (ECHO_PRONOUNS rule).
+POSSESSIVE_TRIGGERS = {"fy", "dy", "ei", "ein", "eich", "eu"}
+
+# Colloquial 1sg forms of verbs the lexicon may not list; "dw i meddwl" (I
+# think) must read "i" as the pronoun, not the preposition "to".
+FIRST_PERSON_VERB_FORMS = {"dw", "dwi", "wy", "w", "sa", "sai", "so", "smo",
+                           "oeddwn", "roeddwn", "o'n", "baswn", "faswn",
+                           "byswn", "fyswn", "swn", "byddwn", "fyddwn"}
+
 # The soft-mutating prepositions among TRIGGERS. A preposition governs a
 # nominal, so a lone adjective or adverb after one isn't its object (see
 # _process_word_trigger).

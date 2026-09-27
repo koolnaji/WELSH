@@ -21,7 +21,7 @@ followed by a non-noun and so produces nothing.
 
 Standalone: imports only spacy_tagging.py.
 """
-from spacy_tagging import is_noun_target, noun_number
+from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted
 from plural_tables import (RHAI_FORMS, COLLECTIVE_NOUNS, MASS_NOUNS,
                            POSSESSIVE_ECHO_PRONOUNS, WELSH_FILLERS)
 
@@ -95,7 +95,11 @@ def process_plural_marking(words_list):
                 not target.get("_clause_boundary_after") and \
                 normalize_word(words_list[after]["word"]) in POSSESSIVE_ECHO_PRONOUNS:
             continue
+        if noun_phrase_interrupted(words_list, i, target):
+            continue   # self-correction or "fath â" -- same rule as numeral_engine.py
         number, number_source = noun_number(target)
+        if number_source != "lexicon":
+            continue   # dictionary-confirmed number only -- see numeral_engine.py
         if number == "plural" or (number == "singular" and target_norm in COLLECTIVE_NOUNS):
             rows.append(_build_plural_row(
                 current_node, target, "correct_mutation", False, number, number_source,

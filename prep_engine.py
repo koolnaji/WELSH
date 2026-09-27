@@ -153,6 +153,14 @@ def process_preposition_erosion(words_list):
         # "i", "o", "ni", "fi" are also pronouns/particles/interjections, so the
         # word after the preposition must actually be tagged as a pronoun --
         # applied to correct AND eroded cases alike, so it can't tilt the rate.
+        # "ti gwybod" / "chi gweld" = the fillers "you know" / "you see", not
+        # the preposition's object: "yn ti gwybod yn Main Bar" (in, you know,
+        # in the Main Bar) was scored as eroded "ynddot" (davies2.cha,
+        # 2026-09-27). ("ti'n gwybod" is already caught: split contraction.)
+        filler_idx = i + lookahead + 1
+        if target_norm in ("ti", "chi") and filler_idx < len(words_list) and \
+                normalize_word(words_list[filler_idx]["word"]) in ("gwybod", "wybod", "gweld", "weld"):
+            continue
         if not tagged_as(target, "PRON", ("PRON",)):
             continue
 

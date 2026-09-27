@@ -9,8 +9,9 @@ corpus_ops.analyze_segments().
 
 Usage:
     python corpus_siarad.py <file.cha | folder of .cha files> [--limit N] [--redo]
-    (a folder is searched recursively; conversations already in runs/ are
-    skipped unless --redo is given, so a stopped run can simply be restarted;
+    (a folder is searched recursively; conversations already done on the
+    current pipeline version, with Cysill, are skipped unless --redo is given,
+    so a stopped run -- or one after a detection fix -- is simply restarted;
     --limit N processes only the next N not yet done)
 
 Output, per conversation, in runs/<stamp>/Siarad_<file>/:
@@ -57,7 +58,7 @@ from corpus_io import (
     set_session_label, session_dir,
 )
 from corpus_ops import analyze_segments
-from cysill_client import cysill_status_line
+from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 from mutation_engine import (
     load_spacy, load_lemma_cache, save_lemma_cache, load_bangor_lexicon,
     reset_cysill_circuit_breaker,
@@ -261,6 +262,12 @@ def process_file(path, stamp):
         results = analyze_segments(
             segments, meta, video_duration_seconds=duration, language="cy",
             language_probability=1.0, checkpoint_key=meta["url"])
+        # Cysill's hourly limit tripped somewhere in this file (tagging OR the
+        # lemma lookups during detection): its rows would be tagged differently
+        # from every other file's, so it isn't saved at all -- see main().
+        if TECHIAITH_API_KEY and is_cysill_disabled():
+            print(f"  ⏸ {path.name}: Cysill hit its hourly limit during this file -- not saved.")
+            return False
         outputs = dict(zip(OUTPUT_KEYS, results))
 
         for row, spk in zip(outputs["segments"], seg_speakers):
@@ -308,15 +315,38 @@ def process_file(path, stamp):
     except Exception as e:
         print(f"  💥 {path.name}: {e}")
         cleanup_incomplete_video_dirs(vpaths, video_label=path.name)
+    return True
+
+
+def _saved_run_quality(pos_csv):
+    """(pipeline_version, share of words with a Cysill POS tag) of a saved run."""
+    import csv
+    tagged = total = 0
+    version = None
+    with open(pos_csv, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            total += 1
+            tagged += bool(row.get("cysill_pos"))
+            version = version or row.get("pipeline_version")
+    return version, (tagged / total if total else 0.0)
 
 
 def _already_done(path):
-    """True if some earlier run already wrote this conversation's segments
-    CSV (runs/<stamp>/Siarad_<file>/segments_*.csv). The whole corpus is
-    tens of thousands of Cysill calls -- hours, usually several sittings --
-    so re-running the folder has to pick up where it stopped rather than
-    redo every finished file."""
-    return any(RUNS_DIR.glob(f"*/Siarad_{path.stem}/segments_*.csv"))
+    """True if some earlier run already wrote this conversation's output ON
+    THE CURRENT PIPELINE VERSION and, when a key is set, WITH Cysill tags.
+    The whole corpus takes several sittings, so a plain rerun picks up where
+    it stopped -- and after a detection fix, the same plain rerun redoes
+    everything still on an older version (no --redo needed, which would
+    restart from file 1 each time the hourly limit stops a run). A
+    conversation saved without Cysill (fusser15-18, 2026-09-27) isn't done."""
+    for segments_csv in RUNS_DIR.glob(f"*/Siarad_{path.stem}/segments_*.csv"):
+        pos_csv = next(segments_csv.parent.glob("pos_*.csv"), None)
+        if pos_csv is None:
+            continue
+        version, cysill_share = _saved_run_quality(pos_csv)
+        if version == pipeline_version() and (not TECHIAITH_API_KEY or cysill_share >= 0.9):
+            return True
+    return False
 
 
 def main(argv):
@@ -344,8 +374,8 @@ def main(argv):
     if not redo:
         done = [f for f in files if _already_done(f)]
         if done:
-            print(f"Skipping {len(done)} conversation(s) already in runs/ "
-                  f"(add --redo to process them again).")
+            print(f"Skipping {len(done)} conversation(s) already done on this pipeline "
+                  f"version with Cysill (add --redo to process them again).")
         files = [f for f in files if f not in done]
         if not files:
             print("Nothing left to process.")
@@ -366,8 +396,12 @@ def main(argv):
     set_session_label(stamp, label=f"siarad-{len(files)}")
     print(f"Processing {len(files)} Siarad file(s) into runs/{session_dir(stamp).name}/")
     try:
-        for f in files:
-            process_file(f, stamp)
+        for n, f in enumerate(files):
+            if not process_file(f, stamp):
+                print(f"Stopped: Cysill's hourly limit was reached. {len(files) - n} "
+                      f"conversation(s) not processed -- run the same command again "
+                      f"in about an hour; finished ones are skipped.")
+                break
     finally:
         save_lemma_cache()
         cleanup_empty_session_dir(stamp)

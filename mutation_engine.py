@@ -138,7 +138,8 @@ from mutation_tables import (
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
     OEDD_CONTRACTIONS, OEDD_PERSON_ENDINGS, CLIPPED_BOD_FORMS, FIXED_EXPRESSIONS,
-    SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS,
+    SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS, DISCOURSE_PARTICLES, NEVER_MUTATING,
+    POSSESSIVE_TRIGGERS, FIRST_PERSON_VERB_FORMS,
     _LEGAL_BASE_MARK_PAIRS,
 )
 
@@ -2353,6 +2354,17 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
     }
 
 
+def _is_first_person_sg_verb(node):
+    """A 1sg finite verb/aux form ("dw", "baswn", "es"): colloquial forms from
+    FIRST_PERSON_VERB_FORMS, or any lexicon reading tagged Person=1
+    Number=Sing on a verb."""
+    w = normalize_word(node["word"])
+    if w in FIRST_PERSON_VERB_FORMS:
+        return True
+    return any(e["pos"] in ("VERB", "AUX") and e["morph"].get("Person") == "1"
+               and e["morph"].get("Number") == "Sing" for e in bangor_lexicon.lookup(w))
+
+
 def _is_verb_target(node):
     """A verb or verb-noun by spaCy (VERB/AUX, or any VerbForm), or by Cysill
     when its FIRST reading is a verb tag."""
@@ -2406,6 +2418,29 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     raw_target = target_found["word"]
     if len(raw_target) >= 2 and raw_target.isupper():
         return None, lookahead
+    # Tag particles ("yn te" = isn't it?) and never-mutating "braf".
+    if target_norm in DISCOURSE_PARTICLES or target_norm in NEVER_MUTATING:
+        return None, lookahead
+    # "i" right after a 1sg verb is the subject pronoun: "dw i meddwl" (I
+    # think) x7 in fusser12.cha was scored as preposition "i" + unmutated
+    # verb-noun (2026-09-27).
+    if norm_current == "i" and i > 0 and _is_first_person_sg_verb(words_list[i - 1]):
+        return None, lookahead
+    # "ei" is soft (his) or aspirate/h (her), and spaCy's gender for "ei" is
+    # a guess ("ei gŵr" -- her husband, correctly unmutated -- was scored as
+    # "his" + erosion). Only the echo pronoun after the noun settles it
+    # ("ei gŵr hi", "ei dad o"); without one, the context isn't scored.
+    if norm_current == "ei":
+        after = i + lookahead + 1
+        echo = normalize_word(words_list[after]["word"]) \
+            if after < len(words_list) and not target_found.get("_clause_boundary_after") else ""
+        if echo == "hi":
+            t1 = {**t1, "fem_ei": True, "expected_mutation": ["fem_ei_pending"]}
+        elif echo in ("e", "o", "fe", "fo"):
+            t1 = {**t1, "fem_ei": False, "expected_mutation": ["soft"]}
+        else:
+            return None, lookahead
+        expected = t1["expected_mutation"]
 
     # PATCH: context guards found in a live audit, 2026-09-26. Each of these
     # is a trigger/target pairing that is not a mutation environment at all,
@@ -2475,7 +2510,8 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         return None, lookahead
     # Noun + echo pronoun = possessive phrase with the possessive dropped
     # ("yn côl fi" = in my lap): its mutation isn't this trigger's.
-    if not target_is_verb and target_pos in ("NOUN", "PROPN") and next_node is not None \
+    if norm_current not in POSSESSIVE_TRIGGERS and not target_is_verb \
+            and target_pos in ("NOUN", "PROPN") and next_node is not None \
             and not target_found.get("_clause_boundary_after") \
             and normalize_word(next_node["word"]) in ECHO_PRONOUNS:
         return None, lookahead
@@ -2655,6 +2691,8 @@ def _process_gender_trigger(current_node, target_node, expected, trigger_label,
     if target_node.get("confidence", 0) < 0.65:
         return None
     target_norm = normalize_word(target_node["word"])
+    if target_norm in DISCOURSE_PARTICLES or target_norm in NEVER_MUTATING:
+        return None     # "noson braf": braf never mutates
     target_lemma = get_welsh_lemma(target_norm)
     if _is_code_switch(target_node, target_norm, target_lemma):
         return _build_cs_row(
@@ -2924,7 +2962,11 @@ def process_comprehensive_mutations(words_list):
             next_node = words_list[i + 1]
             nsp = next_node.get("spacy_token", {}).get("pos", "") if next_node.get("spacy_token") else ""
             ncp = next_node.get("cysill_pos") or ""
-            if nsp == "ADJ" or ncp.startswith("ADJ"):
+            # When the lexicon knows the word, it must have an adjective
+            # reading: "constable baswn" / "ffordd deuda" (verbs "I would" /
+            # "say!") were tagged ADJ and scored (fusser12.cha, 2026-09-27).
+            next_lex = next_node.get("lex_pos")
+            if (nsp == "ADJ" or ncp.startswith("ADJ")) and not (next_lex and "ADJ" not in next_lex):
                 row = _process_gender_trigger(
                     current_node, next_node, ["soft"],
                     norm_current, "fem_noun+adjective", None, False)

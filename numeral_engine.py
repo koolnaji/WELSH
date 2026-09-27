@@ -29,7 +29,7 @@ used it would silently drop this branch's data.
 Standalone: imports only spacy_tagging.py, same convention as the other
 non-mutation branches.
 """
-from spacy_tagging import is_noun_target, noun_number, tagged_as
+from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted, tagged_as
 from numeral_tables import NUMERAL_FORMS, PARTITIVE_WORDS, WELSH_FILLERS
 
 
@@ -106,8 +106,16 @@ def process_numeral_agreement(words_list):
             continue
         if not is_noun_target(target):
             continue
+        if noun_phrase_interrupted(words_list, i, target):
+            continue
 
         number, number_source = noun_number(target)
+        # Dictionary-confirmed number only: spaCy's guess on words the lexicon
+        # doesn't know was wrong every time it was checked ("tair wsnos" --
+        # colloquial "wythnos", singular -- scored plural; fusser13.cha,
+        # 2026-09-27). Same rule in plural_engine.py.
+        if number_source != "lexicon":
+            continue
         if number == "singular":
             rows.append(_build_numeral_row(
                 current_node, target, numeral, "correct_mutation", False, "singular",
