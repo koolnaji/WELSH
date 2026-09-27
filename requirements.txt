@@ -1,17 +1,39 @@
-pandas>=2.2,<3
-requests>=2.31,<3
-tqdm>=4.66,<5
-# yt-dlp>=2025.1.0 lower bound kept as a floor. The 2026-08 403 storm on
-# low-view videos (see limitations.txt Section 1.4) is resolved
-# operationally, not in code: switch to a nightly build when a storm
-# recurs, revert to a pinned stable release once it clears. If you
-# adopt nightly, record the exact build string here as a comment
-# (`yt-dlp --version`) since nightly is not semver-stable and a later
-# build could silently change this behavior again.
-yt-dlp>=2025.1.0
-faster-whisper>=1.1,<2
-torch>=2.2,<3
-spacy>=3.8,<4
-simplemma>=1.1,<2
-matplotlib>=3.8,<4
-seaborn>=0.13,<1
+# News scraper -- requirements
+# ==============================
+# Install with:
+#   pip install -r requirements.txt
+#   playwright install chromium   # separate step -- pip alone won't fetch the browser binary
+#
+# Windows-specific notes (see README for the full story on each):
+#   - fasttext-wheel, NOT fasttext -- the original PyPI "fasttext" package
+#     has no prebuilt Windows wheel and needs a C++ compiler to build from
+#     source. fasttext-wheel is a maintained drop-in with real Windows
+#     wheels, same `import fasttext`.
+#   - numpy is pinned below 2.0 -- fasttext-wheel (and some of its own
+#     transitive deps) still call the old `np.array(obj, copy=False)`
+#     convention, which NumPy 2.0 turned into a hard error instead of the
+#     old "avoid a copy if possible" behavior. Unpin once every dependency
+#     in this chain has caught up to NumPy 2.0's semantics -- not yet, as
+#     of this file being written.
+#   - CLD3/gcld3 was removed from the panel (3 judges: GlotLID, OpenLID, lingua).
+
+# --- Scraping / extraction ---
+playwright
+trafilatura
+
+# --- Language identification (local judges) ---
+lingua-language-detector
+fasttext-wheel        # NOT fasttext -- see note above
+huggingface_hub       # pulls GlotLID/OpenLID model.bin files on first use
+
+# --- Lemmatization (optional -- only used if --lemmatize is passed) ---
+stanza
+
+# --- Gemini (boilerplate detection + LLM language tiebreak, both opt-in flags) ---
+google-genai
+
+# --- UI / progress ---
+tqdm
+
+# --- Pinned for Windows compatibility -- see note above ---
+numpy<2

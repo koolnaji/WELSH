@@ -1,4 +1,4 @@
-# Dev-only dependencies -- needed to run tests/, not to run the pipeline
+# Dev-only dependencies -- needed to run tests/, not to run the scraper
 # itself. Install with:
 #   pip install -r requirements-dev.txt
 #
