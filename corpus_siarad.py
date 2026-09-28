@@ -15,7 +15,7 @@ Usage:
     --limit N processes only the next N not yet done)
 
 Output, per conversation, in runs/<stamp>/Siarad_<file>/:
-  - the same segments/words/lemmas/pos/mutations/prep/plural/numeral CSVs a
+  - the same segments/words/lemmas/pos/mutations/prep/plural/numeral/quantifier CSVs a
     video produces, every row with an added "speaker" column;
   - speakers_*.csv: code, age, sex, role, the transcript's per-speaker
     @Comment notes (e.g. where they grew up), and word / English-tagged
@@ -36,7 +36,9 @@ Conventions (confirmed against a real Siarad file, davies1.cha):
     except in an utterance marked [- eng] (English);
   - dropped: pauses, retraced material (<...> [/], [//]), events and
     fragments (&=laugh, &m), unintelligible xxx/yyy/www, 0-prefixed omitted
-    words, linkers/terminators, bracket codes ([?], [!], [= ...]).
+    words, linkers/terminators, bracket codes ([!], [= ...]);
+  - "[?]" (transcriber unsure): the words are kept but get probability 0.5,
+    so no detection branch scores them (see UNCERTAIN_RE).
 
 Word timing: CHAT times whole utterances. Word times are spread evenly across
 each utterance's recorded span -- interpolated, not measured -- and kept
@@ -55,6 +57,7 @@ import pandas as pd
 from corpus_io import (
     RUNS_DIR, ensure_dirs, run_stamp, _video_slug, append_output_csv,
     cleanup_incomplete_video_dirs, cleanup_empty_session_dir, pipeline_version,
+    is_current_version,
     set_session_label, session_dir,
 )
 from corpus_ops import analyze_segments
@@ -65,8 +68,10 @@ from mutation_engine import (
 )
 
 OUTPUT_KEYS = ["segments", "words", "lemmas", "pos", "mutations",
-               "prep_mutations", "plural_mutations", "numeral_mutations"]
-DETECTION_KEYS = ("mutations", "prep_mutations", "plural_mutations", "numeral_mutations")
+               "prep_mutations", "plural_mutations", "numeral_mutations",
+               "quantifier_mutations"]
+DETECTION_KEYS = ("mutations", "prep_mutations", "plural_mutations", "numeral_mutations",
+                  "quantifier_mutations")
 
 BULLET_RE    = re.compile(r"\x15(\d+)_(\d+)\x15")
 # "@s:eng" / "@s:cym&eng" (explicit), or a BARE "@s" = "the other language of
@@ -85,6 +90,14 @@ OTHER_CODE_RE = re.compile(r"\[(?![/:])[^\]]*\]")
 # so nested groups ("<<o(eddw)n i> [?] just fel> [//]") leave a flat group
 # the retrace pattern can remove whole
 UNWRAP_RE    = re.compile(r"<([^<>]*)>(?!\s*\[[/:])")
+# "word [?]" / "<words> [?]": the transcriber wasn't sure what was said
+# ("<(y)na rai te> [?]" in fusser19.cha produced a rhai erosion, 2026-09-28).
+# Those words get probability UNCERTAIN_PROBABILITY -- below the 0.65 floor
+# every branch applies to triggers and targets, so they are never scored,
+# mutated or not, but still count as words.
+UNCERTAIN_RE = re.compile(r"(<[^<>]*>|[^\s<>]+)\s*\[\?\]")
+UNCERTAIN_MARK = "‡"
+UNCERTAIN_PROBABILITY = 0.5
 DROP_TOKENS  = {".", "?", "!", ",", "xxx", "yyy", "www", "xx", "yy"}
 PROSODY_CHARS = "ˈˌ:^↑↓≈‡„"
 
@@ -149,15 +162,17 @@ def read_chat(path):
 
 
 def clean_main_tier(main):
-    """Returns (start_s, end_s, words) where words is a list of (text, lang).
-    A "," in the transcript is attached to the preceding word so the
-    pipeline's clause-boundary logic sees it."""
+    """Returns (start_s, end_s, words) where words is a list of (text, lang,
+    uncertain). A "," in the transcript is attached to the preceding word so
+    the pipeline's clause-boundary logic sees it."""
     bullet = BULLET_RE.search(main)
     start = int(bullet.group(1)) / 1000 if bullet else None
     end = int(bullet.group(2)) / 1000 if bullet else None
 
     s = BULLET_RE.sub(" ", main)
     utterance_english = "[- eng]" in s
+    s = UNCERTAIN_RE.sub(
+        lambda m: " ".join(t + UNCERTAIN_MARK for t in m.group(1).strip("<>").split()), s)
     s = OTHER_CODE_RE.sub(" ", s)
     while True:
         unwrapped = UNWRAP_RE.sub(r" \1 ", s)
@@ -172,8 +187,10 @@ def clean_main_tier(main):
 
     words = []
     for tok in s.split():
+        uncertain = UNCERTAIN_MARK in tok
+        tok = tok.replace(UNCERTAIN_MARK, "")
         if tok == "," and words:
-            words[-1] = (words[-1][0] + ",", words[-1][1])
+            words[-1] = (words[-1][0] + ",", words[-1][1], words[-1][2])
             continue
         if tok in DROP_TOKENS or tok.startswith(("&", "+", "#", "0")):
             continue
@@ -199,7 +216,7 @@ def clean_main_tier(main):
             tok = tok.replace(ch, "")
         for part in tok.split("_"):
             if part:
-                words.append((part, lang))
+                words.append((part, lang, uncertain))
     return start, end, words
 
 
@@ -210,14 +227,14 @@ def build_segments(utterances):
     prev_end = 0.0
     for utt in utterances:
         start, end, words = clean_main_tier(utt["main"])
-        utt["clean"] = " ".join(w for w, _ in words)
+        utt["clean"] = " ".join(w for w, _, _ in words)
         if not words:
             continue
         if start is None:
             start = end = prev_end
         span = max(end - start, 0.001 * len(words))
         word_objs = []
-        for i, (text, lang) in enumerate(words):
+        for i, (text, lang, uncertain) in enumerate(words):
             w_start = round(start + span * i / len(words), 3)
             while w_start in used:
                 w_start = round(w_start + 0.001, 3)
@@ -225,8 +242,9 @@ def build_segments(utterances):
             w_end = round(max(start + span * (i + 1) / len(words), w_start + 0.001), 3)
             if i == len(words) - 1 and not text.endswith(","):
                 text += "."
-            word_objs.append(SimpleNamespace(word=text, start=w_start, end=w_end,
-                                             probability=1.0, lang=lang))
+            word_objs.append(SimpleNamespace(
+                word=text, start=w_start, end=w_end, lang=lang,
+                probability=UNCERTAIN_PROBABILITY if uncertain else 1.0))
             start_to_speaker[w_start] = utt["speaker"]
         segments.append(SimpleNamespace(start=start, end=start + span, text=utt["clean"],
                                         words=word_objs, no_speech_prob=0.0, avg_logprob=0.0))
@@ -294,7 +312,7 @@ def process_file(path, stamp):
             words = [w for u in utterances if u["speaker"] == code
                      for w in (u.get("clean") or "").split()]
             n_eng = sum(1 for u in utterances if u["speaker"] == code
-                        for _, lang in clean_main_tier(u["main"])[2] if lang == "eng")
+                        for _, lang, _ in clean_main_tier(u["main"])[2] if lang == "eng")
             speaker_rows.append({
                 "conversation": path.stem, "speaker": code, "age": info["age"],
                 "sex": info["sex"], "role": info["role"],
@@ -344,7 +362,7 @@ def _already_done(path):
         if pos_csv is None:
             continue
         version, cysill_share = _saved_run_quality(pos_csv)
-        if version == pipeline_version() and (not TECHIAITH_API_KEY or cysill_share >= 0.9):
+        if is_current_version(version) and (not TECHIAITH_API_KEY or cysill_share >= 0.9):
             return True
     return False
 

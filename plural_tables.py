@@ -41,6 +41,14 @@ MASS_NOUNS = {
 # list as mutation_tables.ECHO_PRONOUNS, duplicated per the convention below.
 POSSESSIVE_ECHO_PRONOUNS = {"fi", "ti", "di", "fe", "e", "hi", "ni", "chi", "nhw"}
 
+# Not nouns after pronoun "rhai" (2026-09-28): the tag particle "te" (isn't
+# it?) in "mae yna rai te" (there are some, aren't there -- fusser19.cha), and
+# "fan"/"man" + yma/yna/hyn/acw = "here/there" ("rai fan yna" = some over
+# there, fusser23.cha). Same list as mutation_tables.DISCOURSE_PARTICLES.
+DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê"}
+PLACE_ADVERB_NOUNS = {"fan", "man"}
+PLACE_ADVERB_FOLLOWERS = {"yma", "yna", "hyn", "acw", "ma", "na", "'ma", "'na"}
+
 # ========================= DUPLICATED, STANDALONE-CONVENTION HELPERS =====
 # Small and stable enough to duplicate rather than import -- keeps this
 # branch independent of mutation_engine.py/mutation_tables.py's internals

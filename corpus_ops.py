@@ -69,6 +69,7 @@ from youtube_access import YouTubeRateLimited, call as youtube_call
 import prep_engine
 import plural_engine
 import numeral_engine
+import quantifier_engine
 
 
 # ========================= EMAIL NOTIFICATION =========================
@@ -523,6 +524,9 @@ def clean_title_for_file(title: str) -> str:
     title = re.sub(r'\s+', ' ', title).strip()
     return title[:70]
 
+# >>> NOT VERSIONED -- source discovery: which items get queued, never what a
+# row says. Left out of corpus_io.pipeline_version() (see _UNVERSIONED_START
+# there). Keep detection code OUT of this region.
 def _channel_short_name(url):
     # e.g. "https://www.youtube.com/c/HanshS4C/videos" -> "HanshS4C"
     parts = url.rstrip("/").split("/")
@@ -641,9 +645,130 @@ def _discover_ypod_json(source_url, processed, queue_ids):
         ep_id = m.group(1) if m else direct_url
         if ep_id in processed or ep_id in queue_ids:
             continue
+        if _too_short(_parse_duration(ep.get("duration")), direct_url):
+            continue
         out.append({"id": ep_id, "url": direct_url,
                     "title": ep.get("title", "unknown"),
                     "source": source_url})
+    return out
+
+
+# ========================= SOURCE HANDLING =========================
+# Anything shorter than this is skipped: trailers, promos, Shorts, teaser
+# clips and news "stings" carry a handful of words each, so they add rows
+# without adding a usable per-video formality score (corpus_formality.py
+# needs enough tagged words to be stable) and cost a download each. Checked
+# at discovery wherever a source publishes a duration, and again on the
+# downloaded audio for sources that don't (welsh_pipeline.py).
+MIN_EPISODE_SECONDS = 180
+_ITUNES_NS = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+
+
+def _parse_duration(value):
+    """Seconds from "1:02:03", "62:03", "3723" or a number; None if absent
+    or unreadable."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if ":" in text:
+            seconds = 0.0
+            for part in text.split(":"):
+                seconds = seconds * 60 + float(part)
+            return seconds
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _too_short(duration, url=""):
+    """YouTube Shorts always; anything else only when its duration is KNOWN
+    to be under MIN_EPISODE_SECONDS -- unknown length is checked after
+    download instead of being guessed here."""
+    if url and "/shorts/" in url:
+        return True
+    return duration is not None and duration < MIN_EPISODE_SECONDS
+
+
+def _normalize_youtube_source(url):
+    """A bare channel URL (@handle, /c/, /channel/, /user/) lists the
+    channel's TABS (Videos, Shorts, Live) rather than its videos; pointing
+    at /videos gets the uploads only, which also keeps Shorts out."""
+    parsed = urlparse(url)
+    if "youtube.com" not in parsed.netloc.lower():
+        return url
+    path = parsed.path.rstrip("/")
+    if re.fullmatch(r"/(@[^/]+|c/[^/]+|channel/[^/]+|user/[^/]+)", path):
+        return f"{parsed.scheme or 'https'}://{parsed.netloc}{path}/videos"
+    return url
+
+
+def _detect_source_type(ch):
+    """How to enumerate a source: an explicit "type" wins; YouTube goes
+    through yt-dlp; anything else is fetched once and sniffed -- RSS/Atom
+    XML -> _discover_rss_feed(), a Y Pod-style JSON cache (an "Episodes"
+    list) -> _discover_ypod_json(), anything else -> yt-dlp's generic
+    extractors. Lets a new source be added by URL alone."""
+    if ch.get("type"):
+        return ch["type"]
+    host = urlparse(ch["url"]).netloc.lower()
+    if "youtube.com" in host or "youtu.be" in host:
+        return "yt_dlp"
+    try:
+        resp = requests.get(ch["url"], timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        head = resp.content[:4000].lstrip().lower()
+        if head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head:
+            return "rss_feed"
+        if head.startswith(b"{") and b'"episodes"' in resp.content.lower():
+            return "ypod_json"
+    except Exception as e:
+        print(f" ⚠️  Couldn't sniff {ch['url']} ({e}) -- trying yt-dlp.")
+    return "yt_dlp"
+
+
+def _discover_yt_dlp(channel_url, processed, queue_ids):
+    """yt-dlp flat listing (YouTube channels/playlists, and any other site
+    yt-dlp has an extractor for). Nested playlists (a channel's tabs) are
+    walked one level down, skipping the Shorts tab."""
+    out = []
+    opts = {"quiet": True, "extract_flat": True, "no_warnings": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(_normalize_youtube_source(channel_url), download=False)
+    except Exception as e:
+        print(f" 💥 Failed collecting {channel_url}: {e}")
+        return out
+    entries = []
+    for entry in info.get("entries") or []:
+        if entry and entry.get("_type") == "playlist" and entry.get("entries"):
+            if "shorts" not in (entry.get("title") or entry.get("url") or "").lower():
+                entries.extend(e for e in entry["entries"] if e)
+        elif entry:
+            entries.append(entry)
+    skipped_short = 0
+    for entry in entries:
+        # PATCH: was hardcoded to reconstruct a youtube.com/watch?v=<id> URL
+        # regardless of source -- silently wrong for any non-YouTube feed.
+        # See _resolve_entry_url()'s docstring.
+        vid_id    = entry.get("id") or entry.get("url")
+        entry_url = _resolve_entry_url(entry, channel_url)
+        # PATCH: a flat-extraction entry whose url is the FEED's own url
+        # (confirmed live on a Spreaker feed: every "episode" downloaded the
+        # same audio) is skipped rather than queued as a duplicate.
+        if entry_url and entry_url == channel_url:
+            print(f" ⚠️  Skipping '{entry.get('title', vid_id)}' -- resolved to the "
+                  f"feed URL itself, not a per-episode URL.")
+            continue
+        if _too_short(entry.get("duration"), entry_url or ""):
+            skipped_short += 1
+            continue
+        if vid_id and entry_url and vid_id not in processed and vid_id not in queue_ids:
+            out.append({"id": vid_id, "url": entry_url,
+                        "title": entry.get("title", "unknown"), "source": channel_url})
+    if skipped_short:
+        print(f"   (skipped {skipped_short} item(s) under {MIN_EPISODE_SECONDS}s or Shorts)")
     return out
 
 
@@ -696,86 +821,63 @@ def _discover_rss_feed(source_url, processed, queue_ids):
         ep_id = m.group(1) if m else (guid or audio_url)
         if ep_id in processed or ep_id in queue_ids:
             continue
+        if _too_short(_parse_duration(item.findtext(f"{_ITUNES_NS}duration")), audio_url):
+            continue
         title_el = item.find("title")
         title = (title_el.text or "unknown").strip() if title_el is not None else "unknown"
         out.append({"id": ep_id, "url": audio_url, "title": title, "source": source_url})
     return out
 
 
+_DISCOVERERS = {
+    "ypod_json": _discover_ypod_json,
+    "rss_feed":  _discover_rss_feed,
+    "yt_dlp":    _discover_yt_dlp,
+}
+
+
 def discover_new_videos(limit, channels=None):
-    out = []
-    opts = {"quiet": True, "extract_flat": True, "no_warnings": True}
+    """
+    Queues up to `limit` new items across the selected sources (default:
+    all of CURATED_CHANNELS). Each source is enumerated by
+    _detect_source_type() -- explicit "type", else sniffed -- and one
+    failing source never stops the others.
+
+    The queue is filled ROUND-ROBIN across sources, one item from each in
+    turn, not source by source: taking the first `limit` items overall
+    let whichever channel came first (and had the most uploads) fill the
+    whole batch, so a run sampled one register. Spreading across sources
+    is what gives corpus_formality.py a wide spread of per-video F-scores
+    to plot against.
+    """
     processed = load_processed()
     queue     = load_queue()
     queue_ids = {v["id"] for v in queue}
     target_channels = channels if channels else CURATED_CHANNELS
+    per_source = []
     for ch in target_channels:
-        channel_url = ch["url"]
-        print(f"Collecting from: {channel_url}")
-        # PATCH: Y Pod's internal cache JSON isn't RSS/Atom, so yt-dlp's
-        # generic extractor can't enumerate it as a playlist -- branch
-        # to a dedicated adapter instead of forcing it through yt-dlp.
-        if ch.get("type") == "ypod_json":
-            out.extend(_discover_ypod_json(channel_url, processed, queue_ids))
-            continue
-        # PATCH: standard RSS feeds route through direct XML parsing --
-        # see _discover_rss_feed()'s own docstring for why (yt-dlp's flat
-        # extraction was confirmed live to misresolve every entry on this
-        # feed to the feed's own URL).
-        if ch.get("type") == "rss_feed":
-            out.extend(_discover_rss_feed(channel_url, processed, queue_ids))
-            continue
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(channel_url, download=False)
-                for entry in info.get("entries", []):
-                    # PATCH: was hardcoded to reconstruct a
-                    # youtube.com/watch?v=<id> URL regardless of
-                    # source -- silently wrong for any non-YouTube
-                    # feed (e.g. podcast RSS), which already carries
-                    # its own real episode URL. See
-                    # _resolve_entry_url()'s docstring.
-                    vid_id    = entry.get("id") or entry.get("url")
-                    entry_url = _resolve_entry_url(entry, channel_url)
-                    # PATCH: guard against a flat-extraction entry whose
-                    # resolved url is the FEED's own url rather than a
-                    # per-episode one. Confirmed live against a Spreaker
-                    # RSS feed: every queued episode ended up with
-                    # entry_url == channel_url (visible downstream as
-                    # every row's video_url/source column being the bare
-                    # show-feed link, identical across "different"
-                    # episodes) -- since id/title still varied per entry
-                    # (pulled correctly from the feed listing), each
-                    # queued separately, but download_audio() handed the
-                    # same feed url plausibly resolves to the same
-                    # (first/latest) episode every time, producing
-                    # byte-identical transcripts under different titles.
-                    # Treating this the same as an unresolved entry (skip,
-                    # don't queue) stops a guaranteed duplicate from
-                    # silently entering the corpus; the warning also
-                    # serves as a live diagnostic for whether this is
-                    # really what's happening on a given feed.
-                    if entry_url and entry_url == channel_url:
-                        print(f" ⚠️  Skipping '{entry.get('title', vid_id)}' -- "
-                              f"resolved to the feed URL itself, not a "
-                              f"per-episode URL. Extraction didn't return a "
-                              f"distinct url for this entry.")
-                        continue
-                    if vid_id and entry_url and vid_id not in processed and vid_id not in queue_ids:
-                        out.append({"id": vid_id,
-                                    "url": entry_url,
-                                    "title": entry.get("title", "unknown"),
-                                    "source": channel_url})
-        except Exception as e:
-            print(f" 💥 Failed collecting {channel_url}: {e}")
-    seen   = set()
-    unique = [x for x in out if not (x["id"] in seen or seen.add(x["id"]))]
-    if unique:
-        queue.extend(unique[:limit])
+        kind = _detect_source_type(ch)
+        print(f"Collecting from: {channel_display_name(ch)} ({kind})")
+        found = _DISCOVERERS.get(kind, _discover_yt_dlp)(ch["url"], processed, queue_ids)
+        print(f"   {len(found)} new item(s)")
+        per_source.append(found)
+
+    seen, picked = set(), []
+    while len(picked) < limit and any(per_source):
+        for items in per_source:
+            while items and items[0]["id"] in seen:
+                items.pop(0)
+            if items and len(picked) < limit:
+                item = items.pop(0)
+                seen.add(item["id"])
+                picked.append(item)
+    if picked:
+        queue.extend(picked)
         save_queue(queue)
-        print(f"Added {len(unique[:limit])} videos. Queue now has {len(queue)}.")
+        print(f"Added {len(picked)} item(s), spread across sources. Queue now has {len(queue)}.")
     else:
         print("No new videos found.")
+# <<< NOT VERSIONED
 
 # PATCH: yt-dlp has two independent sources of raw console output that
 # don't know anything about our tqdm bars and write straight to
@@ -1418,7 +1520,7 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
     same tagging and detection as Whisper output.
 
     Returns (segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows,
-    prep_rows, plural_rows, numeral_rows).
+    prep_rows, plural_rows, numeral_rows, quantifier_rows).
     """
     _step = step or (lambda label: print(f" {label}..."))
 
@@ -1533,7 +1635,7 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
                     and norm_word not in DEFINITE_ARTICLE_FORMS:
                 continue
 
-            lemma      = get_welsh_lemma(raw_word)
+            lemma      = get_welsh_lemma(raw_word, w)
             conf       = w.get("confidence", 0.0)
             spacy_tok  = w.get("spacy_token")
             cysill_pos = w.get("cysill_pos")
@@ -1655,7 +1757,10 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
     # numeral + noun number agreement -- the "no English counterpart" partner
     # of plural_rows (see numeral_tables.py).
     numeral_rows = numeral_engine.process_numeral_agreement(words_only)
-    for row in plural_rows + numeral_rows:
+    # quantifier + "o" + plural -- the second "English agrees" branch,
+    # alongside plural_rows (see quantifier_tables.py).
+    quantifier_rows = quantifier_engine.process_quantifier_plurals(words_only)
+    for row in plural_rows + numeral_rows + quantifier_rows:
         row.update({
             "video_title": video_meta["title"],
             "video_url":   video_meta.get("url", "local_file"),
@@ -1668,12 +1773,12 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
     # Which detection code produced these rows -- see corpus_io.pipeline_version().
     version = pipeline_version()
     for rows in (segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows,
-                 prep_rows, plural_rows, numeral_rows):
+                 prep_rows, plural_rows, numeral_rows, quantifier_rows):
         for row in rows:
             row["pipeline_version"] = version
 
     return segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows, \
-        prep_rows, plural_rows, numeral_rows
+        prep_rows, plural_rows, numeral_rows, quantifier_rows
 
 
 def analyze_phrase(phrase):
@@ -1691,7 +1796,7 @@ def analyze_phrase(phrase):
     for idx, w in enumerate(enriched):
         if w.get("synthetic"):
             continue
-        lemma    = get_welsh_lemma(w["word"])
+        lemma    = get_welsh_lemma(w["word"], w)
         norm_tok = normalize_word(w["word"])
         spacy_tok = w.get("spacy_token")
         cysill_pos = w.get("cysill_pos")
@@ -1729,12 +1834,14 @@ def analyze_phrase(phrase):
     prep_rows = prep_engine.process_preposition_erosion(enriched)
     plural_rows = plural_engine.process_plural_marking(enriched)
     numeral_rows = numeral_engine.process_numeral_agreement(enriched)
-    return word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows, numeral_rows
+    quantifier_rows = quantifier_engine.process_quantifier_plurals(enriched)
+    return word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows, \
+        numeral_rows, quantifier_rows
 
 
 def save_analysis_outputs(stamp, segments, words, lemmas, pos_rows, mutations,
                            prep_mutations=None, plural_mutations=None,
-                           numeral_mutations=None):
+                           numeral_mutations=None, quantifier_mutations=None):
     paths = run_paths(stamp)
     if segments: pd.DataFrame(segments).to_csv(paths["segments"], index=False, encoding="utf-8-sig", quoting=1)
     if words:    pd.DataFrame(words).to_csv(paths["words"],    index=False, encoding="utf-8-sig", quoting=1)
@@ -1747,3 +1854,5 @@ def save_analysis_outputs(stamp, segments, words, lemmas, pos_rows, mutations,
         pd.DataFrame(plural_mutations).to_csv(paths["plural_mutations"], index=False, encoding="utf-8-sig", quoting=1)
     if numeral_mutations:
         pd.DataFrame(numeral_mutations).to_csv(paths["numeral_mutations"], index=False, encoding="utf-8-sig", quoting=1)
+    if quantifier_mutations:
+        pd.DataFrame(quantifier_mutations).to_csv(paths["quantifier_mutations"], index=False, encoding="utf-8-sig", quoting=1)

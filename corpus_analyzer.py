@@ -19,8 +19,8 @@ Output (all written to welsh_analysis/analysis/):
     - figures/tagger_agreement.png  : heuristic vs tagger agreement
     - figures/collision_flags.png
     - figures/erosion_vs_formality.png, erosion_vs_codeswitch.png : mutation branch, per video
-    - figures/branches_vs_formality.png        : all four branches, rate vs F-score, per video
-    - figures/branches_by_formality_band.png   : all four branches pooled by F-score third
+    - figures/branches_vs_formality.png        : every branch, rate vs F-score, per video
+    - figures/branches_by_formality_band.png   : every branch pooled by F-score third
     - figures/speaker_branches_vs_formality.png, speaker_branches_by_formality_band.png :
       the same two, one point per Siarad speaker
     - utterance_export.csv          : flat utterance-level rows for future joining
@@ -53,7 +53,8 @@ import seaborn as sns
 # wrote to. Importing the same names from mutation_engine.py makes this
 # the single source of truth: change WELSH_ANALYSIS_DIR once, and every
 # file (pipeline + all three companion tools) follows automatically.
-from corpus_io import BASE_DIR, MUT_DIR, OUT_DIR, FIG_DIR
+from corpus_io import (BASE_DIR, MUT_DIR, OUT_DIR, FIG_DIR, pipeline_version,
+                       is_current_version)
 import corpus_formality
 
 # Seaborn theme -- clean, publication-friendly.
@@ -1312,12 +1313,16 @@ def fig_erosion_vs_codeswitch(df, formality_df):
 
 # ========================= ALL BRANCHES vs FORMALITY =========================
 # (label, per-video CSV prefix, prediction). The three "erode" branches have
-# no English counterpart; "rhai + plural" does, and is the control.
+# no English counterpart; the two "resist" branches do (English "some books",
+# "lots of books") and are the controls. The quantifier branch was added
+# 2026-09-28 because "rhai" + noun is too rare in speech to carry that side
+# alone.
 BRANCHES = [
-    ("Mutation",                "mutations",         "erode"),
-    ("Conjugated prepositions", "prep_mutations",    "erode"),
-    ("Numeral + singular noun", "numeral_mutations", "erode"),
-    ("rhai + plural noun",      "plural_mutations",  "resist"),
+    ("Mutation",                "mutations",            "erode"),
+    ("Conjugated prepositions", "prep_mutations",       "erode"),
+    ("Numeral + singular noun", "numeral_mutations",    "erode"),
+    ("rhai + plural noun",      "plural_mutations",     "resist"),
+    ("Quantifier + o + plural", "quantifier_mutations", "resist"),
 ]
 
 
@@ -1330,7 +1335,7 @@ def load_branch_rows():
     Mutation folders use the same one-file-per-folder rule as
     load_and_merge_mutations() (corroborated, else original, else legacy).
     Every branch writes "correct_mutation"/"erosion" statuses, so
-    EVALUABLE_STATUSES applies to all four. Siarad rows keep their
+    EVALUABLE_STATUSES applies to all of them. Siarad rows keep their
     "speaker" column.
     """
     out = {}
@@ -1381,6 +1386,10 @@ def report_pipeline_versions(df, label):
         return pd.Series(dtype=int)
     versions = (df["pipeline_version"].fillna(UNVERSIONED) if "pipeline_version" in df.columns
                 else pd.Series(UNVERSIONED, index=df.index))
+    # Versions recorded as detection-identical (corpus_io.VERSION_EQUIVALENTS)
+    # count as the current one -- they are one measurement.
+    current = pipeline_version()
+    versions = versions.map(lambda v: current if is_current_version(v) else v)
     counts = versions.value_counts()
     if len(counts) > 1:
         print(f"  ⚠️ {label}: rows from {len(counts)} different pipeline versions -- "
@@ -1411,7 +1420,7 @@ def _wilson_interval(k, n, z=1.96):
 
 def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, min_contexts=5):
     """
-    2x2 scatter + regression, one panel per branch: erosion rate per unit
+    Scatter + regression, one panel per branch: erosion rate per unit
     (video, or Siarad speaker) against its F-score. Points are coloured by
     transcript type -- Siarad (human) vs Whisper -- so an offset between the
     two sources shows up as two clouds, not as a slope. A panel with fewer
@@ -1422,7 +1431,10 @@ def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, m
         print(f"  [skip] {filename} -- no formality data")
         return
     fscores = formality_df[keys + ["f_score", "source"]].dropna(subset=["f_score"])
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10), sharex=True)
+    ncols = 3 if len(BRANCHES) > 4 else 2
+    fig, axes = plt.subplots(2, ncols, figsize=(6.5 * ncols, 10), sharex=True)
+    for ax in axes.flat[len(BRANCHES):]:
+        ax.set_visible(False)
     for ax, (label, _prefix, prediction) in zip(axes.flat, BRANCHES):
         pts = _unit_rates(branch_rows.get(label), keys, min_contexts)
         pts = pts.merge(fscores, on=keys, how="inner") if not pts.empty else pts
@@ -1476,7 +1488,8 @@ def fig_branches_by_formality_band(branch_rows, formality_df, keys, filename, un
 
     fig, ax = plt.subplots(figsize=(10, 6))
     plotted = 0
-    for offset, (label, _prefix, prediction) in zip((-0.09, -0.03, 0.03, 0.09), BRANCHES):
+    offsets = [0.06 * (k - (len(BRANCHES) - 1) / 2) for k in range(len(BRANCHES))]
+    for offset, (label, _prefix, prediction) in zip(offsets, BRANCHES):
         rows = branch_rows.get(label)
         if rows is None or rows.empty or any(k not in rows.columns for k in keys):
             continue
@@ -1719,7 +1732,7 @@ def main():
     else:
         print("  [skip] no formality data computed -- see corpus_formality.py output above")
 
-    print("\nAll four branches vs. formality...")
+    print("\nAll branches vs. formality...")
     branch_rows = load_branch_rows()
     for label, rows in branch_rows.items():
         n_video = rows["video_url"].nunique() if not rows.empty else 0

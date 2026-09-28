@@ -139,7 +139,8 @@ from mutation_tables import (
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
     OEDD_CONTRACTIONS, OEDD_PERSON_ENDINGS, CLIPPED_BOD_FORMS, FIXED_EXPRESSIONS,
     SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS, DISCOURSE_PARTICLES, NEVER_MUTATING,
-    POSSESSIVE_TRIGGERS, FIRST_PERSON_VERB_FORMS,
+    POSSESSIVE_TRIGGERS, FIRST_PERSON_VERB_FORMS, SUBJECT_PRONOUNS,
+    CARDINAL_WORDS, YN_ELIDED_ARTICLE_NOUNS, FUSED_PREPOSITION_FORMS,
     _LEGAL_BASE_MARK_PAIRS,
 )
 
@@ -272,7 +273,70 @@ def load_bangor_lexicon():
         return False
 
 
-def get_welsh_lemma(word):
+# Cysill's mutation field ("wlad/NF/TM") in the lexicon's own Mutation= codes,
+# and Cysill's coarse POS in the lexicon's UD POS tags -- for
+# lemma_from_tagger() below.
+_FRIENDLY_TO_LEX_MUTATION = {v: k for k, v in bangor_lexicon.BANGOR_MUTATION_MAP.items()}
+_CYSILL_COARSE_TO_UD = {
+    "VERB": {"VERB", "AUX"}, "NOUN": {"NOUN", "PROPN"}, "ADJ": {"ADJ"},
+    "ADV": {"ADV"}, "PRON": {"PRON", "DET"}, "ADP": {"ADP"},
+    "CONJ": {"CCONJ", "SCONJ"}, "NUM": {"NUM"}, "PART": {"PART", "INTJ"},
+}
+
+
+def lemma_from_tagger(word, cysill_pos, cysill_mutation):
+    """
+    The lemma of `word` in context, from the Cysill POS reply the pipeline
+    already has plus the Bangor lexicon -- the method Techiaith recommended
+    (Dewi Bryn Jones, 2026-09-27): the POS reply carries each word's mutation
+    ("wlad/NF/TM" = soft), and the lexicon lists "wlad" as soft-mutated
+    "gwlad". Keeps the lexicon readings whose mutation matches Cysill's (and,
+    when that still leaves several, whose POS does); returns their lemma only
+    if exactly one remains. A word the lexicon doesn't list gets the reported
+    mutation undone and its radical looked up instead.
+
+    This replaces most one-word-per-request lemmatizer calls, and is more
+    accurate for ambiguous forms: the lemmatizer sees the word alone, so
+    "dala" (colloquial "dal", to hold) came back "talu" (to pay, soft-mutated)
+    and "i dala" was scored a correct mutation (robert1.cha, 2026-09-28);
+    Cysill tags that "dala" unmutated in context.
+
+    None when the lexicon isn't loaded, Cysill gave no tag, or the readings
+    don't narrow to one lemma -- get_welsh_lemma() then falls back as before.
+    """
+    w = normalize_word(word)
+    if not w or not cysill_pos or not bangor_lexicon.is_loaded():
+        return None
+    ud_tags = set()
+    for coarse in cysill_coarse_pos(cysill_pos).split("|"):
+        ud_tags |= _CYSILL_COARSE_TO_UD.get(coarse, set())
+    want = _FRIENDLY_TO_LEX_MUTATION.get(cysill_mutation)   # None = unmutated
+
+    def single_lemma(readings, mutation):
+        same = [r for r in readings if r["morph"].get("Mutation") == mutation]
+        typed = [r for r in same if r["pos"] in ud_tags] or same
+        lemmas = {r["lemma"].lower() for r in typed}
+        return next(iter(lemmas)) if len(lemmas) == 1 else None
+
+    readings = bangor_lexicon.lookup(w)
+    if readings:
+        return single_lemma(readings, want)
+    if cysill_mutation not in RADICAL_TO_MUTATED and cysill_mutation != "h-mutation":
+        return None
+    lemmas = {single_lemma(bangor_lexicon.lookup(radical), None)
+              for radical in reverse_mutation_candidates(w, [cysill_mutation])} - {None}
+    return next(iter(lemmas)) if len(lemmas) == 1 else None
+
+
+def get_welsh_lemma(word, node=None):
+    """
+    Lemma lookup, cheapest source first: the lexicon (when the form has one
+    lemma), the in-context lemma enrich_words() derived from Cysill's POS
+    reply (node["tagger_lemma"], see lemma_from_tagger()), the persistent
+    LEMMA_CACHE, and only then the one-word Cysill lemmatizer and simplemma.
+    Pass the word's dict as `node` wherever there is one; a bare string
+    still works, it just can't use the in-context lemma.
+    """
     w = normalize_word(word)
     if not w:
         return None
@@ -314,6 +378,12 @@ def get_welsh_lemma(word):
         if bangor_lemma:
             LEMMA_CACHE[w] = bangor_lemma
             return bangor_lemma
+    # In context, Cysill's own tagging beats any context-free answer, cached
+    # or not. It also seeds the cache, so bare-string callers skip the API.
+    tagger_lemma = (node or {}).get("tagger_lemma")
+    if tagger_lemma:
+        LEMMA_CACHE.setdefault(w, tagger_lemma)
+        return tagger_lemma
     if w in LEMMA_CACHE:
         return LEMMA_CACHE[w]
     lemma = None
@@ -1053,6 +1123,13 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
             # be a noun here -- spacy_tagging.is_noun_target().
             lex_readings = bangor_lexicon.lookup(normalize_word(w["word"])) if use_lex else []
             entry["lex_pos"]              = sorted({e["pos"] for e in lex_readings}) or None
+            # In-context lemma from this chunk's live Cysill tags (never from
+            # a locally resolved chunk, whose cysill_tok has no POS) -- read
+            # by get_welsh_lemma(word, node), saving a lemmatizer call.
+            entry["tagger_lemma"]         = (
+                lemma_from_tagger(w["word"], cysill_tok.get("pos"),
+                                  cysill_tok.get("tagger_mutation_type"))
+                if use_lex and cysill_tok and lexicon_tags is None else None)
             # Unified gender: lexicon, then spaCy, then Cysill -- but the
             # lexicon's NOUN gender only where the word is tagged a noun
             # here. "gender" is also read for adjective triggers (Layer 1G's
@@ -1429,9 +1506,9 @@ def _is_plausible_welsh_word(word: str) -> bool:
     return True
 
 
-def layer_2_lemma_analysis(following_word, cysill_pos=None, spacy_token=None):
+def layer_2_lemma_analysis(following_word, cysill_pos=None, spacy_token=None, node=None):
     raw   = normalize_word(following_word)
-    lemma = get_welsh_lemma(raw)
+    lemma = get_welsh_lemma(raw, node)
     cluster = initial_cluster(raw)
 
     # Check high-confidence English before Welsh plausibility filters. Otherwise
@@ -1840,13 +1917,37 @@ def classify_register_adjustment(expected, surface_mut):
 
 
 # ========================= MUTATION EVALUATION =========================
+# spaCy POS -> the lexicon POS tags it is consistent with (spaCy tags most
+# verb-nouns NOUN, which the lexicon lists as VERB).
+_SPACY_LEX_COMPATIBLE = {
+    "NOUN": {"NOUN", "PROPN", "VERB"}, "PROPN": {"NOUN", "PROPN"},
+    "VERB": {"VERB", "AUX"}, "AUX": {"VERB", "AUX"},
+}
+
+
+def _spacy_misread(node):
+    """True when spaCy's POS for this word is one the lexicon never gives it
+    -- spaCy has misread the word, so its morphology for it is noise."""
+    spacy_pos = (node.get("spacy_token") or {}).get("pos")
+    lex_pos = node.get("lex_pos")
+    if not spacy_pos or not lex_pos:
+        return False
+    return not (_SPACY_LEX_COMPATIBLE.get(spacy_pos, {spacy_pos}) & set(lex_pos))
+
+
 def _tagger_mutation_matches(target_node, expected):
     """The expected mutation types that spaCy's Mutation feature or Cysill's
     (or the lexicon's) mutation tag positively report on this target -- the
     taggers saying the form IS already mutated that way. Empty set when
-    neither says so (absence of a tag is not evidence of a radical)."""
+    neither says so (absence of a tag is not evidence of a radical).
+
+    spaCy's feature is ignored where spaCy misread the word's POS: "aeth o i
+    dala pysgod" -- spaCy tagged "dala" NUM (the lexicon: VERB only) and
+    SM, Cysill tagged it an unmutated verb, and the row fell to
+    erosion_unverified on spaCy's word alone (phrase test, 2026-09-28)."""
     spacy_tok = target_node.get("spacy_token") or {}
-    found = {SPACY_MUTATION_MAP.get(spacy_tok.get("mutation")),
+    spacy_mut = None if _spacy_misread(target_node) else spacy_tok.get("mutation")
+    found = {SPACY_MUTATION_MAP.get(spacy_mut),
              target_node.get("cysill_mutation_type")} - {None}
     if "soft" in found:
         found.add("soft_limited")
@@ -1858,6 +1959,7 @@ def _evaluate_mutation_outcome(target_node, expected):
         target_node["word"],
         cysill_pos=target_node.get("cysill_pos"),
         spacy_token=target_node.get("spacy_token"),
+        node=target_node,
     )
     if t2.get("skip_reason"):
         return {"skip": True, "t2": t2}
@@ -2172,7 +2274,7 @@ def _evaluate_feminine_ei(current_node, target_node, trigger_word):
     if target_node.get("confidence", 0) < 0.65:
         return None
     raw = normalize_word(target_node["word"])
-    lemma = get_welsh_lemma(raw)
+    lemma = get_welsh_lemma(raw, target_node)
     if is_english_code_switch(raw, lemma):
         return None
     radical_for_classification = lemma or raw
@@ -2188,6 +2290,7 @@ def _evaluate_feminine_ei(current_node, target_node, trigger_word):
         target_node["word"],
         cysill_pos=target_node.get("cysill_pos"),
         spacy_token=target_node.get("spacy_token"),
+        node=target_node,
     )
     if t2.get("skip_reason"):
         return None
@@ -2274,6 +2377,7 @@ def _evaluate_mixed_mutation(current_node, target_node, trigger_word):
         target_node["word"],
         cysill_pos=target_node.get("cysill_pos"),
         spacy_token=target_node.get("spacy_token"),
+        node=target_node,
     )
     if t2.get("skip_reason"):
         return None
@@ -2290,7 +2394,7 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
     if target_node.get("confidence", 0) < 0.65:
         return None
     raw   = normalize_word(target_node["word"])
-    lemma = get_welsh_lemma(raw)
+    lemma = get_welsh_lemma(raw, target_node)
     if is_english_code_switch(raw, lemma):
         return None
     base_form = normalize_word(lemma) if lemma else (raw[1:] if raw.startswith("h") else raw)
@@ -2365,6 +2469,86 @@ def _is_first_person_sg_verb(node):
                and e["morph"].get("Number") == "Sing" for e in bangor_lexicon.lookup(w))
 
 
+def _is_finite_verb(node):
+    """True only when the lexicon says this form is an inflected verb and
+    nothing else: every reading a VERB/AUX carrying Person (so not a
+    verb-noun or impersonal), no noun/adjective homograph, and not "bod"
+    (the word after a bod form is its subject, which never mutates)."""
+    readings = bangor_lexicon.lookup(normalize_word(node["word"]))
+    verbs = [e for e in readings if e["pos"] in ("VERB", "AUX")]
+    if not verbs or len(verbs) != len(readings):
+        return False
+    return all("Person" in e["morph"] and e["lemma"].lower() != "bod" for e in verbs)
+
+
+def _prev_real_index(words_list, idx):
+    """Index of the nearest earlier word that isn't a synthetic token or a
+    hesitation, or None at an utterance/clause boundary."""
+    k = idx - 1
+    while k >= 0:
+        node = words_list[k]
+        if node.get("_clause_boundary_after"):
+            return None
+        if not node.get("synthetic") and normalize_word(node["word"]) not in HESITATION_FILLERS:
+            return k
+        k -= 1
+    return None
+
+
+def _tagged_pronoun(node):
+    """spaCy says PRON, or Cysill gave a single pronoun reading."""
+    if (node.get("spacy_token") or {}).get("pos") == "PRON":
+        return True
+    cysill = (node.get("cysill_pos") or "").upper()
+    return "+" not in cysill and cysill.startswith("PRON")
+
+
+def _object_follows_finite_verb(words_list, idx, spacy_says_obj=False):
+    """The direct-object position that soft-mutates: an inflected verb +
+    its subject pronoun + the object ("welais i gi", "gwnes i weld"). The
+    pronoun must be tagged a pronoun AND agree with the verb in person and
+    number: "i" and "o" are also prepositions, and "aeth i Fangor" (went to
+    Bangor) is not "welais i gi". With no pronoun, the noun right after the
+    verb is normally its SUBJECT (Welsh is verb-subject-object: "daeth dyn"),
+    so that is only accepted when spaCy's parse also calls it the object.
+    Anything else in between ("toedd yna ddim gwynt", "fuais i nôl papur")
+    means this isn't the position."""
+    k = _prev_real_index(words_list, idx)
+    if k is None:
+        return False
+    if _is_finite_verb(words_list[k]):
+        return spacy_says_obj
+    person_number = SUBJECT_PRONOUNS.get(normalize_word(words_list[k]["word"]))
+    if person_number is None or not _tagged_pronoun(words_list[k]):
+        return False
+    k2 = _prev_real_index(words_list, k)
+    if k2 is None or not _is_finite_verb(words_list[k2]):
+        return False
+    person, number = person_number
+    return any(e["morph"].get("Person") == person and e["morph"].get("Number") == number
+               for e in bangor_lexicon.lookup(normalize_word(words_list[k2]["word"])))
+
+
+def _is_object_candidate(node):
+    """Can this word be a direct object? A noun, numeral or verb-noun by the
+    lexicon (by spaCy only where the lexicon doesn't know it). Adverb
+    homographs are out ("welais i ddoe": "ddoe" is a fossilized adverb, not
+    a live mutation), and so is the negator "dim"/"ddim" ("welais i ddim"),
+    whose historical object mutation would add a correct row to nearly
+    every negative sentence."""
+    norm = normalize_word(node["word"])
+    if norm in DISCOURSE_PARTICLES or norm in NEVER_MUTATING or norm in ("dim", "ddim"):
+        return False
+    readings = bangor_lexicon.lookup(norm)
+    if readings:
+        if any(e["pos"] == "ADV" for e in readings):
+            return False
+        return any(e["pos"] in ("NOUN", "PROPN", "NUM")
+                   or (e["pos"] == "VERB" and e["morph"].get("VerbForm") == "Vnoun")
+                   for e in readings)
+    return (node.get("spacy_token") or {}).get("pos") in ("NOUN", "PROPN", "NUM")
+
+
 def _is_verb_target(node):
     """A verb or verb-noun by spaCy (VERB/AUX, or any VerbForm), or by Cysill
     when its FIRST reading is a verb tag."""
@@ -2421,10 +2605,57 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     # Tag particles ("yn te" = isn't it?) and never-mutating "braf".
     if target_norm in DISCOURSE_PARTICLES or target_norm in NEVER_MUTATING:
         return None, lookahead
+    # Not mutation targets at all, by the lexicon: forms of "bod" ("dyna
+    # basai", "yn basai") and conjugated prepositions ("sy gynno" = who has,
+    # "o dano" = from under it; "gynno" is the northern form, not a mutated
+    # one) -- all in the 69-conversation Siarad run (2026-09-28).
+    target_lex = bangor_lexicon.lookup(target_norm)
+    if target_lex and (all(e["pos"] == "ADP" for e in target_lex) or
+                       all(e["pos"] in ("VERB", "AUX") and e["lemma"].lower() == "bod"
+                           for e in target_lex)):
+        return None, lookahead
+    # "yna" mutates only as the existential "(mae) yna gi" (there is a dog).
+    # After a noun it's the demonstrative "y pnawn yna" (that afternoon), and
+    # what follows isn't its target -- "yna bore", "yna pnawn" were scored.
+    if norm_current == "yna":
+        k = _prev_real_index(words_list, i)
+        prev = normalize_word(words_list[k]["word"]) if k is not None else ""
+        if prev not in BOD_SURFACE_FORMS and prev not in BOD_SUBJECT_EXEMPT_TRIGGERS \
+                and prev not in ("does", "toes", "sdim", "sy", "sydd"):
+            return None, lookahead
+    # "o" + verb-noun is nearly always the pronoun "he" with the aspect "yn"
+    # dropped ("oedd o mynd" = he was going), not the preposition: "o mynd",
+    # "o medru", "o gweithio" were scored (stammers3/6.cha). Skipped mutated
+    # or not.
+    if norm_current == "o" and (_is_verb_target(target_found)
+                                or "VERB" in (target_found.get("lex_pos") or [])):
+        return None, lookahead
+    # "lle" before a clause is "where" ("o lle mae o'n dod" = from where he
+    # comes), a relative adverb, not the noun "place".
+    after_idx = i + lookahead + 1
+    if target_norm in ("lle", "le") and after_idx < len(words_list) and \
+            not target_found.get("_clause_boundary_after"):
+        after_node = words_list[after_idx]
+        after_norm = normalize_word(after_node["word"])
+        if after_norm in BOD_SURFACE_FORMS or after_norm in BOD_SUBJECT_EXEMPT_TRIGGERS \
+                or _is_verb_target(after_node):
+            return None, lookahead
     # "i" right after a 1sg verb is the subject pronoun: "dw i meddwl" (I
     # think) x7 in fusser12.cha was scored as preposition "i" + unmutated
     # verb-noun (2026-09-27).
     if norm_current == "i" and i > 0 and _is_first_person_sg_verb(words_list[i - 1]):
+        return None, lookahead
+    # "o" right after an inflected verb is its subject "he" ("rhoddodd o
+    # bres" = he gave money); the object mutation after it belongs to the
+    # object rule (Layer 1H), not to a preposition "o".
+    if norm_current == "o" and i > 0 and not words_list[i - 1].get("_clause_boundary_after") \
+            and _is_finite_verb(words_list[i - 1]):
+        return None, lookahead
+    # Same for the echo pronoun after a fused preposition: "gynna i gar",
+    # "arno o" -- see FUSED_PREPOSITION_FORMS.
+    if norm_current in ("i", "o", "ni", "mi", "fe") and i > 0 and \
+            not words_list[i - 1].get("_clause_boundary_after") and \
+            normalize_word(words_list[i - 1]["word"]) in FUSED_PREPOSITION_FORMS:
         return None, lookahead
     # "ei" is soft (his) or aspirate/h (her), and spaCy's gender for "ei" is
     # a guess ("ei gŵr" -- her husband, correctly unmutated -- was scored as
@@ -2518,7 +2749,11 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if norm_current == "pan" and not target_is_verb:
         return None, lookahead
 
-    target_lemma = get_welsh_lemma(target_norm)
+    target_lemma = get_welsh_lemma(target_norm, target_found)
+    # Numeral after numeral is counting: "tri pedwar o'gloch" (see CARDINAL_WORDS).
+    if norm_current in CARDINAL_WORDS and (target_pos == "NUM" or target_norm in CARDINAL_WORDS
+                                           or target_lemma in CARDINAL_WORDS):
+        return None, lookahead
     if _is_code_switch(target_found, target_norm, target_lemma):
         return _build_cs_row(current_node, target_found, t1,
                              norm_current, conf_current), lookahead
@@ -2573,6 +2808,30 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         target_is_verb = (target_spacy_pos == "VERB" or target_verbform == "Vnoun"
                           or target_cysill_pos.startswith("VB"))
         if target_is_verb:
+            return None, lookahead
+
+    # "yn" + a common noun with no article: "in the" with the article dropped
+    # ("fuan yn bore", "yn pnawn", "mae'r trydydd yn canol") -- see
+    # YN_ELIDED_ARTICLE_NOUNS. "yn" (in) only takes a definite noun, so a
+    # bare common noun after locative "yn" means the article was dropped,
+    # and there is no mutation to expect. The exception is the construct
+    # "yng nghanol y dre" (noun + definite genitive), which is nasal.
+    # Names stay in ("yn Porthmadog" is real erosion). Skipped mutated or
+    # not, so the rate can't tilt.
+    if norm_current == "yn" and expected and not looks_like_name and target_pos != "PROPN":
+        genitive_follows = next_node is not None and not target_found.get("_clause_boundary_after") and (
+            normalize_word(next_node["word"]) in DEFINITE_ARTICLE_FORMS
+            or next_node["word"][:1].isupper()
+            or (next_node.get("spacy_token") or {}).get("pos") == "PROPN")
+        adjective_follows = next_node is not None and not target_found.get("_clause_boundary_after") \
+            and ((next_node.get("spacy_token") or {}).get("pos") == "ADJ"
+                 or set(next_node.get("lex_pos") or []) == {"ADJ"})
+        if target_norm in YN_ELIDED_ARTICLE_NOUNS or target_lemma in YN_ELIDED_ARTICLE_NOUNS:
+            if genitive_follows:
+                expected = ["nasal"]
+            elif not adjective_follows:     # "mae'n fore braf" stays predicative
+                return None, lookahead
+        elif expected == ["nasal"] and target_pos == "NOUN" and not genitive_follows:
             return None, lookahead
 
     # Pronoun "i" (I) before a verb-noun, with the spoken "yn" dropped: "sa i
@@ -2693,7 +2952,7 @@ def _process_gender_trigger(current_node, target_node, expected, trigger_label,
     target_norm = normalize_word(target_node["word"])
     if target_norm in DISCOURSE_PARTICLES or target_norm in NEVER_MUTATING:
         return None     # "noson braf": braf never mutates
-    target_lemma = get_welsh_lemma(target_norm)
+    target_lemma = get_welsh_lemma(target_norm, target_node)
     if _is_code_switch(target_node, target_norm, target_lemma):
         return _build_cs_row(
             current_node, target_node, None, trigger_label,
@@ -2736,6 +2995,19 @@ def _process_gender_trigger(current_node, target_node, expected, trigger_label,
             )
             if exempt:
                 return None
+    # Unmutable initial: the same exemption _process_word_trigger has, which
+    # was never ported here -- "y lôn" (l- has no soft form) scored as
+    # erosion 12 times in fusser17.cha (2026-09-28). Only when the lemma is
+    # known: a lemma-less surface like "ferch" starts with a MUTATED letter
+    # and must still be evaluated.
+    if expected and target_lemma:
+        tables = {"soft": SOFT_MUTATION, "soft_limited": SOFT_MUTATION_LIMITED,
+                  "nasal": NASAL_MUTATION, "aspirate": ASPIRATE_MUTATION}
+        checkable = [e for e in expected if e in tables]
+        cluster = initial_cluster(target_lemma)
+        if checkable and not ("soft" in expected and cluster in ("ts", "j")) and \
+                not any(cluster in tables[e] for e in checkable):
+            return None
     if require_target_is_noun:
         spacy_pos   = spacy_tok["pos"] if spacy_tok else ""
         cysill_pos  = target_node.get("cysill_pos") or ""
@@ -2768,10 +3040,15 @@ def _process_phantom_check(current_node, cysill_pos, conf_current):
         return None
     if current_node.get("synthetic"):
         return None
+    # A fused preposition isn't a mutated word: taggers that don't know
+    # northern "gynna" read it as soft-mutated "cynnu" (phrase test).
+    if normalize_word(current_node["word"]) in FUSED_PREPOSITION_FORMS:
+        return None
     t2 = layer_2_lemma_analysis(
         current_node["word"],
         cysill_pos=cysill_pos,
         spacy_token=current_node.get("spacy_token"),
+        node=current_node,
     )
     if t2.get("skip_reason"):
         return None
@@ -2955,7 +3232,10 @@ def process_comprehensive_mutations(words_list):
         spacy_pos = spacy_tok["pos"] if spacy_tok else ""
         trigger_number = (current_node.get("lex_number") or extract_number_from_spacy(spacy_tok)
                           or current_node.get("cysill_number"))
+        # English nouns have no Welsh gender to trigger anything; their
+        # "feminine" is a tagger guess ("stuff gwyrdd", fusser17.cha).
         if gender == "feminine" and trigger_number != "plural" and \
+                not current_node.get("_code_switch") and \
                 (spacy_pos in ("NOUN", "PROPN") or
                 cysill_pos.split("+")[0].startswith("N")) and \
                 no_clause_boundary and i + 1 < len(words_list):
@@ -3031,7 +3311,7 @@ def process_comprehensive_mutations(words_list):
         if norm_current in NASAL_NUMERAL_TRIGGERS and no_clause_boundary and i + 1 < len(words_list):
             next_node  = words_list[i + 1]
             next_norm = normalize_word(next_node["word"])
-            next_lemma_for_cs = get_welsh_lemma(next_norm)
+            next_lemma_for_cs = get_welsh_lemma(next_norm, next_node)
             if next_node.get("confidence", 0) >= 0.65 and \
                     is_english_code_switch(next_norm, next_lemma_for_cs):
                 row = _build_cs_row(
@@ -3041,7 +3321,7 @@ def process_comprehensive_mutations(words_list):
                 mutation_rows.append(row)
                 i += 2
                 continue
-            next_lemma = get_welsh_lemma(next_node["word"]) or normalize_word(next_node["word"])
+            next_lemma = get_welsh_lemma(next_node["word"], next_node) or normalize_word(next_node["word"])
             if next_lemma in NASAL_NUMERAL_VALID_TARGETS:
                 outcome = _evaluate_mutation_outcome(next_node, ["nasal"])
                 if not outcome["skip"]:
@@ -3052,8 +3332,14 @@ def process_comprehensive_mutations(words_list):
                     continue
 
         # ---- Layer 1G: feminine ordinal + noun → soft ----
+        # Where the lexicon knows the word it must list an ordinal reading:
+        # "Gymraeg gair" (the NOUN Cymraeg, tagged ADJ + feminine) was scored
+        # as an ordinal context (fusser17.cha, 2026-09-28).
+        lex_ordinal = any(e["morph"].get("Numtype") == "Ord"
+                          for e in bangor_lexicon.lookup(norm_current))
         is_fem_ordinal = (cysill_pos.startswith("ORDF") or
-                          (spacy_tok and spacy_tok.get("pos") == "ADJ" and gender == "feminine"))
+                          (spacy_tok and spacy_tok.get("pos") == "ADJ" and gender == "feminine")) \
+            and (lex_ordinal or not current_node.get("lex_pos"))
         if is_fem_ordinal and no_clause_boundary and i + 1 < len(words_list):
             row = _process_gender_trigger(
                 current_node, words_list[i + 1], ["soft"],
@@ -3093,7 +3379,7 @@ def process_comprehensive_mutations(words_list):
         if norm_current in COMPOUND_NOUN_SECOND_ELEMENT and no_clause_boundary and i + 1 < len(words_list):
             next_node = words_list[i + 1]
             next_norm = normalize_word(next_node.get("word", ""))
-            next_lemma = get_welsh_lemma(next_norm)
+            next_lemma = get_welsh_lemma(next_norm, next_node)
             expected_second = COMPOUND_NOUN_SECOND_ELEMENT[norm_current]
             # only fires when the second word's radical matches the known
             # compound's second component -- not just any noun pair
@@ -3133,14 +3419,26 @@ def process_comprehensive_mutations(words_list):
         # pos check: only a nominal can be a direct object -- an ADJ tagged
         # "obj" is a parse error (live: "Croes y mawr" misheard for "Croeso
         # mawr" scored "mawr" as an eroded object).
-        if not was_consumed(current_node) and spacy_tok and spacy_tok.get("dep") in OBJ_DEPS and \
-                spacy_tok.get("pos") in ("NOUN", "PROPN", "NUM") and \
-                spacy_tok.get("head_dep") in ("ROOT", "ccomp", "xcomp") and \
-                spacy_tok.get("head_verbform") != "Vnoun":
+        # Position-based since 2026-09-28. The parse alone let through the tag
+        # particle "te" ("isn't it?", 7 of 22 erosions in robert8.cha),
+        # subjects ("toedd yna ddim gwynt"), and objects of verb-nouns ("fuais
+        # i nôl papur") -- 473 of 4,475 erosions came from this rule -- and
+        # missed real objects whenever spaCy misparsed a short utterance
+        # ("welais i ci mawr": "ci" tagged PART). Now: a noun/verb-noun
+        # (_is_object_candidate) in object position (_object_follows_finite_
+        # verb: lexicon-confirmed inflected verb + agreeing subject pronoun).
+        # spaCy's "obj" is only needed when there's no pronoun. Skipped
+        # mutated or not, so the rate can't tilt.
+        spacy_says_obj = bool(spacy_tok) and spacy_tok.get("dep") in OBJ_DEPS and \
+            spacy_tok.get("pos") in ("NOUN", "PROPN", "NUM")
+        if not was_consumed(current_node) and not current_node.get("synthetic") and \
+                _is_object_candidate(current_node) and \
+                _object_follows_finite_verb(words_list, i, spacy_says_obj):
             t2 = layer_2_lemma_analysis(
                 current_node["word"],
                 cysill_pos=cysill_pos,
                 spacy_token=spacy_tok,
+                node=current_node,
             )
             if not t2.get("skip_reason"):
                 outcome = _evaluate_mutation_outcome(current_node, ["soft"])
@@ -3170,6 +3468,7 @@ def process_comprehensive_mutations(words_list):
                 current_node["word"],
                 cysill_pos=cysill_pos,
                 spacy_token=spacy_tok,
+                node=current_node,
             )
             if not t2.get("skip_reason"):
                 outcome = _evaluate_mutation_outcome(current_node, ["soft"])

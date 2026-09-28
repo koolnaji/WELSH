@@ -49,6 +49,7 @@ from corpus_ops import (
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
     send_notification_email, build_email_body, channel_display_name,
     TRANSCRIBE_PRESETS, DEFAULT_TRANSCRIBE_PRESET,
+    MIN_EPISODE_SECONDS, _probe_duration_seconds,
 )
 import corpus_analyzer
 # PATCH: fetch_captions is now a normal top-level import rather than
@@ -520,7 +521,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 videos_attempted = len(pending_mp3_files)
                 set_session_label(stamp, label=f"local-mp3-{len(pending_mp3_files)}")
                 keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations",
-                        "plural_mutations", "numeral_mutations"]
+                        "plural_mutations", "numeral_mutations", "quantifier_mutations"]
                 for p in tqdm(pending_mp3_files, desc="Videos", unit="video"):
                     meta = {"title": p.stem, "url": str(p), "source": "local"}
                     # PATCH: see matching comment in the choice "3" loop --
@@ -533,10 +534,10 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     vpaths = None
                     try:
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
                         vpaths = _video_slug(meta, stamp) if save_results else _preview_video_slug(meta, stamp)
-                        outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums]
+                        outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants]
                         h = [True] * len(outputs)   # fresh header flags per video (new file each time)
                         any_written = False
                         for data, key, hi in zip(outputs, keys, range(len(outputs))):
@@ -650,7 +651,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # gets the live value.
                 nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
                 keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations",
-                        "plural_mutations", "numeral_mutations"]
+                        "plural_mutations", "numeral_mutations", "quantifier_mutations"]
                 for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                     # PATCH: defined before the try block (not just inside it)
                     # so the except block below can tell whether _video_slug()
@@ -736,10 +737,24 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                                        f"corroboration): {e}")
 
                         mp3_path = download_audio(video, audio_dir=vpaths["audio_dir"])
+                        # Second line of the short-clip filter (the first is at
+                        # discovery -- see MIN_EPISODE_SECONDS): sources that
+                        # don't publish a duration are only checked here, before
+                        # any transcription time is spent.
+                        audio_seconds = _probe_duration_seconds(mp3_path)
+                        if audio_seconds is not None and audio_seconds < MIN_EPISODE_SECONDS:
+                            tqdm.write(f"  ⏭ {video.get('title', video['id'])}: only "
+                                       f"{audio_seconds:.0f}s of audio (< {MIN_EPISODE_SECONDS}s) "
+                                       f"-- too short to analyse; skipped and marked processed.")
+                            cleanup_incomplete_video_dirs(
+                                vpaths, video_label=video.get("title", video["id"]))
+                            processed.add(video["id"])
+                            save_processed(processed)
+                            continue
                         with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
                         all_mutation_rows.extend(muts)
-                        outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums]
+                        outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants]
                         h = [True] * len(outputs)   # fresh header flags per video (new file each time)
                         any_written = False
                         for data, key, hi in zip(outputs, keys, range(len(outputs))):
@@ -816,10 +831,11 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     save_lemma_cache()
                     continue
                 if phrase:
-                    word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows, numeral_rows = analyze_phrase(phrase)
+                    (word_rows, lemma_rows, pos_rows, mutation_rows, prep_rows, plural_rows,
+                     numeral_rows, quantifier_rows) = analyze_phrase(phrase)
                     all_mutation_rows = mutation_rows
                     save_analysis_outputs(stamp, [], word_rows, lemma_rows, pos_rows, mutation_rows,
-                                          prep_rows, plural_rows, numeral_rows)
+                                          prep_rows, plural_rows, numeral_rows, quantifier_rows)
 
             elif choice == "5":
                 manage_queue()

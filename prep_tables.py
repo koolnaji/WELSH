@@ -220,12 +220,17 @@ PREP_CONJUGATED_FORMS = {
     # following pronoun ("gen i" vs "gen ti"), unlike ar/at/am/wrth/dan/
     # dros/drwy, which each have a distinct 1st vs 2nd singular stem.
     # Confirmed against the source table, not a transcription slip.
+    # PATCH (2026-09-28): northern forms attested in the Siarad transcripts
+    # ("gynna i", "genna i" dozens of times; "gynnyn nhw", "genno fo",
+    # "gennon ni", "gennoch chi") were missing, so correct northern usage
+    # produced no row while eroded "gan fi" still did -- inflating the rate.
     "gan": {
-        "1sg": {"gen", "gin"}, "2sg": {"gen", "gin"},
-        "3sg_m": {"ganddo", "gynno"}, "3sg_f": {"ganddi", "gynni"},
-        "1pl": {"gynnon", "gennyn", "ganddon"},
-        "2pl": {"gynnoch", "gennych", "ganddoch"},
-        "3pl": {"ganddyn", "gennyn", "gynnon", "gynddon"},
+        "1sg": {"gen", "gin", "gynna", "genna", "gennyf", "gynnaf"},
+        "2sg": {"gen", "gin", "gynnat", "gennat", "gennyt"},
+        "3sg_m": {"ganddo", "gynno", "genno"}, "3sg_f": {"ganddi", "gynni", "genni"},
+        "1pl": {"gynnon", "gennyn", "ganddon", "gennon", "gynnan", "gennan"},
+        "2pl": {"gynnoch", "gennych", "ganddoch", "gennoch", "gynnach", "gennach"},
+        "3pl": {"ganddyn", "gennyn", "gynnon", "gynddon", "gynnyn"},
     },
     "heb": {
         # PATCH: "hebdda" (welearnwelsh.com) is a genuinely different stem
@@ -243,6 +248,23 @@ PREP_CONJUGATED_FORMS = {
         "1pl": {"rhyngddon"}, "2pl": {"rhyngddoch"}, "3pl": {"rhyngddyn"},
     },
 }
+
+# Northern colloquial endings, added to every stem-conjugating preposition
+# above (2026-09-28): 1pl "-an" ("atan ni", "arnan ni") and 2pl "-ach"
+# ("ohonach chi") -- both attested in Siarad. Built from each 1pl "-on" /
+# 2pl "-och" form, so the table above stays the sourced standard.
+for _forms in PREP_CONJUGATED_FORMS.values():
+    for _person, _ending, _northern in (("1pl", "on", "an"), ("2pl", "och", "ach")):
+        if _person in _forms:
+            _forms[_person] = _forms[_person] | {
+                f[:-len(_ending)] + _northern for f in _forms[_person] if f.endswith(_ending)}
+
+# Every fused form of each preposition, whatever person -- see
+# prep_engine.py: a fused form counts as fused even when its pronoun is a
+# different person ("gynno chdi", "iddo nhw" -- levelled paradigms, a
+# separate phenomenon from the analytic "ar fi" this branch measures).
+PREP_ALL_FUSED_FORMS = {prep: set().union(*forms.values())
+                        for prep, forms in PREP_CONJUGATED_FORMS.items()}
 
 # ========================= DUPLICATED, STANDALONE-CONVENTION HELPERS =====
 # Small and stable enough to duplicate rather than import -- keeps this

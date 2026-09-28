@@ -123,7 +123,10 @@ def _candidate_paths(path=None):
 # "Fem,Masc" down to just "Fem" and misreport a genuinely dual-gender
 # noun as unambiguously feminine -- caught before shipping by checking
 # the real data first, not assumed.
-_MORPH_FEATURE_RE = re.compile(r"([A-Za-z]+)=([A-Za-z]+(?:,[A-Za-z]+)*)")
+# Values may be digits: "Person=1". The letters-only version silently dropped
+# every Person feature, so no lexicon check on a verb's person ever passed
+# (found 2026-09-28: "welais i ci" never reached the object rule).
+_MORPH_FEATURE_RE = re.compile(r"([A-Za-z]+)=([A-Za-z0-9]+(?:,[A-Za-z0-9]+)*)")
 
 _lexicon = None  # wordform -> list of {"lemma", "pos", "morph"} dicts, loaded lazily
 _loaded_path = None
@@ -295,6 +298,31 @@ def resolved_tag_if_unambiguous(word):
     mutation_type = BANGOR_MUTATION_MAP.get(morph.get("Mutation"))
 
     return {"mutation_type": mutation_type, "gender": gender, "number": number}
+
+
+_plural_noun_lemmas = None   # built on first use by noun_lemma_has_plural()
+
+
+def noun_lemmas(word):
+    """The lemmas of this wordform's NOUN readings (lowercased), or an empty
+    set."""
+    return {e["lemma"].lower() for e in lookup(word) if e["pos"] == "NOUN"}
+
+
+def noun_lemma_has_plural(lemma):
+    """True if the lexicon lists any plural noun form of this lemma. A noun
+    it never lists in the plural offers no singular/plural choice, so the
+    number-agreement branches can't score it either way. One pass over the
+    lexicon the first time it's asked (a set of a few tens of thousands of
+    lemmas); False if the lexicon isn't loaded."""
+    global _plural_noun_lemmas
+    if _lexicon is None:
+        return False
+    if _plural_noun_lemmas is None:
+        _plural_noun_lemmas = {e["lemma"].lower() for entries in _lexicon.values()
+                               for e in entries
+                               if e["pos"] == "NOUN" and e["morph"].get("Number") == "Plur"}
+    return lemma.lower() in _plural_noun_lemmas
 
 
 _NOUN_GENDER = {"Masc": "masculine", "Fem": "feminine", "Fem,Masc": "epicene"}

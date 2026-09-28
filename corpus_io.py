@@ -171,11 +171,51 @@ PREVIEW_DIR = BASE_DIR / "mp3_previews"
 # Sgorio removed: nominally Welsh-language sports coverage, but verified
 # (Vkq5, 2026-07) to be virtually all-English in practice -- was silently
 # contaminating the corpus with non-Welsh audio.
+#
+# Curated 2026-09-28 for a WIDE SPREAD OF FORMALITY, so the per-video
+# F-score (corpus_formality.py) has range to plot erosion against: before,
+# every source but S4C was informal-to-casual, so the scatter would have
+# bunched at one end. Ordered roughly most -> least formal. Each entry's
+# "speech" says how the speech is produced -- "scripted" (read or acted),
+# "mixed" (prepared presenter + unscripted guests), "spontaneous" -- because
+# formality and scriptedness move together: erosion in a scripted bulletin
+# reflects a writer's and editor's choices, not a speaker's production, so
+# analyses should be able to hold "speech" constant. It is a fact about how
+# the programme is made, not a register judgement, so it is kept here.
+#
+# "type" is optional: without it corpus_ops._detect_source_type() works it
+# out (YouTube -> yt-dlp; RSS/Atom XML -> the direct feed parser; a Y Pod
+# JSON cache -> its adapter). The two older podcast feeds pin "yt_dlp"
+# explicitly because that is how their episode ids were recorded in
+# processed_videos.json -- switching parser would change the ids and
+# re-queue every episode already processed.
+#
+# BBC podcast feeds keep only recent episodes (daysLive ~30), so they are
+# thin at any one time but refresh weekly; re-run discovery every few weeks.
+# The feeds carry BBC Terms of Use: personal, non-commercial use -- fine for
+# this research, but don't redistribute the audio.
 CURATED_CHANNELS = [
-    {"url": "https://www.youtube.com/c/HanshS4C/videos"},
-    {"url": "https://www.youtube.com/@RowndaRownd/videos"},
-    {"url": "https://www.youtube.com/@S4C/videos"},
-    {"url": "https://www.youtube.com/@BBCRadio_Cymru/videos"},
+    # --- formal ---
+    # Newyddion S4C -- S4C's news service: read bulletins plus reports.
+    {"url": "https://www.youtube.com/@NewyddionS4C/videos",
+     "name": "Newyddion S4C", "speech": "scripted"},
+    # Coleg Cymraeg Cenedlaethol -- Welsh-medium university lectures and
+    # talks (short promo clips are dropped by MIN_EPISODE_SECONDS).
+    {"url": "https://www.youtube.com/@colegcymraeg/videos",
+     "name": "Coleg Cymraeg Cenedlaethol", "speech": "mixed"},
+    # Gwleidydda and Beti a'i Phobol (BBC Radio Cymru RSS) removed
+    # 2026-09-28: their episode audio is served over plain http from
+    # open.live.bbc.co.uk and every download was refused (WinError 10061),
+    # and BBC terms restrict building datasets from its content.
+    # --- middle ---
+    {"url": "https://www.youtube.com/@S4C/videos", "speech": "mixed"},
+    # BBC Radio Cymru's YouTube channel includes live music sessions --
+    # sung lyrics aren't speech; worth reviewing what it contributes.
+    {"url": "https://www.youtube.com/@BBCRadio_Cymru/videos", "speech": "mixed"},
+    # Rownd a Rownd is a scripted soap: informal STYLE, but written dialogue.
+    {"url": "https://www.youtube.com/@RowndaRownd/videos", "speech": "scripted"},
+    # --- informal / casual ---
+    {"url": "https://www.youtube.com/c/HanshS4C/videos", "speech": "mixed"},
     # PATCH: casual, fully-spontaneous-speech sources (not YouTube channels
     # -- see corpus_ops.py's _resolve_entry_url()/_discover_ypod_json() for
     # how discover_new_videos() handles non-YouTube sources). Each carries
@@ -192,7 +232,8 @@ CURATED_CHANNELS = [
     # actually resolving through yt-dlp -- confirmed via search index that
     # the real canonical feed is hosted directly on Fireside, not served
     # reliably at the custom-domain path. Swapped to the confirmed URL.
-    {"url": "https://feeds.fireside.fm/haclediad/rss", "name": "Haclediad"},
+    {"url": "https://feeds.fireside.fm/haclediad/rss", "name": "Haclediad",
+     "type": "yt_dlp", "speech": "spontaneous"},
     # Colli'r Plot (Y Pod) -- four novelists chatting about books and
     # whatever else, unscripted. RSS feed via its Spreaker host.
     # PATCH: "type": "rss_feed" routes this through corpus_ops.py's
@@ -202,7 +243,7 @@ CURATED_CHANNELS = [
     # URL instead of each episode's, silently producing duplicate audio
     # across an entire batch. See _discover_rss_feed()'s own docstring.
     {"url": "https://www.spreaker.com/show/5059223/episodes/feed",
-     "name": "Colli'r Plot", "type": "rss_feed"},
+     "name": "Colli'r Plot", "type": "rss_feed", "speech": "spontaneous"},
     # Pryd ar Dafod (Y Pod) -- casual food-and-chat interview podcast.
     # Confirmed working: Anchor/Spotify-for-Podcasters publishes a
     # standard public RSS feed for this show, so it goes through the
@@ -211,7 +252,7 @@ CURATED_CHANNELS = [
     # left in corpus_ops.py in case a future Y Pod-only show turns out
     # not to have a real feed the way this one did.
     {"url": "https://anchor.fm/s/1064d88dc/podcast/rss",
-     "name": "Pryd ar Dafod"},
+     "name": "Pryd ar Dafod", "type": "yt_dlp", "speech": "spontaneous"},
     # Siarad Siop efo Mari a Meilir (Y Pod) -- casual celebrity/pop-culture
     # banter between two friends, unscripted. Confirmed: this show's Y Pod
     # cache ID is "cwins" (a legacy name from when it started in 2023 as a
@@ -222,7 +263,7 @@ CURATED_CHANNELS = [
     # _extract_direct_media_url() passes them through unchanged -- verified
     # working against this show's actual cache response, not guessed.
     {"url": "https://ypod.cymru/beta/s/cache/podcast-cwins.json?v=1",
-     "name": "Siarad Siop efo Mari a Meilir", "type": "ypod_json"},
+     "name": "Siarad Siop efo Mari a Meilir", "type": "ypod_json", "speech": "spontaneous"},
 ]
 
 
@@ -281,6 +322,7 @@ def run_paths(stamp):
         "prep_mutations": PHRASE_TEST_DIR / f"prep_mutations_{stamp}.csv",
         "plural_mutations": PHRASE_TEST_DIR / f"plural_mutations_{stamp}.csv",
         "numeral_mutations": PHRASE_TEST_DIR / f"numeral_mutations_{stamp}.csv",
+        "quantifier_mutations": PHRASE_TEST_DIR / f"quantifier_mutations_{stamp}.csv",
     }
 
 
@@ -346,6 +388,7 @@ def _video_slug(meta, stamp):
         # plural_engine.py's docstring).
         "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
         "numeral_mutations": video_dir / f"numeral_mutations_{folder_name}.csv",
+        "quantifier_mutations": video_dir / f"quantifier_mutations_{folder_name}.csv",
         "captions_dir": video_dir,
         "audio_dir":    video_dir,
     }
@@ -384,6 +427,7 @@ def _preview_video_slug(meta, stamp):
         "prep_mutations": video_dir / f"prep_mutations_{folder_name}.csv",
         "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
         "numeral_mutations": video_dir / f"numeral_mutations_{folder_name}.csv",
+        "quantifier_mutations": video_dir / f"quantifier_mutations_{folder_name}.csv",
     }
 
 
@@ -487,8 +531,39 @@ _DETECTION_SOURCES = (
     "spacy_tagging.py", "mutation_engine.py", "mutation_tables.py",
     "prep_engine.py", "prep_tables.py", "plural_engine.py", "plural_tables.py",
     "numeral_engine.py", "numeral_tables.py",
+    "quantifier_engine.py", "quantifier_tables.py",
 )
 _pipeline_version = None
+
+# Code inside a hashed file that doesn't affect any output row -- source
+# discovery (which videos get queued) in corpus_ops.py -- sits between these
+# two marker lines and is left out of the hash. Editing it (adding a source,
+# a discovery fix) must not mark every processed file as stale: that forced
+# a pointless redo of all 69 Siarad conversations once (2026-09-28).
+_UNVERSIONED_START = b"# >>> NOT VERSIONED"
+_UNVERSIONED_END = b"# <<< NOT VERSIONED"
+
+# Older versions whose detection code is identical to a given current one,
+# as {older_version: current_version}. Only honoured while pipeline_version()
+# still equals the current_version it was recorded against, so it expires by
+# itself on the next real detection change. Used by is_current_version().
+VERSION_EQUIVALENTS = {}
+
+
+def _versioned_bytes(data):
+    """The file's bytes minus every NOT VERSIONED region (markers included)."""
+    out, pos = [], 0
+    while True:
+        start = data.find(_UNVERSIONED_START, pos)
+        if start < 0:
+            out.append(data[pos:])
+            return b"".join(out)
+        end = data.find(_UNVERSIONED_END, start)
+        if end < 0:     # unterminated region: hash everything (safe direction)
+            out.append(data[pos:])
+            return b"".join(out)
+        out.append(data[pos:start])
+        pos = end + len(_UNVERSIONED_END)
 
 
 def pipeline_version():
@@ -500,9 +575,16 @@ def pipeline_version():
             source = here / name
             if source.exists():
                 digest.update(name.encode("utf-8"))
-                digest.update(source.read_bytes())
+                digest.update(_versioned_bytes(source.read_bytes()))
         _pipeline_version = digest.hexdigest()[:10]
     return _pipeline_version
+
+
+def is_current_version(version):
+    """True for rows made by the current detection code: this version, or an
+    older one recorded in VERSION_EQUIVALENTS against it."""
+    current = pipeline_version()
+    return version == current or VERSION_EQUIVALENTS.get(version) == current
 
 
 # ========================= JSON STATE PERSISTENCE =========================

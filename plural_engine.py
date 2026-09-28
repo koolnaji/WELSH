@@ -23,7 +23,8 @@ Standalone: imports only spacy_tagging.py.
 """
 from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted
 from plural_tables import (RHAI_FORMS, COLLECTIVE_NOUNS, MASS_NOUNS,
-                           POSSESSIVE_ECHO_PRONOUNS, WELSH_FILLERS)
+                           POSSESSIVE_ECHO_PRONOUNS, WELSH_FILLERS, DISCOURSE_PARTICLES,
+                           PLACE_ADVERB_NOUNS, PLACE_ADVERB_FOLLOWERS)
 
 
 def normalize_word(word):
@@ -86,11 +87,17 @@ def process_plural_marking(words_list):
         target_norm = normalize_word(target["word"])
         if target_norm in MASS_NOUNS:
             continue   # English "some" + mass noun is singular -- see MASS_NOUNS
+        if target_norm in DISCOURSE_PARTICLES:
+            continue   # "mae yna rai te" -- see DISCOURSE_PARTICLES
         # "rhai" + noun + possessive pronoun is pronoun "rhai" + a possessive
         # phrase: "mae gyda nhw rai tad fi" = they've got some of my dad's
         # (davies13.cha, 2026-09-26) -- not "some dads".
         after = next((k + 1 for k in range(i + 1, min(i + 4, len(words_list)))
                       if words_list[k] is target), None)
+        if target_norm in PLACE_ADVERB_NOUNS and after is not None and after < len(words_list) \
+                and normalize_word(words_list[after]["word"]) in PLACE_ADVERB_FOLLOWERS:
+            continue   # "rai fan yna" = some over there
+
         if after is not None and after < len(words_list) and \
                 not target.get("_clause_boundary_after") and \
                 normalize_word(words_list[after]["word"]) in POSSESSIVE_ECHO_PRONOUNS:

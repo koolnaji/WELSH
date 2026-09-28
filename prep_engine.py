@@ -32,7 +32,7 @@ mutation_engine.py's PATCH (2.2) comment for the full story).
 from spacy_tagging import mark_consumed, tagged_as, was_consumed
 from prep_tables import (
     PERSONS, INDEPENDENT_PRONOUNS, PREP_BARE_FORMS, PREP_CONJUGATED_FORMS,
-    PREP_LEXEME_ALIASES, WELSH_FILLERS,
+    PREP_ALL_FUSED_FORMS, PREP_LEXEME_ALIASES, WELSH_FILLERS,
 )
 
 
@@ -68,6 +68,33 @@ def _person_for_pronoun(pronoun_norm):
         if pronoun_norm in forms:
             return person
     return None
+
+
+def _is_verb(node):
+    """A verb or verb-noun by spaCy (VERB/AUX or any VerbForm), or a word the
+    lexicon only knows as a verb."""
+    spacy_tok = node.get("spacy_token") or {}
+    if spacy_tok.get("pos") in ("VERB", "AUX") or (spacy_tok.get("morph") or {}).get("VerbForm"):
+        return True
+    lex_pos = node.get("lex_pos") or []
+    return bool(lex_pos) and set(lex_pos) <= {"VERB", "AUX"}
+
+
+def _before_verb_noun(words_list, target):
+    """True when the pronoun is followed by a verb-noun: "cyn i nhw fynd"
+    (before they go) -- the pronoun is the subject of a non-finite clause,
+    where colloquial "i nhw" is widespread even for speakers who say
+    "iddyn nhw" as a dative. Reported so the two uses can be separated."""
+    k = next((k for k, w in enumerate(words_list) if w is target), None)
+    if k is None or k + 1 >= len(words_list) or target.get("_clause_boundary_after"):
+        return False
+    nxt = words_list[k + 1]
+    # The lexicon first: spaCy gave "gar" (car, soft-mutated) a verb feature
+    # in "mae gynna i gar" (phrase test, 2026-09-28).
+    lex_pos = nxt.get("lex_pos")
+    if lex_pos:
+        return "VERB" in lex_pos
+    return _is_verb(nxt)
 
 
 def _find_pronoun_target(i, words_list):
@@ -140,6 +167,12 @@ def process_preposition_erosion(words_list):
         #   - the stem of a split contraction read as a pronoun ("i o'n").
         if current_node.get("_from_contraction") or current_node.get("_clause_boundary_after"):
             continue
+        # "o" straight after a verb is the object pronoun "it/him": "wnaethon
+        # ni roid o i +//" (we gave it to...) was scored as eroded "ohona i"
+        # (fusser21.cha, 2026-09-28).
+        if norm == "o" and i > 0 and not words_list[i - 1].get("_clause_boundary_after") \
+                and _is_verb(words_list[i - 1]):
+            continue
 
         target, lookahead = _find_pronoun_target(i, words_list)
         if target is None or target.get("_contraction_stem"):
@@ -161,26 +194,47 @@ def process_preposition_erosion(words_list):
         if target_norm in ("ti", "chi") and filler_idx < len(words_list) and \
                 normalize_word(words_list[filler_idx]["word"]) in ("gwybod", "wybod", "gweld", "weld"):
             continue
-        if not tagged_as(target, "PRON", ("PRON",)):
+        # The pronoun tag is only needed after a BARE preposition, where "i"
+        # / "o" really can be something else. After a fused form the word
+        # can only be its echo pronoun, whatever the taggers say: neither
+        # knows northern "gynna" (read as a verb, "cynnu"), so the "i" in
+        # "mae gynna i gar" (I have a car) was tagged a preposition and the
+        # context dropped -- losing correct rows only (phrase test,
+        # 2026-09-28).
+        is_fused = any(_matches_any_form(norm, forms) for forms in PREP_ALL_FUSED_FORMS.values())
+        if not is_fused and not tagged_as(target, "PRON", ("PRON",)):
             continue
 
         # Case A: current word IS a correctly-conjugated form for this
         # exact person, under some preposition (exact match, or the same
         # form with a colloquially-dropped final -f -- see
         # _matches_any_form's docstring).
-        matched_prep = None
+        # A fused form counts as fused whatever pronoun follows it: "gynno
+        # chdi", "iddo nhw", "wrtha chdi" are levelled northern paradigms,
+        # not the analytic "ar fi" this branch measures. Before 2026-09-28
+        # they matched nothing and produced no row, so only correct usage
+        # went uncounted. person_agrees records the levelling separately.
+        matched_prep, person_agrees = None, False
         for prep, forms_by_person in PREP_CONJUGATED_FORMS.items():
             valid_forms = forms_by_person.get(person)
             if valid_forms and _matches_any_form(norm, valid_forms):
-                matched_prep = prep
+                matched_prep, person_agrees = prep, True
                 break
+        if matched_prep is None:
+            matched_prep = next((prep for prep, forms in PREP_ALL_FUSED_FORMS.items()
+                                 if _matches_any_form(norm, forms)), None)
         if matched_prep:
-            valid_forms = PREP_CONJUGATED_FORMS[matched_prep][person]
+            valid_forms = (PREP_CONJUGATED_FORMS[matched_prep].get(person)
+                           or PREP_ALL_FUSED_FORMS[matched_prep])
             row = _build_prep_row(
                 current_node, target, matched_prep, person,
                 status="correct_mutation", is_erosion=False,
-                note=f"Correctly conjugated '{matched_prep}' ({person}): {norm}",
+                note=(f"Correctly conjugated '{matched_prep}' ({person}): {norm}"
+                      if person_agrees else
+                      f"Fused '{matched_prep}' with a {person} pronoun (levelled form): {norm}"),
                 mutation_found=norm, expected_forms=valid_forms)
+            row["person_agrees"] = person_agrees
+            row["before_verb_noun"] = _before_verb_noun(words_list, target)
             rows.append(row)
             mark_consumed(target)
             continue
@@ -209,6 +263,8 @@ def process_preposition_erosion(words_list):
                           f"{'/'.join(sorted(valid_forms))}), bare preposition + "
                           f"independent pronoun used instead"),
                     mutation_found="none", expected_forms=valid_forms)
+                row["person_agrees"] = None
+                row["before_verb_noun"] = _before_verb_noun(words_list, target)
                 rows.append(row)
                 mark_consumed(target)
                 continue

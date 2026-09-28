@@ -77,10 +77,17 @@ TRIGGERS = {
     # nothing shadowing it.
     "prif": "soft",
     "mor": "soft_limited", "cyn": "soft_limited",
-    "mae": "soft", "ydy": "soft", "oes": "soft",
+    # "mae"/"ydy"/"oes" and "mai"/"taw" removed 2026-09-28: none of them
+    # mutates the next word. After a bod form that word is the subject ("mae
+    # ci yn cysgu" -- see BOD_SUBJECT_EXEMPT_TRIGGERS below, whose own
+    # comment already said so), and "mai"/"taw" (that, focus) never mutate.
+    # The subject guard relied on spaCy's "nsubj", so "mae pethau", "ydy
+    # problem", "mai rhaglen" still came through as erosion (313 rows in the
+    # 69-conversation Siarad run, with "yna" -- see _process_word_trigger).
+    # A pronoun-less "mae gen i gar" object is a different, unmodelled rule.
     "sy": "soft", "sydd": "soft",
     "dyma": "soft", "dyna": "soft", "yna": "soft",
-    "mai": "soft", "taw": "soft", "pe": "soft",
+    "pe": "soft",
     "fy": "nasal", "dy": "soft",
     "ei": "soft|aspirate",
     "ein": "h-mutation", "eu": "h-mutation", "u": "h-mutation",
@@ -352,8 +359,13 @@ ECHO_PRONOUNS = {"fi", "ti", "di", "fe", "e", "hi", "ni", "chi", "nhw"}
 # erosions in fusser12.cha alone (2026-09-27).
 DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê"}
 
-# Adjectives that never undergo soft mutation ("mae'n braf").
-NEVER_MUTATING = {"braf"}
+# Words that never mutate, so a trigger before them is not a context:
+#  - "braf" ("mae'n braf"), "mor" ("mae'n mor dda");
+#  - "gartre"/"adre" -- already the (fossilized, soft-mutated) adverbs "at
+#    home"/"home", so "yn gartre" can only ever look like erosion;
+#  - "tu" in "tu allan / tu ôl / tu mewn", said without its article ("o tu
+#    ôl" = o'r tu ôl) -- never mutated in speech (2026-09-28).
+NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu"}
 
 # Possessive determiners: after these, a noun + echo pronoun ("ei gŵr hi") is
 # the NORMAL possessive, not a dropped possessive (ECHO_PRONOUNS rule).
@@ -364,6 +376,61 @@ POSSESSIVE_TRIGGERS = {"fy", "dy", "ei", "ein", "eich", "eu"}
 FIRST_PERSON_VERB_FORMS = {"dw", "dwi", "wy", "w", "sa", "sai", "so", "smo",
                            "oeddwn", "roeddwn", "o'n", "baswn", "faswn",
                            "byswn", "fyswn", "swn", "byddwn", "fyddwn"}
+
+# Conjugated (fused) preposition forms that are followed by an echo pronoun
+# which is also a trigger word ("gynna i", "arno o", "ohonon ni"). That
+# pronoun is never the preposition "i"/"o" or the particle "ni": "mae gynna
+# i gar" (I have a car) was scored as preposition "i" + "car" (phrase test,
+# 2026-09-28). Neither tagger knows northern "gynna". Duplicated from
+# prep_tables.PREP_CONJUGATED_FORMS (1sg / 3sg masc. / 1pl, standard and
+# northern) per the branch-independence convention.
+FUSED_PREPOSITION_FORMS = {
+    # 1sg (+ i)
+    "gen", "gin", "gynna", "genna", "gennyf", "gynnaf", "arna", "arnaf",
+    "ata", "ataf", "atof", "amdana", "amdanaf", "wrtha", "wrthof", "dana",
+    "danaf", "ohona", "ohonof", "ynddof", "drosta", "drostof", "drwyddof",
+    "hebdda", "hebddof", "rhyngddof",
+    # 3sg masc. (+ o / fo / fe)
+    "iddo", "arno", "ato", "amdano", "wrtho", "dano", "ohono", "ynddo",
+    "drosto", "drwyddo", "hebddo", "rhyngddo", "ganddo", "gynno", "genno",
+    # 1pl (+ ni)
+    "arnon", "aton", "amdanon", "wrthon", "danon", "ohonon", "ynddon",
+    "droston", "drwyddon", "hebddon", "rhyngddon", "gynnon", "gennon",
+    "ganddon", "arnan", "atan", "amdanan", "wrthan", "danan", "ohonan",
+    "gynnan", "gennan",
+}
+
+# Subject pronouns that sit between a finite verb and its object ("welais i
+# gi"), with the lexicon's Person/Number each must agree with on the verb.
+SUBJECT_PRONOUNS = {
+    "i": ("1", "Sing"), "fi": ("1", "Sing"), "mi": ("1", "Sing"),
+    "ti": ("2", "Sing"), "di": ("2", "Sing"), "chdi": ("2", "Sing"),
+    "o": ("3", "Sing"), "fo": ("3", "Sing"), "e": ("3", "Sing"),
+    "fe": ("3", "Sing"), "hi": ("3", "Sing"),
+    "ni": ("1", "Plur"), "chi": ("2", "Plur"), "nhw": ("3", "Plur"), "hwy": ("3", "Plur"),
+}
+
+# Cardinal numerals. After a numeral trigger another numeral is counting ("tri
+# pedwar o'gloch" = three or four o'clock), not a mutation context -- scored
+# as aspirate erosion 3 times in fusser17.cha (2026-09-28).
+CARDINAL_WORDS = {"un", "dau", "dwy", "tri", "tair", "pedwar", "pedair", "pump",
+                  "pum", "chwech", "chwe", "saith", "wyth", "naw", "deg", "deng",
+                  "deuddeg", "pymtheg", "ugain", "cant", "can", "mil"}
+
+# Nouns spoken after "yn" (in) with the article dropped: "fuan yn bore" =
+# early in the morning (yn y bore), "yn pnawn", "yn canol", "yn gwaelod".
+# Siarad writes these without a "(y)", so they looked like predicative "yn"
+# + noun (soft) or "in" + noun (nasal) -- 11 false erosions in fusser17.cha
+# alone (2026-09-28). Only "yng nghanol y dre" (noun + genitive) is a real
+# nasal context, and _process_word_trigger keeps that case. A noun followed
+# by an adjective is predicative, not locative -- "mae'n fore braf", "mae'n
+# waith caled" -- and is still scored (soft).
+YN_ELIDED_ARTICLE_NOUNS = {"bore", "pnawn", "prynhawn", "nos", "canol", "gwaelod",
+                           "gwaith",
+                           "pen", "top", "topiau", "diwedd", "dechrau", "tŷ", "ty",
+                           "ysgol", "gwely", "dre", "dref", "tre", "tref",
+                           "capel", "eglwys", "cefn", "blaen", "gardd", "llofft",
+                           "gegin", "cegin", "pentre", "pentref", "coleg", "ardal"}
 
 # The soft-mutating prepositions among TRIGGERS. A preposition governs a
 # nominal, so a lone adjective or adverb after one isn't its object (see
