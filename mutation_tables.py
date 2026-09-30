@@ -357,15 +357,25 @@ ECHO_PRONOUNS = {"fi", "ti", "di", "fe", "e", "hi", "ni", "chi", "nhw"}
 # Discourse particles, never mutation targets: "yn te"/"yn de" = the tag
 # "isn't it?" (yntê), "ydy ta" = "then" -- not the noun "te" (tea). ~11 false
 # erosions in fusser12.cha alone (2026-09-27).
-DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê"}
+DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê",
+                       # "you know" / "you see" / "look" fillers and the tag
+                       # questions "(on)d ydyn?", "(on)d oedd?" -- 147 of the 264
+                       # mutation_mismatch rows in the Siarad run of 2026-09-29
+                       # ("a timod" most of them), all counted as correct usage.
+                       "timod", "tibod", "chimod", "twel", "tweld", "wsti", "sti",
+                       "yli", "ylwch", "tydy", "tydi", "tydyn", "toedd", "toedden"}
 
 # Words that never mutate, so a trigger before them is not a context:
 #  - "braf" ("mae'n braf"), "mor" ("mae'n mor dda");
 #  - "gartre"/"adre" -- already the (fossilized, soft-mutated) adverbs "at
 #    home"/"home", so "yn gartre" can only ever look like erosion;
 #  - "tu" in "tu allan / tu ôl / tu mewn", said without its article ("o tu
-#    ôl" = o'r tu ôl) -- never mutated in speech (2026-09-28).
-NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu"}
+#    ôl" = o'r tu ôl) -- never mutated in speech (2026-09-28);
+#  - "bron" (almost) -- "mae Twm yn bron yn ddeg" (Twm is almost ten) was
+#    scored as erosion of predicative "yn" (runs/20260929_075603_youtube-10).
+#    The noun "bron" (breast) does mutate ("ei fron"), but a mutated form
+#    isn't "bron" and is still evaluated.
+NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu", "bron"}
 
 # Possessive determiners: after these, a noun + echo pronoun ("ei gŵr hi") is
 # the NORMAL possessive, not a dropped possessive (ECHO_PRONOUNS rule).
@@ -455,6 +465,64 @@ FIXED_EXPRESSIONS = {
                                                            # all, down, up, out
     "am":   {"byth", "fyth", "ddim", "dim", "wn", "gwn"},  # forever, free, as far as (I know)
     "ei":   {"gilydd", "cilydd"},                          # each other
+    # Added after the Siarad precision audit (2026-09-29), where each was
+    # scored as erosion: "a ballu" (and so on) x4; "o bosib" transcribed
+    # "a bosib"; the exclamations "argoel fawr" and "bobl bach" (goodness
+    # me); "noson (o'r) blaen" (the other night) with the "o'r" elided. The
+    # noun-headed ones are checked in _process_gender_trigger.
+    "a":      {"ballu", "pallu", "phallu", "bosib", "posib", "phosib",
+               "bosibl", "posibl", "phosibl"},
+    "argoel": {"fawr", "mawr"},
+    "bobl":   {"bach", "fach"}, "pobl":  {"bach", "fach"},
+    "bobol":  {"bach", "fach"}, "pobol": {"bach", "fach"},
+    "noson":  {"blaen", "flaen"},
+}
+
+# Common nouns that head place names ("cwm Ffynnon Lloer", "dyffryn Ogwen",
+# "pen y Bryn"), radical and mutated spellings. Before a capitalised name
+# they're part of it even when transcribed in lower case -- "i cwm", "yn
+# dyffryn" were still scored as erosion after the capitalisation rule
+# (fusser17.cha, 2026-09-30). See mutation_engine._mark_place_name_heads.
+# Soft forms that are also everyday words are left out: "dal" (tal / still,
+# hold), "ros" (rhos / gave), "lan" (glan / up).
+PLACE_NAME_HEADS = {
+    "cwm", "gwm", "nghwm", "chwm", "dyffryn", "ddyffryn", "nyffryn",
+    "pen", "ben", "mhen", "phen", "bryn", "fryn", "mryn", "llyn", "lyn",
+    "afon", "mynydd", "fynydd", "moel", "foel", "craig", "graig", "nghraig",
+    "chraig", "coed", "goed", "nghoed", "choed", "nant", "porth", "borth",
+    "mhorth", "phorth", "aber", "tal", "nhal", "thal", "rhos",
+    "maes", "faes", "pont", "bont", "mhont", "phont", "llan", "caer", "gaer",
+    "nghaer", "chaer", "ynys", "traeth", "draeth", "nhraeth", "thraeth", "bae",
+    "cefn", "gefn", "nghefn", "chefn", "blaen", "flaen", "blaenau", "flaenau",
+    "glan", "pant", "bant", "mhant", "phant", "morfa", "forfa",
+    "betws", "fetws", "tre", "dre", "nhre", "thre", "tref", "dref", "plas",
+    "blas", "capel", "gapel", "nghapel", "chapel", "stryd", "heol",
+}
+
+# Capitalised words that are ordinary mutating words, not names: months,
+# days, languages, nationalities, and religious words. Capitalisation marks a
+# place/proper name everywhere else (see mutation_engine._is_unmeasured_name),
+# but "yn Gymraeg", "ym mis Mai", "i Dduw" are live mutation contexts.
+# Radical and mutated spellings, lower case.
+CAPITALISED_COMMON_WORDS = {
+    # months
+    "ionawr", "chwefror", "mawrth", "fawrth", "ebrill", "mai", "fai",
+    "mehefin", "fehefin", "gorffennaf", "orffennaf", "ngorffennaf", "awst",
+    "medi", "fedi", "hydref", "tachwedd", "dachwedd", "nhachwedd", "thachwedd",
+    "rhagfyr", "ragfyr",
+    # days (dydd Llun ... dydd Sul)
+    "llun", "lun", "mercher", "fercher", "iau", "gwener", "wener", "sadwrn", "sul",
+    # languages
+    "cymraeg", "gymraeg", "nghymraeg", "chymraeg", "saesneg", "ffrangeg",
+    "almaeneg", "sbaeneg", "gwyddeleg", "wyddeleg", "eidaleg", "lladin", "ladin",
+    "llydaweg", "lydaweg", "cernyweg", "gernyweg", "nghernyweg", "chernyweg",
+    # nationalities
+    "cymro", "gymro", "nghymro", "chymro", "cymraes", "gymraes", "nghymraes",
+    "chymraes", "cymry", "gymry", "nghymry", "chymry", "cymreig", "gymreig",
+    "nghymreig", "chymreig", "sais", "saeson", "saesnes", "gwyddel", "wyddel",
+    # religious words and festivals
+    "duw", "dduw", "nuw", "iesu", "crist", "grist", "nghrist", "christ",
+    "nadolig", "pasg", "basg", "mhasg", "phasg",
 }
 
 # "o'n i" / "ro'n ni" are the past of bod -- oeddwn i / roedden ni (I was /

@@ -30,7 +30,7 @@ Standalone: imports only spacy_tagging.py, same convention as the other
 non-mutation branches.
 """
 from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted, tagged_as
-from numeral_tables import NUMERAL_FORMS, PARTITIVE_WORDS, WELSH_FILLERS
+from numeral_tables import NUMERAL_FORMS, NUMBER_WORDS, PARTITIVE_WORDS, WELSH_FILLERS
 
 
 def normalize_word(word):
@@ -100,7 +100,7 @@ def process_numeral_agreement(words_list):
         target = _find_noun_target(i, words_list)
         if target is None or target.get("confidence", 0.0) < 0.65:
             continue
-        if normalize_word(target["word"]) in PARTITIVE_WORDS:
+        if normalize_word(target["word"]) in PARTITIVE_WORDS | NUMBER_WORDS:
             continue
         if target.get("_code_switch"):
             continue

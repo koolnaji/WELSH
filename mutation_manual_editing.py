@@ -251,9 +251,10 @@ def find_mutation_csvs(explicit_paths):
               f"point this at your mutations CSVs directly, or check "
               f"BASE_DIR at the top of this script.")
         sys.exit(1)
+    # _deleted/: superseded output (incl. folders output_merge.py absorbed)
     all_files = [
         f for f in MUT_DIR.rglob("mutations_*.csv")
-        if not f.name.endswith("_precaption_backup.csv")
+        if not f.name.endswith("_precaption_backup.csv") and "_deleted" not in f.parts
     ]
     return _pick_best_mutations_file(all_files)
 

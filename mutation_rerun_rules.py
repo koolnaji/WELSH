@@ -1,6 +1,47 @@
 """
 mutation_rerun_rules.py
 ===============
+Brings existing output up to the current detection code -- all five
+branches (mutations, prep, plural, numeral, quantifier) -- without
+re-transcribing (Whisper) or re-calling Cysill.
+
+Full rerun (folders processed from 2026-09-29 on)
+-------------------------------------------------
+Each run now saves its tagged word stream (tagged_*.json.gz: the words after
+Whisper filters, contraction splitting, Cysill, spaCy and lexicon tagging,
+before detection). A rerun feeds it through corpus_ops.rows_from_enriched()
+-- the very function a normal run uses for detection -- so rerun output is
+exactly what processing the video today would give, minus the tagging.
+What a rerun picks up: anything in the detection branches, their tables,
+mutation_engine's detection code, and lemma lookups. What it can't: changes
+before detection (Whisper and its filters, contraction splitting, Cysill,
+spaCy, Bangor-lexicon tags) -- those need the video processed again.
+
+A folder that output_merge.py stacked from several runs holds one tagged
+file per run whose rows it kept; they are stacked again the same way. Rows
+from runs that saved no tagged file stay as they are (and keep their
+pipeline_version). Every rerun row carries pipeline_version = the current
+detection code and tagging_version = the code that tagged its words.
+
+Dry run (default): per folder and branch, what would change (rows added,
+removed, changed, and status changes such as erosion -> correct_mutation),
+and rerun_candidate_<file>.csv next to each file that would change. With
+--commit the files are replaced. Manual reviews are carried to the matching
+new row (same rule, trigger, target and status within 1s); a reviewed row
+whose result changed is not overwritten silently -- it goes to
+superseded_reviews_mutations.csv for a fresh look. A stale corroborated
+file is regenerated from the folder's captions, or renamed stale_*.
+
+    python mutation_rerun_rules.py                          # dry run, every folder
+    python mutation_rerun_rules.py --branch prep,numeral    # only these branches
+    python mutation_rerun_rules.py --video davies --commit  # apply to matching folders
+
+Folders from before 2026-09-29 have no tagged file. Process them once more
+to enable full reruns; until then the legacy mode below still re-runs the
+mutation branch for them when --trigger/--rule is given.
+
+Legacy mode: mutation rules only, rebuilt from pos_*.csv
+--------------------------------------------------------
 Re-run mutation-rule detection on already-transcribed videos, without
 re-transcribing (Whisper) or re-hitting Cysill -- for when you've changed
 a rule in mutation_engine.py or a table in mutation_tables.py and want to
@@ -26,7 +67,7 @@ pos_*.csv. Cysill itself is never called -- lemma lookups
 but they hit the warm lemma_cache.json first and only reach out to
 Cysill/simplemma for genuinely new words.
 
-Output is always written to a separate *_rerun_candidate.csv file next
+Output is always written to a separate rerun_candidate_*.csv file next
 to the real mutations CSV -- nothing touches the real file unless you
 pass --commit, and even then:
   - only rows matching your --trigger/--rule filter are considered for
@@ -80,6 +121,256 @@ MANUAL_REVIEW_COLUMNS = [
 ]
 
 JOIN_KEY_COLUMNS = ["video_title", "timestamp", "trigger_word", "following_word"]
+
+
+# ========================= FULL RERUN (all branches) =========================
+import io
+from collections import Counter
+
+from corpus_io import RUNS_DIR
+import output_merge as om
+
+# --branch name -> output file key (corpus_io._video_slug / output_merge.DATA_FILES)
+BRANCHES = {"mutations": "mutations", "prep": "prep_mutations", "plural": "plural_mutations",
+            "numeral": "numeral_mutations", "quantifier": "quantifier_mutations"}
+TRANSCRIPT_KEYS = ("segments", "words", "lemmas", "pos")
+OUTPUT_KEYS = list(om.DATA_FILES)      # the order rows_from_enriched() returns them in
+# what identifies "the same row" in each detection file
+ROW_KEYS = {
+    "mutations": ["timestamp", "trigger_word", "following_word", "rule"],
+    "prep_mutations": ["timestamp", "preposition", "following_pronoun"],
+    "plural_mutations": ["timestamp", "trigger_word", "following_word"],
+    "numeral_mutations": ["timestamp", "numeral_surface", "following_word"],
+    "quantifier_mutations": ["timestamp", "quantifier_surface", "following_word"],
+}
+# bookkeeping columns, not results -- a difference in these isn't a change
+NOT_COMPARED = {"pipeline_version", "tagging_version", "video_title", "video_url", "source",
+                "video_duration_seconds", "video_word_count", "video_codeswitch_word_count",
+                "speaker", *MANUAL_REVIEW_COLUMNS, "is_erosion"}
+CANDIDATE_PREFIX = "rerun_candidate_"
+
+
+def _text_frame(rows):
+    """Rows as the text a CSV of them holds -- the form existing files are
+    read in -- so old and new values compare like for like."""
+    if not rows:
+        return None
+    buffer = io.StringIO()
+    pd.DataFrame(rows).to_csv(buffer, index=False)
+    return pd.read_csv(io.StringIO(buffer.getvalue()), dtype=str, keep_default_na=False)
+
+
+def _attach_speakers(frames, data):
+    """Siarad/Patagonia rows carry the speaker of their utterance (added by
+    corpus_siarad.py after detection, so not in rows_from_enriched's output)."""
+    speakers = [s[5] if len(s) > 5 else None for s in data["segments"]]
+    if not any(speakers):
+        return
+    by_start = {}
+    for w in data["words"]:
+        seg_id, start = w.get("_seg_id"), w.get("start")
+        if seg_id is not None and start is not None and 0 <= seg_id < len(speakers):
+            by_start[round(float(start), 3)] = speakers[seg_id]
+    for key, df in frames.items():
+        if key == "segments":
+            if len(speakers) == len(df):        # one row per segment, same order
+                df["speaker"] = speakers
+        else:
+            df["speaker"] = om._start_times(df, key).round(3).map(by_start).fillna("")
+
+
+def regenerate_folder(folder):
+    """Every output file of `folder`, rebuilt by the current detection code
+    from its saved tagged word stream(s), stacked like output_merge stacks
+    runs, with the folder's rows that have no tagged file kept as they are.
+    Returns (frames, #segments kept without tagging, tagged files used), or
+    None when the folder has no tagged file."""
+    caches = sorted(Path(folder).glob("tagged_*.json.gz"))
+    if not caches:
+        return None
+    from corpus_ops import rows_from_tagged_cache   # heavy import, only when needed
+    parts = []
+    for path in caches:
+        rows, data = rows_from_tagged_cache(path)
+        frames = {k: f for k, f in zip(OUTPUT_KEYS, map(_text_frame, rows)) if f is not None}
+        _attach_speakers(frames, data)
+        window = data.get("window")
+        if not window:
+            spans = om._segment_spans(frames.get("segments"))
+            window = [min(a for a, _ in spans), max(b for _, b in spans)] if spans else [0, 0]
+        parts.append((data.get("tagged_at") or "", frames, om._union([window]), data))
+    parts.sort(key=lambda p: p[0], reverse=True)          # newest run first
+
+    _, current, coverage, newest = parts[0]
+    counts = {c: om._to_float(newest.get(c)) for c in om.COUNT_COLUMNS}
+    title = (newest.get("video_meta") or {}).get("title")
+    for _, frames, window, _ in parts[1:]:
+        kept, _, _, _ = om._select_old(current, frames, coverage)
+        om.absorb(current, counts, frames, kept)
+        coverage = om._union(coverage + window)
+
+    # the folder's own rows, oldest of all: only what no tagged run covers survives
+    existing = om._load(folder)
+    existing_coverage, _ = om.read_coverage(folder, existing)
+    kept, _, n_untagged, _ = om._select_old(current, existing, coverage)
+    om.absorb(current, counts, existing, kept)
+    coverage = om._union(coverage + existing_coverage)
+    return om.finalize(current, coverage, counts, title), n_untagged, len(caches)
+
+
+def diff_rows(key, old_df, new_df):
+    """(added, removed, changed, reviewed-and-changed, status changes) between
+    the existing and regenerated rows of one detection file."""
+    cols = ROW_KEYS[key]
+
+    def keyed(df):
+        out = {}
+        if df is not None:
+            for _, r in df.iterrows():
+                out.setdefault(tuple(str(r.get(c, "")) for c in cols), r)
+        return out
+
+    old_rows, new_rows = keyed(old_df), keyed(new_df)
+    compare = [c for c in (new_df.columns if new_df is not None else [])
+               if old_df is not None and c in old_df.columns and c not in NOT_COMPARED]
+    added = [k for k in new_rows if k not in old_rows]
+    removed = [k for k in old_rows if k not in new_rows]
+    changed, reviewed, statuses = [], [], Counter()
+    for k in new_rows.keys() & old_rows.keys():
+        old, new = old_rows[k], new_rows[k]
+        if all(str(old.get(c, "")) == str(new.get(c, "")) for c in compare):
+            continue
+        is_reviewed = str(old.get("manual_reviewed", "")).strip().lower() == "true"
+        (reviewed if is_reviewed else changed).append(k)
+        if old.get("status") != new.get("status"):
+            statuses[(old.get("status"), new.get("status"))] += 1
+    for k in added:
+        statuses[(None, new_rows[k].get("status"))] += 1
+    for k in removed:
+        statuses[(old_rows[k].get("status"), None)] += 1
+    return added, removed, changed, reviewed, statuses
+
+
+def _folder_paths(folder, keys):
+    """Each key's existing file in `folder`, or the name the pipeline would give it."""
+    folder = Path(folder)
+    segments = om._find_file(folder, "segments")
+    folder_name = segments.stem[len("segments_"):] if segments else folder.name
+    return {k: om._find_file(folder, om.DATA_FILES[k])
+               or folder / f"{om.DATA_FILES[k]}_{folder_name}.csv" for k in keys}
+
+
+def _without_kept_reviews(original, new):
+    """Drops from `original` the reviewed rows that are already in `new` with
+    their review -- rows kept as they were (no tagged file) -- so they aren't
+    handed on a second time and reported as unmatched."""
+    key_cols = list(om.REVIEW_KEY)
+    if original is None or original.empty or new is None or new.empty \
+            or "manual_reviewed" not in new.columns \
+            or not set(key_cols) <= set(new.columns) or not set(key_cols) <= set(original.columns):
+        return original
+    kept = {tuple(str(v) for v in row) for row in
+            new.loc[om._is_true(new["manual_reviewed"]).values, key_cols].itertuples(index=False)}
+    if not kept:
+        return original
+    keys = original[key_cols].astype(str).apply(tuple, axis=1)
+    return original[~keys.isin(kept).values]
+
+
+def _refresh_corroborated(folder, mutations_path):
+    """After the mutation file changed, its corroborated copy is stale:
+    regenerated from the folder's caption track when there is one, else
+    renamed stale_* so no tool reads it as current."""
+    stale = om._find_file(folder, om.CORROBORATED_PREFIX)
+    if stale is None:
+        return
+    captions = [v.with_suffix(".csv") for v in sorted(Path(folder).glob("*.vtt"))
+                if v.with_suffix(".csv").exists()]
+    if captions:
+        try:
+            import mutation_captions
+            import spacy_tagging
+            cap_kind = om._first(om._read_csv(stale), "caption_kind") or None
+            nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
+            mutation_captions.run_corroboration(mutations_path, captions[0], nlp=nlp,
+                                                cap_kind=cap_kind, output_path=stale)
+            return
+        except (Exception, SystemExit) as e:
+            tqdm.write(f"  ⚠️ Couldn't redo caption corroboration ({e}).")
+    stale.replace(stale.with_name("stale_" + stale.name))
+    tqdm.write(f"  {stale.name} no longer matches the mutation file -- renamed stale_{stale.name}.")
+
+
+def rerun_folder(folder, keys, rewrite_transcripts, commit):
+    """Full rerun of one folder. Returns a per-file summary, or None when the
+    folder has no tagged file."""
+    result = regenerate_folder(folder)
+    if result is None:
+        return None
+    frames, n_untagged, n_caches = result
+    paths = _folder_paths(folder, OUTPUT_KEYS)
+    existing = om._load(folder)
+    summary = {"untagged_segments_kept": n_untagged, "tagged_files": n_caches, "files": {}}
+    for key in keys:
+        added, removed, changed, reviewed, statuses = diff_rows(
+            key, existing.get(key), frames.get(key))
+        summary["files"][key] = {"added": len(added), "removed": len(removed),
+                                 "changed": len(changed), "reviewed_changed": len(reviewed),
+                                 "statuses": statuses}
+
+    differs = [k for k in keys if any(v for n, v in summary["files"][k].items()
+                                      if n != "statuses")]
+    if not commit:
+        for key in differs:
+            if frames.get(key) is not None:
+                target = paths[key].with_name(CANDIDATE_PREFIX + paths[key].name)
+                frames[key].to_csv(target, index=False, encoding="utf-8-sig", quoting=1)
+        return summary
+
+    to_write = list(keys) + (list(TRANSCRIPT_KEYS) if rewrite_transcripts else [])
+    out = {}
+    for key in to_write:
+        new = frames.get(key)
+        if new is None:                          # no rows any more: header only
+            old = existing.get(key)
+            if old is None:
+                continue
+            new = old.iloc[0:0]
+        out[key] = new
+    if "mutations" in out:
+        corroborated_path = om._find_file(folder, om.CORROBORATED_PREFIX)
+        corroborated = om._read_csv(corroborated_path) if corroborated_path else None
+        original, stray = om._overlay_reviews(existing.get("mutations"), corroborated)
+        original = _without_kept_reviews(original, out["mutations"])
+        out["mutations"], stray_new = om._transfer_reviews(out["mutations"], original)
+        om.save_stray_reviews(folder, [stray, stray_new])
+    om.write_frames(out, {k: paths[k] for k in out})
+    for key in out:
+        candidate = paths[key].with_name(CANDIDATE_PREFIX + paths[key].name)
+        candidate.unlink(missing_ok=True)
+    if "mutations" in out:
+        _refresh_corroborated(folder, paths["mutations"])
+    return summary
+
+
+def _print_summary(folder, summary, commit):
+    lines = []
+    for key, s in summary["files"].items():
+        if not any(v for n, v in s.items() if n != "statuses"):
+            continue
+        moves = ", ".join(f"{a or 'new'}→{b or 'gone'}: {n}"
+                          for (a, b), n in s["statuses"].most_common(6))
+        lines.append(f"    {key}: +{s['added']} -{s['removed']} ~{s['changed']}"
+                     + (f", {s['reviewed_changed']} reviewed row(s) changed" if s["reviewed_changed"] else "")
+                     + (f"  [{moves}]" if moves else ""))
+    head = f"  {folder.parent.name}/{folder.name}"
+    if summary["untagged_segments_kept"]:
+        head += (f"  ({summary['untagged_segments_kept']} segment(s) with no tagged file "
+                 f"kept as they were)")
+    if lines:
+        tqdm.write(head + (" -- applied" if commit else ""))
+        for line in lines:
+            tqdm.write(line)
 
 
 def _mutations_dir_for(mutations_csv_path):
@@ -323,21 +614,80 @@ def diff_and_write(video_slug, old_df, new_df, out_path, commit, triggers, rules
           f"in place rather than deleted -- see 'removed' count above).")
 
 
-def run_rerun(trigger_arg=None, rule_arg=None, video="all", commit=False):
+def _video_folders(video):
+    folders = sorted({p.parent for p in RUNS_DIR.glob("*/*/segments_*.csv")
+                      if "_deleted" not in p.parts})
+    if video and video != "all":
+        folders = [f for f in folders if video in f.name or video in f.parent.name]
+    return folders
+
+
+def run_rerun(trigger_arg=None, rule_arg=None, video="all", commit=False, branches=None):
     """
     Core entry point, usable both from the CLI (main(), below) and
-    imported directly by welsh_pipeline.py's menu. trigger_arg/rule_arg
-    are comma-separated strings (or None) exactly as they'd arrive from
-    --trigger/--rule; keeping that shape here (rather than pre-split
-    lists) means both callers pass through the same normalization path
-    instead of the menu needing to duplicate it.
+    imported directly by welsh_pipeline.py's menu.
+
+    Folders with a saved tagged word stream get a full rerun of the
+    branches in `branches` (comma-separated names from BRANCHES, or None for
+    all five; with all five the segments/words/lemmas/pos files are
+    rewritten too). Folders without one get the legacy mutation-only rerun
+    when trigger_arg/rule_arg are given (comma-separated, as from
+    --trigger/--rule), and are listed otherwise.
     """
-    if not trigger_arg and not rule_arg:
-        print("Specify at least a trigger or a rule (nothing to filter to otherwise --"
-              " re-running every rule on every video is just a full-corpus reprocess,"
-              " which this tool intentionally doesn't do; use option 3 for that).")
+    names = [b.strip() for b in branches.split(",")] if branches else list(BRANCHES)
+    unknown = [b for b in names if b not in BRANCHES]
+    if unknown:
+        print(f"Unknown branch(es): {', '.join(unknown)}. Choose from: {', '.join(BRANCHES)}")
+        return False
+    keys = [BRANCHES[b] for b in names]
+    rewrite_transcripts = len(names) == len(BRANCHES)
+
+    folders = _video_folders(video)
+    if not folders:
+        print("No matching output folders found.")
         return False
 
+    load_lemma_cache()
+    from mutation_engine import load_bangor_lexicon
+    # Detection reads the lexicon live (inflected verbs, noun number, lemmas):
+    # without it the object rule produced no rows and guarded contexts came
+    # back ("sy gynno"), rewriting every folder wrongly (2026-09-30). Stop.
+    if not load_bangor_lexicon():
+        print("Nothing rerun: the Bangor lexicon is required for a rerun.")
+        return False
+    untagged, totals = [], Counter()
+    for folder in tqdm(folders, desc="Folders"):
+        try:
+            summary = rerun_folder(folder, keys, rewrite_transcripts, commit)
+        except Exception as e:
+            tqdm.write(f"  💥 {folder.parent.name}/{folder.name}: {e} -- left unchanged.")
+            continue
+        if summary is None:
+            untagged.append(folder)
+            continue
+        _print_summary(folder, summary, commit)
+        for s in summary["files"].values():
+            for name in ("added", "removed", "changed", "reviewed_changed"):
+                totals[name] += s[name]
+    save_lemma_cache()
+
+    print(f"\nFull rerun: {len(folders) - len(untagged)} folder(s), branches: {', '.join(names)}. "
+          f"+{totals['added']} -{totals['removed']} ~{totals['changed']} row(s)"
+          + (f", {totals['reviewed_changed']} reviewed row(s) changed" if totals["reviewed_changed"] else "")
+          + ("" if commit else f" -- dry run; see {CANDIDATE_PREFIX}*.csv, apply with --commit"))
+    if untagged:
+        print(f"{len(untagged)} folder(s) have no saved tagging (processed before full reruns "
+              f"existed), e.g. {untagged[0].parent.name}/{untagged[0].name}. Process them once "
+              f"more to enable full reruns"
+              + ("; running the legacy mutation-only rerun on them now." if (trigger_arg or rule_arg)
+                 else "; --trigger/--rule runs the legacy mutation-only rerun on them."))
+    if not (trigger_arg or rule_arg) or not untagged:
+        return True
+    return _run_legacy(trigger_arg, rule_arg, untagged, commit)
+
+
+def _run_legacy(trigger_arg, rule_arg, folders, commit):
+    """The original mutation-only rerun, for folders with no saved tagging."""
     triggers = [normalize_word(t) for t in trigger_arg.split(",")] if trigger_arg else None
     rules    = [r.strip() for r in rule_arg.split(",")] if rule_arg else None
 
@@ -350,11 +700,10 @@ def run_rerun(trigger_arg=None, rule_arg=None, video="all", commit=False):
     # classification underneath them; re-run mutation_captions.py's
     # corroboration pass afterward if the corroborated version needs
     # refreshing against the new results.
-    all_csvs = sorted(MUT_DIR.rglob("mutations_original_*.csv"))
+    all_csvs = sorted(p for folder in folders
+                      for p in folder.glob("mutations_original_*.csv"))
     all_csvs = [p for p in all_csvs if "precaption_backup" not in p.name
-                and "_rerun_candidate" not in p.name]
-    if video and video != "all":
-        all_csvs = [p for p in all_csvs if video in p.parent.name]
+                and "_rerun_candidate" not in p.name and "_deleted" not in p.parts]
 
     if not all_csvs:
         print("No matching mutations CSVs found.")
@@ -362,13 +711,14 @@ def run_rerun(trigger_arg=None, rule_arg=None, video="all", commit=False):
 
     load_lemma_cache()
 
-    for mutations_csv_path in tqdm(all_csvs, desc="Videos"):
+    for mutations_csv_path in tqdm(all_csvs, desc="Videos (legacy)"):
         result = rerun_one_video(mutations_csv_path, triggers, rules)
         if result is None:
             continue
         old_df, new_df = result
-        out_path = mutations_csv_path.with_name(
-            mutations_csv_path.stem + "_rerun_candidate.csv")
+        # prefixed, not suffixed: a name starting "mutations_" is read as
+        # real output by corpus_analyzer.py and mutation_manual_editing.py
+        out_path = mutations_csv_path.with_name(CANDIDATE_PREFIX + mutations_csv_path.name)
         diff_and_write(mutations_csv_path.parent.name, old_df, new_df,
                         out_path, commit, triggers, rules, mutations_csv_path)
 
@@ -379,16 +729,20 @@ def run_rerun(trigger_arg=None, rule_arg=None, video="all", commit=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--trigger", help="Comma-separated trigger word(s), e.g. yn,ei")
-    ap.add_argument("--rule", help="Comma-separated rule name(s), e.g. word_trigger,phantom_check")
+    ap.add_argument("--branch", help="Comma-separated branch(es) to rerun: "
+                                      f"{', '.join(BRANCHES)} [default: all five]")
+    ap.add_argument("--trigger", help="Legacy mode only (folders without saved tagging): "
+                                      "comma-separated trigger word(s), e.g. yn,ei")
+    ap.add_argument("--rule", help="Legacy mode only: comma-separated rule name(s), "
+                                   "e.g. word_trigger,phantom_check")
     ap.add_argument("--video", default="all",
-                     help="Substring to match against mutations CSV folder names, or 'all'")
+                     help="Substring to match against output folder names, or 'all'")
     ap.add_argument("--commit", action="store_true",
-                     help="Apply changes in place instead of writing a comparison file only")
+                     help="Apply changes in place instead of writing comparison files only")
     args = ap.parse_args()
 
     ok = run_rerun(trigger_arg=args.trigger, rule_arg=args.rule,
-                    video=args.video, commit=args.commit)
+                    video=args.video, commit=args.commit, branches=args.branch)
     if not ok:
         sys.exit(1)
 

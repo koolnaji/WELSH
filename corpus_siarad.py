@@ -9,12 +9,22 @@ corpus_ops.analyze_segments().
 
 Usage:
     python corpus_siarad.py <file.cha | folder of .cha files> [--limit N] [--redo]
+                            [--corpus siarad|patagonia]
     (a folder is searched recursively; conversations already done on the
     current pipeline version, with Cysill, are skipped unless --redo is given,
     so a stopped run -- or one after a detection fix -- is simply restarted;
-    --limit N processes only the next N not yet done)
+    --limit N processes only the next N not yet done; --corpus defaults to
+    "patagonia" when the path contains "patagonia", else "siarad")
 
-Output, per conversation, in runs/<stamp>/Siarad_<file>/:
+Also reads the Bangor Patagonia corpus (Welsh-Spanish, Argentina, 2009; same
+team and CHAT conventions, GPLv3; cite Deuchar & Webb-Davies (2011), The
+Bangor Patagonia Corpus, doi:10.21415/T55K5C). The only difference that
+matters here is the second language: each file's @Languages header names
+them, the FIRST is the default for untagged words (Patagonia documentation;
+some files may be Spanish-default), and a bare "@s" means "the file's other
+language" -- Spanish there, English in Siarad.
+
+Output, per conversation, in runs/<stamp>/Siarad_<file>/ (Patagonia_<file>/):
   - the same segments/words/lemmas/pos/mutations/prep/plural/numeral/quantifier CSVs a
     video produces, every row with an added "speaker" column;
   - speakers_*.csv: code, age, sex, role, the transcript's per-speaker
@@ -61,6 +71,7 @@ from corpus_io import (
     set_session_label, session_dir,
 )
 from corpus_ops import analyze_segments
+from output_merge import merge_with_previous
 from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 from mutation_engine import (
     load_spacy, load_lemma_cache, save_lemma_cache, load_bangor_lexicon,
@@ -72,6 +83,12 @@ OUTPUT_KEYS = ["segments", "words", "lemmas", "pos", "mutations",
                "quantifier_mutations"]
 DETECTION_KEYS = ("mutations", "prep_mutations", "plural_mutations", "numeral_mutations",
                   "quantifier_mutations")
+
+CORPORA = ("siarad", "patagonia")
+# Used when a file has no @Languages header: Siarad's pair.
+DEFAULT_LANGUAGES = ("cym", "eng")
+# "[- spa]" / "[- eng]" / "[- cym]": the whole utterance is in that language.
+UTTERANCE_LANG_RE = re.compile(r"\[-\s*([a-z]{3})\]")
 
 BULLET_RE    = re.compile(r"\x15(\d+)_(\d+)\x15")
 # "@s:eng" / "@s:cym&eng" (explicit), or a BARE "@s" = "the other language of
@@ -123,12 +140,24 @@ def read_chat(path):
         else:
             lines.append(raw)
 
+    # "languages": @Languages, first = default. "pair": the conversation's two
+    # languages from the @ID lines ("cym, spa"). The TalkBank Patagonia release
+    # lists three in @Languages ("cym, eng, spa"), but its bare "@s" words are
+    # Spanish ("no@s", "treinta@s"), so the "other language" comes from here.
     header = {"participants": {}, "comments": [], "situation": None,
-              "date": None, "duration_seconds": None}
+              "date": None, "duration_seconds": None, "languages": DEFAULT_LANGUAGES,
+              "pair": None}
     utterances, current = [], None
     for line in lines:
-        if line.startswith("@ID:"):
+        if line.startswith("@Languages:"):
+            langs = tuple(l.strip() for l in line[len("@Languages:"):].split(",") if l.strip())
+            if langs:
+                header["languages"] = langs
+        elif line.startswith("@ID:"):
             fields = line.split("\t", 1)[-1].split("|")
+            id_langs = tuple(l.strip() for l in fields[0].split(",") if l.strip())
+            if header["pair"] is None and len(id_langs) >= 2:
+                header["pair"] = id_langs[:2]
             if len(fields) > 4:
                 code = fields[2].strip()
                 header["participants"][code] = {
@@ -161,16 +190,22 @@ def read_chat(path):
     return header, utterances
 
 
-def clean_main_tier(main):
+def clean_main_tier(main, languages=DEFAULT_LANGUAGES, pair=None):
     """Returns (start_s, end_s, words) where words is a list of (text, lang,
-    uncertain). A "," in the transcript is attached to the preceding word so
-    the pipeline's clause-boundary logic sees it."""
+    uncertain, name_part). A "," in the transcript is attached to the preceding word so
+    the pipeline's clause-boundary logic sees it. `languages` is the file's
+    @Languages list (the first is the default for untagged words); `pair` is
+    the conversation's two languages from @ID, if known."""
     bullet = BULLET_RE.search(main)
     start = int(bullet.group(1)) / 1000 if bullet else None
     end = int(bullet.group(2)) / 1000 if bullet else None
 
     s = BULLET_RE.sub(" ", main)
-    utterance_english = "[- eng]" in s
+    precode = UTTERANCE_LANG_RE.search(s)
+    utterance_lang = precode.group(1) if precode else languages[0]
+    # the "other language" a bare "@s" switches to
+    pair = pair or (tuple(languages) + DEFAULT_LANGUAGES)[:2]
+    other_lang = pair[1] if utterance_lang == pair[0] else pair[0]
     s = UNCERTAIN_RE.sub(
         lambda m: " ".join(t + UNCERTAIN_MARK for t in m.group(1).strip("<>").split()), s)
     s = OTHER_CODE_RE.sub(" ", s)
@@ -190,7 +225,7 @@ def clean_main_tier(main):
         uncertain = UNCERTAIN_MARK in tok
         tok = tok.replace(UNCERTAIN_MARK, "")
         if tok == "," and words:
-            words[-1] = (words[-1][0] + ",", words[-1][1], words[-1][2])
+            words[-1] = (words[-1][0] + ",",) + words[-1][1:]
             continue
         if tok in DROP_TOKENS or tok.startswith(("&", "+", "#", "0")):
             continue
@@ -199,42 +234,58 @@ def clean_main_tier(main):
         # whose transcriber tags ~350 other English words), and forcing them
         # to Welsh made them numeral/rhai/mutation targets. None = decided by
         # spelling, the same heuristic as YouTube data -- the orthography
-        # criterion (decision 2026-09-26). Explicit tags still win.
-        lang = "eng" if utterance_english else None
+        # criterion (decision 2026-09-26). Explicit tags still win. In a
+        # non-Welsh utterance (Spanish-default Patagonia file, or "[- eng]")
+        # untagged words are that language.
+        lang = None if utterance_lang == "cym" else utterance_lang
         m = LANG_TAG_RE.search(tok)
         if m:
             tag = m.group(1)
             if tag is None:     # bare "@s": switch to the utterance's other language
-                lang = "cym" if utterance_english else "eng"
-            else:
-                lang = "eng" if tag == "eng" else "cym" if tag == "cym" else \
-                       "und" if "&" in tag else "mixed"
+                lang = other_lang
+            elif "&" in tag:    # in both dictionaries ("cym&eng", "cym&spa")
+                lang = "und"
+            elif "+" in tag:    # mixed morphology, treated as Welsh
+                lang = "mixed"
+            else:               # "cym", "eng", "spa", ...
+                lang = tag
             tok = tok[:m.start()]
         tok = tok.split("@")[0].strip("“”\"")
         tok = tok.replace("(", "").replace(")", "").replace("+", "")
         for ch in PROSODY_CHARS:
             tok = tok.replace(ch, "")
-        for part in tok.split("_"):
-            if part:
-                words.append((part, lang, uncertain))
+        # In a mixed-morphology word the underscore joins a stem to a Welsh
+        # ending (hammer_o@s:eng+cym = "hammero"); splitting it left a fake
+        # preposition "o" that the prep branch scored as "o fo" (audit
+        # 2026-09-29). Elsewhere it joins the words of a name or compound.
+        if lang == "mixed":
+            tok = tok.replace("_", "")
+        parts = [p for p in tok.split("_") if p]
+        # A capitalised underscore word is a multi-word name (Pen_y_Bont_Fawr,
+        # Pen_y_groes); every part is flagged, since a lower-case part after
+        # "y" ("groes") would otherwise pass as a common noun -- the mutation
+        # branch doesn't measure place names (decision 2026-09-29).
+        name_part = len(parts) > 1 and any(p[:1].isupper() for p in parts)
+        for part in parts:
+            words.append((part, lang, uncertain, name_part))
     return start, end, words
 
 
-def build_segments(utterances):
+def build_segments(utterances, languages=DEFAULT_LANGUAGES, pair=None):
     """Segment/word objects shaped like faster-whisper's, one segment per
     non-empty utterance, plus {word start -> speaker} for row attribution."""
     segments, seg_speakers, start_to_speaker, used = [], [], {}, set()
     prev_end = 0.0
     for utt in utterances:
-        start, end, words = clean_main_tier(utt["main"])
-        utt["clean"] = " ".join(w for w, _, _ in words)
+        start, end, words = clean_main_tier(utt["main"], languages, pair)
+        utt["clean"] = " ".join(w[0] for w in words)
         if not words:
             continue
         if start is None:
             start = end = prev_end
         span = max(end - start, 0.001 * len(words))
         word_objs = []
-        for i, (text, lang, uncertain) in enumerate(words):
+        for i, (text, lang, uncertain, name_part) in enumerate(words):
             w_start = round(start + span * i / len(words), 3)
             while w_start in used:
                 w_start = round(w_start + 0.001, 3)
@@ -243,11 +294,12 @@ def build_segments(utterances):
             if i == len(words) - 1 and not text.endswith(","):
                 text += "."
             word_objs.append(SimpleNamespace(
-                word=text, start=w_start, end=w_end, lang=lang,
+                word=text, start=w_start, end=w_end, lang=lang, name_part=name_part,
                 probability=UNCERTAIN_PROBABILITY if uncertain else 1.0))
             start_to_speaker[w_start] = utt["speaker"]
         segments.append(SimpleNamespace(start=start, end=start + span, text=utt["clean"],
-                                        words=word_objs, no_speech_prob=0.0, avg_logprob=0.0))
+                                        words=word_objs, no_speech_prob=0.0, avg_logprob=0.0,
+                                        speaker=utt["speaker"]))
         seg_speakers.append(utt["speaker"])
         prev_end = start + span
     return segments, seg_speakers, start_to_speaker
@@ -267,24 +319,29 @@ def _row_start(row):
     return None
 
 
-def process_file(path, stamp):
+def process_file(path, stamp, corpus="siarad"):
     path = Path(path)
     header, utterances = read_chat(path)
-    segments, seg_speakers, start_to_speaker = build_segments(utterances)
-    meta = {"id": f"siarad_{path.stem}", "title": f"Siarad {path.stem}",
-            "url": f"siarad:{path.stem}", "source": "siarad"}
+    languages, pair = header["languages"], header["pair"]
+    segments, seg_speakers, start_to_speaker = build_segments(utterances, languages, pair)
+    meta = {"id": f"{corpus}_{path.stem}", "title": f"{corpus.capitalize()} {path.stem}",
+            "url": f"{corpus}:{path.stem}", "source": corpus}
     duration = header["duration_seconds"] or (segments[-1].end if segments else 0.0)
+    meta["_coverage_window"] = [0.0, float(duration or 0.0)]   # the whole conversation
 
     vpaths = None
     try:
+        vpaths = _video_slug(meta, stamp)
         results = analyze_segments(
             segments, meta, video_duration_seconds=duration, language="cy",
-            language_probability=1.0, checkpoint_key=meta["url"])
+            language_probability=1.0, checkpoint_key=meta["url"],
+            tagged_cache_path=vpaths["tagged"])
         # Cysill's hourly limit tripped somewhere in this file (tagging OR the
         # lemma lookups during detection): its rows would be tagged differently
         # from every other file's, so it isn't saved at all -- see main().
         if TECHIAITH_API_KEY and is_cysill_disabled():
             print(f"  ⏸ {path.name}: Cysill hit its hourly limit during this file -- not saved.")
+            cleanup_incomplete_video_dirs(vpaths, video_label=path.name)
             return False
         outputs = dict(zip(OUTPUT_KEYS, results))
 
@@ -299,7 +356,6 @@ def process_file(path, stamp):
         if unmapped:
             print(f"  ⚠️  {unmapped} detection row(s) could not be mapped to a speaker")
 
-        vpaths = _video_slug(meta, stamp)
         header_flags = [True] * len(OUTPUT_KEYS)
         for idx, key in enumerate(OUTPUT_KEYS):
             if outputs[key]:
@@ -311,13 +367,18 @@ def process_file(path, stamp):
         for code, info in header["participants"].items():
             words = [w for u in utterances if u["speaker"] == code
                      for w in (u.get("clean") or "").split()]
-            n_eng = sum(1 for u in utterances if u["speaker"] == code
-                        for _, lang, _ in clean_main_tier(u["main"])[2] if lang == "eng")
+            word_langs = [lang for u in utterances if u["speaker"] == code
+                          for _, lang, _, _ in clean_main_tier(u["main"], languages, pair)[2]]
             speaker_rows.append({
                 "conversation": path.stem, "speaker": code, "age": info["age"],
                 "sex": info["sex"], "role": info["role"],
                 "notes": " | ".join(info["notes"]) or None,
-                "word_count": len(words), "english_tagged_words": n_eng,
+                "word_count": len(words),
+                "english_tagged_words": sum(1 for l in word_langs if l == "eng"),
+                # every word tagged as a non-Welsh language (Spanish in Patagonia)
+                "other_language_tagged_words": sum(
+                    1 for l in word_langs if l not in (None, "cym", "mixed", "und")),
+                "languages": ",".join(languages),
                 "situation": header["situation"], "date": header["date"],
             })
         pd.DataFrame(speaker_rows).to_csv(out_dir / f"speakers_{folder_name}.csv",
@@ -330,6 +391,14 @@ def process_file(path, stamp):
 
         counts = ", ".join(f"{k.replace('_mutations', '')}={len(outputs[k])}" for k in DETECTION_KEYS)
         print(f"  {path.name}: {len(segments)} utterances, {len(outputs['words'])} words -- {counts}")
+        # One folder per conversation: an earlier run's folder is absorbed and
+        # moved to runs/_deleted/ (output_merge.py). The whole conversation is
+        # covered, so nothing of the earlier run is kept.
+        try:
+            merge_with_previous(vpaths, meta["url"], meta["_coverage_window"])
+        except Exception as e:
+            print(f"  ⚠️ Merge with earlier output failed ({e}) -- this run's output is "
+                  f"saved on its own; earlier folders untouched.")
     except Exception as e:
         print(f"  💥 {path.name}: {e}")
         cleanup_incomplete_video_dirs(vpaths, video_label=path.name)
@@ -349,7 +418,7 @@ def _saved_run_quality(pos_csv):
     return version, (tagged / total if total else 0.0)
 
 
-def _already_done(path):
+def _already_done(path, corpus="siarad"):
     """True if some earlier run already wrote this conversation's output ON
     THE CURRENT PIPELINE VERSION and, when a key is set, WITH Cysill tags.
     The whole corpus takes several sittings, so a plain rerun picks up where
@@ -357,7 +426,7 @@ def _already_done(path):
     everything still on an older version (no --redo needed, which would
     restart from file 1 each time the hourly limit stops a run). A
     conversation saved without Cysill (fusser15-18, 2026-09-27) isn't done."""
-    for segments_csv in RUNS_DIR.glob(f"*/Siarad_{path.stem}/segments_*.csv"):
+    for segments_csv in RUNS_DIR.glob(f"*/{corpus.capitalize()}_{path.stem}/segments_*.csv"):
         pos_csv = next(segments_csv.parent.glob("pos_*.csv"), None)
         if pos_csv is None:
             continue
@@ -370,6 +439,14 @@ def _already_done(path):
 def main(argv):
     redo = "--redo" in argv
     argv = [a for a in argv if a != "--redo"]
+    corpus = None
+    if "--corpus" in argv:
+        at = argv.index("--corpus")
+        corpus = argv[at + 1].lower() if at + 1 < len(argv) else None
+        if corpus not in CORPORA:
+            print(f"--corpus needs one of: {', '.join(CORPORA)}")
+            return 1
+        argv = argv[:at] + argv[at + 2:]
     limit = None
     if "--limit" in argv:
         at = argv.index("--limit")
@@ -381,16 +458,19 @@ def main(argv):
         argv = argv[:at] + argv[at + 2:]
     if len(argv) != 1:
         print("Usage: python corpus_siarad.py <file.cha | folder of .cha files> "
-              "[--limit N] [--redo]")
+              "[--limit N] [--redo] [--corpus siarad|patagonia]")
         return 1
     target = Path(argv[0])
+    if corpus is None:
+        corpus = "patagonia" if "patagonia" in str(target).lower() else "siarad"
+    print(f"Corpus: {corpus}")
     # rglob: the TalkBank zip unpacks into a Siarad/ subfolder
     files = sorted(target.rglob("*.cha")) if target.is_dir() else [target]
     if not files or not all(f.exists() for f in files):
         print(f"No .cha files found at {target}")
         return 1
     if not redo:
-        done = [f for f in files if _already_done(f)]
+        done = [f for f in files if _already_done(f, corpus)]
         if done:
             print(f"Skipping {len(done)} conversation(s) already done on this pipeline "
                   f"version with Cysill (add --redo to process them again).")
@@ -405,17 +485,20 @@ def main(argv):
     load_lemma_cache()
     print("Loading Welsh dependency parser...")
     load_spacy()
-    load_bangor_lexicon()
+    # Detection depends on the lexicon, so a run without it isn't comparable
+    # with the others -- stop rather than write degraded rows (2026-09-30).
+    if not load_bangor_lexicon():
+        raise SystemExit("Stopped: the Bangor lexicon is required (see the message above).")
     print(cysill_status_line())
     print(f"Pipeline version: {pipeline_version()}")
     reset_cysill_circuit_breaker()
 
     stamp = run_stamp()
-    set_session_label(stamp, label=f"siarad-{len(files)}")
-    print(f"Processing {len(files)} Siarad file(s) into runs/{session_dir(stamp).name}/")
+    set_session_label(stamp, label=f"{corpus}-{len(files)}")
+    print(f"Processing {len(files)} {corpus.capitalize()} file(s) into runs/{session_dir(stamp).name}/")
     try:
         for n, f in enumerate(files):
-            if not process_file(f, stamp):
+            if not process_file(f, stamp, corpus):
                 print(f"Stopped: Cysill's hourly limit was reached. {len(files) - n} "
                       f"conversation(s) not processed -- run the same command again "
                       f"in about an hour; finished ones are skipped.")

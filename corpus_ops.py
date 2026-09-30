@@ -59,7 +59,9 @@ from corpus_io import (
     load_failed, save_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
     cleanup_incomplete_video_dirs, pipeline_version, session_dir,
+    save_tagged_cache, load_tagged_cache,
 )
+from types import SimpleNamespace
 # PATCH: single source of truth (see mutation_tables.py for rationale) --
 # was three separate inline copies of this same 4-status list in this
 # file, plus a fourth, DIFFERENT (and wrong) computation for the headline
@@ -70,6 +72,7 @@ import prep_engine
 import plural_engine
 import numeral_engine
 import quantifier_engine
+import run_progress  # unversioned
 
 
 # ========================= EMAIL NOTIFICATION =========================
@@ -1394,9 +1397,82 @@ def _shift_and_trim_padded_segments(segments, sample_bounds):
     return kept
 
 
+# Whisper runs with language="cy" forced, so English speech comes out as
+# invented Welsh rather than English: Eluned Morgan speaking English became
+# "Rwy'n meddwl am ymlaen i'r llyfrwyr yng Nghyrchu yng Nghyngor"
+# (runs/20260929_075603_youtube-10), mutations and all. info.language can't
+# flag it -- it just echoes the forced "cy". So each segment's own audio goes
+# through Whisper's language identification, and a segment whose audio is
+# English is dropped before any analysis. Welsh with English words mixed in
+# is identified as Welsh and kept, so code-switching is still measured.
+# Segments shorter than LANGUAGE_CHECK_MIN_SECONDS are identified on a window
+# padded out to that length around them (the speech either side is nearly
+# always the same speaker): kept unchecked, English fragments got through --
+# "whilst I led the campaign" (1.9 s) scored "i led" as a correct soft
+# mutation (runs/20260929_222720, Reform UK video). Costs one extra encoder
+# pass per segment; set LANGUAGE_CHECK_ENABLED = False to skip it.
+LANGUAGE_CHECK_ENABLED = True
+LANGUAGE_CHECK_MIN_SECONDS = 2.0
+LANGUAGE_CHECK_ENGLISH_MIN_PROB = 0.5
+_WHISPER_SAMPLE_RATE = 16000
+
+
+def drop_non_welsh_segments(segments, audio_path, model):
+    """Drops segments whose audio Whisper identifies as English (see the
+    comment above). Timestamps must still be relative to `audio_path`, so
+    call this before _shift_and_trim_padded_segments(). If language
+    identification isn't available or fails, every segment is kept and a
+    warning is printed -- the run continues exactly as before this existed."""
+    if not LANGUAGE_CHECK_ENABLED or not segments:
+        return segments
+    if not hasattr(model, "detect_language"):
+        tqdm.write(" ⚠️ Language check skipped: this faster-whisper has no "
+                   "detect_language() (needs faster-whisper >= 1.1).")
+        return segments
+    try:
+        from faster_whisper import decode_audio
+        audio = decode_audio(str(audio_path), sampling_rate=_WHISPER_SAMPLE_RATE)
+    except Exception as e:
+        tqdm.write(f" ⚠️ Language check skipped: couldn't load audio ({e}).")
+        return segments
+
+    kept, dropped, dropped_seconds = [], [], 0.0
+    run_progress.phase("Checking language", total=len(segments), unit="segments")  # unversioned
+    for seg in segments:
+        run_progress.advance()  # unversioned
+        start, end = seg.start, seg.end
+        if end - start < LANGUAGE_CHECK_MIN_SECONDS:
+            pad = (LANGUAGE_CHECK_MIN_SECONDS - (end - start)) / 2
+            start, end = max(0.0, start - pad), end + pad
+        clip = audio[int(start * _WHISPER_SAMPLE_RATE):int(end * _WHISPER_SAMPLE_RATE)]
+        if len(clip) == 0:
+            kept.append(seg)
+            continue
+        try:
+            _, _, all_probs = model.detect_language(audio=clip)
+        except Exception as e:
+            tqdm.write(f" ⚠️ Language check failed ({e}) -- keeping all segments.")
+            return segments
+        probs = dict(all_probs)
+        p_en, p_cy = probs.get("en", 0.0), probs.get("cy", 0.0)
+        if p_en >= LANGUAGE_CHECK_ENGLISH_MIN_PROB and p_en > p_cy:
+            dropped.append((seg, p_en))
+            dropped_seconds += seg.end - seg.start
+            continue
+        kept.append(seg)
+
+    if dropped:
+        tqdm.write(f" 🚫 Dropped {len(dropped)} English segment(s), "
+                   f"{dropped_seconds:.0f}s of audio (Whisper was forced to "
+                   f"Welsh and would have invented Welsh words for them):")
+        for seg, p_en in dropped[:3]:
+            tqdm.write(f"    [{seg.start:.1f}s] p(en)={p_en:.2f}: {seg.text.strip()[:80]}")
+    return kept
+
+
 # ========================= ANALYSIS =========================
 def analyze(audio_path, model, video_meta, substeps=None, preset=None,
-            sample_seconds=None, skip_seconds=300):
+            sample_seconds=None, skip_seconds=300, tagged_cache_path=None):
     """
     substeps: optional tqdm instance with total=4 (transcribe, preprocess,
     tag+align, mutations). If given, step descriptions go there instead of
@@ -1474,7 +1550,15 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
             sample_bounds["true_end"] - sample_bounds["true_start"], 2)
     else:
         video_duration_seconds = round(getattr(info, "duration", 0.0) or 0.0, 2)
+    # The stretch of the video this run covers, in video seconds -- read by
+    # output_merge.merge_with_previous() when this video already has output.
+    # Kept on video_meta (the caller's dict), never written to a CSV row.
+    video_meta["_coverage_window"] = (
+        [sample_bounds["true_start"], sample_bounds["true_end"]] if sample_bounds is not None
+        else [0.0, video_duration_seconds])
+    segments = run_progress.track_transcription(segments, info)  # unversioned
     segments = list(segments)
+    segments = drop_non_welsh_segments(segments, audio_path, model)
     # PATCH: shift clip-relative timestamps to true-video time and drop
     # padding-only partial segments BEFORE any other filtering -- see
     # _shift_and_trim_padded_segments()'s docstring. A no-op when this
@@ -1490,7 +1574,7 @@ def analyze(audio_path, model, video_meta, substeps=None, preset=None,
         segments, video_meta,
         video_duration_seconds=video_duration_seconds,
         language=info.language, language_probability=info.language_probability,
-        checkpoint_key=checkpoint_key, step=_step)
+        checkpoint_key=checkpoint_key, step=_step, tagged_cache_path=tagged_cache_path)
     return (*rows, time.time() - start_time)
 
 
@@ -1510,7 +1594,8 @@ def _report_tagger_coverage(enriched):
 
 
 def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
-                     language_probability, checkpoint_key, step=None):
+                     language_probability, checkpoint_key, step=None,
+                     tagged_cache_path=None):
     """
     Everything after transcription: preprocessing, Cysill/spaCy tagging and
     every detection branch, for any list of segment-like objects (.start,
@@ -1518,6 +1603,10 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
     optional .lang from a human-annotated transcript). Split out of analyze()
     so human-transcribed corpora (corpus_siarad.py) go through exactly the
     same tagging and detection as Whisper output.
+
+    tagged_cache_path: where to save the tagged word stream (see
+    corpus_io.save_tagged_cache) so mutation_rerun_rules.py can re-run
+    detection later without re-tagging. None = don't save.
 
     Returns (segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows,
     prep_rows, plural_rows, numeral_rows, quantifier_rows).
@@ -1565,17 +1654,18 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
         if is_english_code_switch(w["word"], None)
     )
     # _code_switch: the per-word decision the detection branches read. A
-    # human language tag wins where there is one (Siarad: "eng" -> English,
-    # "cym"/"mixed" -> Welsh); otherwise -- Whisper output, and Siarad's
-    # "und" (in both dictionaries) -- the same heuristic as above. The count
-    # above deliberately stays heuristic-only, so the code-switch RATE is
-    # measured identically for every source.
+    # human language tag wins where there is one ("cym"/"mixed" -> Welsh;
+    # any other language -- Siarad "eng", Patagonia "spa" -> not Welsh);
+    # otherwise -- Whisper output, and "und" (in both dictionaries) -- the
+    # same heuristic as above. The count above deliberately stays
+    # heuristic-only, so the code-switch RATE is measured identically for
+    # every source.
     for w in all_preprocessed:
         lang = w.get("_lang")
-        if lang == "eng":
-            w["_code_switch"] = True
-        elif lang in ("cym", "mixed"):
+        if lang in ("cym", "mixed"):
             w["_code_switch"] = False
+        elif lang not in (None, "und"):
+            w["_code_switch"] = True
         else:
             w["_code_switch"] = is_english_code_switch(w["word"], None)
 
@@ -1585,9 +1675,59 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
     enriched = enrich_words(all_preprocessed, checkpoint_key=checkpoint_key)
     _report_tagger_coverage(enriched)
 
+    # Everything detection needs besides the words -- saved with them (before
+    # detection marks anything on the word dicts) for later reruns.
+    context = {
+        "video_meta": {k: video_meta.get(k) for k in ("id", "title", "url", "source")},
+        "window": video_meta.get("_coverage_window"),
+        "tagged_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "tagging_version": pipeline_version(),
+        "video_duration_seconds": video_duration_seconds,
+        "language": language,
+        "language_probability": language_probability,
+        "video_word_count": video_word_count,
+        "video_codeswitch_word_count": video_codeswitch_word_count,
+        # [first word index, end index, start s, end s, text, speaker]
+        "segments": [[a, b, seg.start, seg.end, seg.text, getattr(seg, "speaker", None)]
+                     for a, b, seg in seg_boundaries],
+    }
+    if tagged_cache_path:
+        try:
+            save_tagged_cache(tagged_cache_path, enriched, context)
+        except Exception as e:
+            tqdm.write(f" ⚠️ Couldn't save the tagged words for later reruns ({e}) -- "
+                       f"this video's output is unaffected.")
+    return rows_from_enriched(enriched, seg_boundaries, video_meta, context, step=_step)
+
+
+def rows_from_tagged_cache(path):
+    """(the nine output row lists, the cache's context) for a saved tagged
+    word stream, produced by the CURRENT detection code -- nothing before
+    detection (Whisper, filters, contraction splitting, Cysill, spaCy,
+    lexicon tags) is redone. Used by mutation_rerun_rules.py."""
+    data = load_tagged_cache(path)
+    seg_boundaries = [(s[0], s[1], SimpleNamespace(start=s[2], end=s[3], text=s[4]))
+                      for s in data["segments"]]
+    rows = rows_from_enriched(data["words"], seg_boundaries, data["video_meta"], data,
+                              step=lambda label: None)
+    return rows, data
+
+
+def rows_from_enriched(enriched, seg_boundaries, video_meta, context, step=None):
+    """Detection: the output rows for a tagged word stream. The only part of
+    analyze_segments() a rerun repeats, so a rerun can't drift from a real
+    run. `context` is the dict analyze_segments() builds (and saves)."""
+    _step = step or (lambda label: print(f" {label}..."))
+    video_duration_seconds = context["video_duration_seconds"]
+    language = context["language"]
+    language_probability = context["language_probability"] or 0.0
+    video_word_count = context["video_word_count"]
+    video_codeswitch_word_count = context["video_codeswitch_word_count"]
+
     # Build output rows
     segment_rows, word_rows, lemma_rows, pos_rows, words_only = [], [], [], [], []
 
+    run_progress.phase("Looking up lemmas", total=len(enriched), unit="words")  # unversioned
     for seg_start, seg_end, seg in seg_boundaries:
         seg_text = seg.text.strip()
         segment_rows.append({
@@ -1606,6 +1746,7 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
 
         kept_before = len(words_only)
         for w in enriched[seg_start:seg_end]:
+            run_progress.advance()  # unversioned
             raw_word  = w["word"]
             norm_word = normalize_word(raw_word)
             # PATCH (found via direct phrase-test verification, then
@@ -1770,12 +1911,16 @@ def analyze_segments(segments, video_meta, *, video_duration_seconds, language,
             "video_codeswitch_word_count": video_codeswitch_word_count,
         })
 
-    # Which detection code produced these rows -- see corpus_io.pipeline_version().
+    # Which detection code produced these rows -- see corpus_io.pipeline_version()
+    # -- and which code tagged the words they come from. The two differ only
+    # after a rerun (mutation_rerun_rules.py), which redoes detection alone.
     version = pipeline_version()
+    tagging_version = context.get("tagging_version") or version
     for rows in (segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows,
                  prep_rows, plural_rows, numeral_rows, quantifier_rows):
         for row in rows:
             row["pipeline_version"] = version
+            row["tagging_version"] = tagging_version
 
     return segment_rows, word_rows, lemma_rows, pos_rows, mutation_rows, \
         prep_rows, plural_rows, numeral_rows, quantifier_rows

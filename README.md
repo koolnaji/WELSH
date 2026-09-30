@@ -239,7 +239,7 @@ not the padded extraction) -- see **Where your data ends up** below.
 
 This applies process-wide for the run, the same way a transcription
 preset does -- it's not a per-video or per-menu-choice setting. Both
-Queue & Processing -> b and Testing -> b respect it if set at launch.
+menu 2 (process the queue) and More tools -> d (local MP3s) respect it if set at launch.
 
 Applies only to already-downloaded/local audio -- it doesn't reduce
 what gets downloaded from YouTube first (that's still the full video).
@@ -339,7 +339,7 @@ reintroduce this behavior without warning.
 | `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. A missing key used to be completely silent; startup now prints a `Cysill:` status line, and every video prints a `Tagger coverage:` line with how many words spaCy, Cysill and the lexicon each covered. |
 | `BANGOR_LEXICON_PATH` | No | Full path to `lecsicon_cc0.txt` (see **Setup** step 5). Only needed if the file is not in the pipeline folder. It is tried first; then the loader looks next to `bangor_lexicon.py`, then in a `bangor_lexicon/` subfolder there, then in `./bangor_lexicon/`. If it points at a file that doesn't exist, startup prints a warning and uses the first copy it finds in those places. |
 | `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` | No | Authenticates yt-dlp's caption listing/download requests the same way a logged-in browser tab would. Audio downloads deliberately run without cookies and use them only as a fallback for videos that require sign-in (age gate, bot check, members-only) -- sending the cookie file on downloads produced persistent `HTTP Error 403` that went away without it (see `limitations.txt` Section 1.4). Note that yt-dlp writes cookies back into this file after every call, so point it at a copy used only by this pipeline, never your only export of a logged-in session. Channel discovery never uses cookies. YouTube rate-limits anonymous requests to its caption/timedtext endpoint hard (`HTTP Error 429: Too Many Requests`), and the resulting block has been reported to last on the order of hours -- authenticating avoids tripping it in the first place, rather than just retrying through it. `YTDLP_COOKIES_FILE` points at a `cookies.txt` (Netscape format, e.g. exported via a "Get cookies.txt LOCALLY" browser extension -- portable between machines, and the more reliable option on Windows, see below); `YTDLP_COOKIES_FROM_BROWSER` names a browser (`chrome`, `firefox`, ...) to read cookies live from instead, machine-local only. If both are set, the file wins. Leave both blank to run fully anonymous, exactly as before this existed. **Windows + Chrome-family browsers:** newer Chrome versions' "app-bound encryption" is known to break yt-dlp's live cookie decryption on Windows (see [yt-dlp#15401](https://github.com/yt-dlp/yt-dlp/issues/15401)) -- if `YTDLP_COOKIES_FROM_BROWSER=chrome` fails to decrypt, either try `firefox` instead or switch to `YTDLP_COOKIES_FILE`. |
-| `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after Queue & Processing -> b (Process queue) or Testing -> b (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
+| `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after menu 2 (Process the queue) or More tools -> d (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
 
 Never commit real values for any of these -- keep them in your actual
 environment/shell profile/`.env`, not in source files.
@@ -604,26 +604,28 @@ Two principles run through every exclusion:
 
 ## Workflow
 
-`welsh_pipeline.py`'s menu has three categories -- pick a number, then a
-letter. `q` at either level cancels back without losing anything already
-done.
+`welsh_pipeline.py` has one menu, in the order the work is usually done.
+Every action returns to it; `q` quits. The top line shows the queue size
+and the pipeline version.
 
-The usual path: **1a** (discover) -> **1b** (process queue) -> **1d**
-(review by hand) -> **2a** (generate figures).
+The usual paths:
+- **New YouTube data:** 1 (find) -> 2 (process) -> 5 (numbers).
+- **Siarad / Patagonia:** 3 -> 5.
+- **After changing detection code:** 4 (update results) -> 5.
 
-**1 -- Queue & Processing**
-- **a** Discover new videos -- scans `CURATED_CHANNELS` (in `corpus_io.py`) for anything new, adds it to `video_queue.json`. Doesn't download or transcribe. The batch is filled round-robin across sources (one item from each in turn), so no single channel fills it. Items under `MIN_EPISODE_SECONDS` (3 min: Shorts, trailers, promos, news stings) are skipped here when the source publishes a duration, and after download when it doesn't.
-- **b** Process queue -- transcribes, then runs all five detection branches (mutation, prep, numeral, plural, quantifier) and (YouTube sources only) caption-corroborates the mutation findings. Failed videos retry up to 3x (`failed_videos.json`) before being given up on. Sends a completion email if configured.
-- **c** Manage queue -- view, filter, or remove queued videos.
-- **d** Manually review mutations -- launches `mutation_manual_editing.py` (`--help` for its filtering options).
-- **e** Re-run mutation rule(s) -- launches `mutation_rerun_rules.py` to re-evaluate already-transcribed videos after a rule change, without re-transcribing or re-hitting Cysill.
+1. **Find new YouTube videos** -- scans `CURATED_CHANNELS` (in `corpus_io.py`) for anything new, adds it to `video_queue.json`. Doesn't download or transcribe. The batch is filled round-robin across sources (one item from each in turn), so no single channel fills it. Items under `MIN_EPISODE_SECONDS` (3 min: Shorts, trailers, promos, news stings) are skipped here when the source publishes a duration, and after download when it doesn't.
+2. **Process the queue** -- transcribes, then runs all five detection branches (mutation, prep, numeral, plural, quantifier) and caption-corroborates the mutation findings. Failed videos retry up to 3x (`failed_videos.json`). Sends a completion email if configured. The Whisper model size is asked once per session.
+3. **Process transcripts (Siarad / Patagonia / news)** -- `s`/`p`: `corpus_siarad.py` on `<data folder>/siarad` or `/patagonia` (or a path you type). `n`: `news_text.py` on the scraped Welsh news articles (found automatically: `NEWS_CORPUS_DIR`, else `Desktop\news_corpus` -- the scraper's fixed output folder -- plus older `Desktop\NEWS\news_corpus` / data-folder copies, in both `raw/cy/` and legacy `cy/raw/` layouts; Newyddion S4C and Y Cymro only, BBC skipped) -- each article becomes two text documents, narration (source `news-narration`) and quoted speech (`news-quote`), the no-ASR formal baseline and detector noise floor. Anything already done on the current version is skipped, so after a Cysill limit stop just choose it again.
+4. **Update all results after a code change** -- `mutation_rerun_rules.py` on every processed folder, all five branches, from the saved tagging: no re-transcription, no Cysill calls, manual reviews kept. Apply now or preview only. (Per-branch / per-folder / per-trigger filters: `python mutation_rerun_rules.py --help`.)
+5. **Show the numbers** -- the corpus analyzer: every branch's rate per corpus, figures, the erosion-vs-formality regression. Also `python corpus_analyzer.py`.
+6. **Precision audit** -- `audit_sample.py`: draw/refresh the Siarad audit sample, or score the verdicts.
+7. **More tools**
+   - **a** Manage the queue -- show (with per-channel counts), remove by number, add a URL, clear.
+   - **b** Review flagged erosions by hand -- `mutation_manual_editing.py` (`--help` for its filters).
+   - **c** Test a Welsh phrase -- no audio. Runs all five branches on the typed phrase; output in `phrase_tests/`. The menu loads the code once at startup -- restart it after changing any `.py` file.
+   - **d** Analyze local MP3 files -- asks **save** (real corpus) or **preview** (`mp3_previews/`, never marked processed).
 
-**2 -- Analysis**
-- **a** Run corpus analyzer -- merges every mutations file ever produced into corpus-wide figures + a summary, including the erosion-vs-formality regression (`corpus_formality.py`). Read-only; also runnable directly as `python corpus_analyzer.py`.
-
-**3 -- Testing**
-- **a** Test a Welsh phrase -- no audio, no transcription wait. Runs all five detection branches on the typed phrase. Output goes to `phrase_tests/`; a `mutations_*.csv` (or other branch file) is only written when that branch found at least one context. The menu loads the code once at startup -- restart it after changing any `.py` file, or you're testing the old code.
-- **b** Analyze local MP3 files -- point it at a folder of MP3s (no captions to corroborate against). Asks **save** (real corpus, same as 1b) or **preview** (writes to `mp3_previews/` instead, never marked processed) -- use preview to sanity-check an unfamiliar audio source before committing it.
+All three processing scripts stop at startup if the Bangor lexicon can't be loaded -- detection depends on it, and a run without it isn't comparable with the others.
 
 ## Where your data ends up
 
@@ -639,8 +641,8 @@ WELSH_ANALYSIS_DIR/
 │   │                                          processed (e.g. 20260928_081602_siarad-20,
 │   │                                          ..._youtube-3, ..._local-mp3)
 │   ├── research_summary_<stamp>.csv        session-level summaries, written by
-│   ├── erosion_by_trigger_type_<stamp>.csv   Queue & Processing -> b itself,
-│   ├── erosion_by_rule_<stamp>.csv           not Analysis -> a
+│   ├── erosion_by_trigger_type_<stamp>.csv   menu 2 (process the queue) itself,
+│   ├── erosion_by_rule_<stamp>.csv           not menu 5 (the analyzer)
 │   └── <slug>/                             one folder per video (or Siarad_<file>), from _video_slug()
 │       ├── segments_<stamp>_<slug>.csv     Whisper's segment-level transcript
 │       ├── words_<stamp>_<slug>.csv        word-level transcript + POS tags + per-word
@@ -672,23 +674,23 @@ WELSH_ANALYSIS_DIR/
 │                                               typically music/session recordings), split the same
 │                                               way per-video audio is, by a `_norm` filename marker
 ├── runs/_deleted/                          the pipeline's own soft-delete archive
-├── test_audio/                             drop local MP3s here for Testing -> b
-├── analysis/                               Analysis -> a's output: merged_mutations.csv,
+├── test_audio/                             drop local MP3s here for More tools -> d
+├── analysis/                               menu 5's output: merged_mutations.csv,
 │                                              utterance_export.csv, video_formality.csv and
 │                                              speaker_formality.csv (corpus_formality.py),
 │                                              and asr_divergence.csv
 │   └── figures/                              chart images, including erosion_vs_formality.png
 │                                              and erosion_vs_codeswitch.png
-├── phrase_tests/                           Testing -> a's ad-hoc "test a Welsh phrase"
+├── phrase_tests/                           More tools -> c's ad-hoc "test a Welsh phrase"
 │                                              output -- deliberately kept outside runs/ so it
 │                                              never gets swept into the real corpus by
-│                                              Analysis -> a or mutation_rerun_rules.py
-├── mp3_previews/                           Testing -> b's output when you choose "preview" instead
+│                                              menu 5 or mutation_rerun_rules.py
+├── mp3_previews/                           More tools -> d's output when you choose "preview" instead
 │                                              of "save" -- same quarantine idea as phrase_tests/,
 │                                              never marked processed, never swept into the corpus
-├── video_queue.json                        pending videos (Queue & Processing -> a adds, -> b consumes)
-├── processed_videos.json                   videos already handled by Queue & Processing -> b
-├── processed_local_mp3s.json               local files already saved via Testing -> b
+├── video_queue.json                        pending videos (menu 1 adds, menu 2 consumes)
+├── processed_videos.json                   videos already handled by menu 2
+├── processed_local_mp3s.json               local files already saved via More tools -> d
 ├── failed_videos.json                      videos that errored, with retry count
 └── lemma_cache.json                        word -> lemma lookups, cached across every run so
                                               repeat words (very common in Welsh function words)

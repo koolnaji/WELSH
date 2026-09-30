@@ -111,9 +111,18 @@ def _candidate_paths(path=None):
     user-level fix still sees it (2026-09-26). load() now falls through to
     the copy beside the code and says so loudly instead."""
     explicit = _explicit_path(path)
+    # Also the data folder (WELSH_ANALYSIS_DIR, default ~/welsh_analysis) and
+    # a bangor_lexicon/ folder beside the code folder: on 2026-09-29 the file
+    # had ended up in those two places only, so every run started from
+    # Desktop\WELSH after ~21:00 went without the lexicon -- the object rule
+    # produced no rows at all and "sy gynno" / "dyna basai" were scored again.
+    data_dir = Path(os.getenv("WELSH_ANALYSIS_DIR", str(Path.home() / "welsh_analysis"))).expanduser()
     defaults = [_MODULE_DIR / LEXICON_FILENAME,
                 _MODULE_DIR / "bangor_lexicon" / LEXICON_FILENAME,
+                data_dir / LEXICON_FILENAME,
+                _MODULE_DIR.parent / "bangor_lexicon" / LEXICON_FILENAME,
                 Path("bangor_lexicon") / LEXICON_FILENAME]
+    defaults.insert(3, _MODULE_DIR.parent.parent / "welsh_analysis" / LEXICON_FILENAME)  # unversioned
     return ([explicit] if explicit else []) + defaults
 
 # Matches one UD-style feature=value pair at a time, INCLUDING comma-

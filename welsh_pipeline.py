@@ -2,11 +2,12 @@
 welsh_pipeline.py
 ===========
 Thin entry point / CLI. This is the only file you run directly. It owns
-the interactive menu loop (analyze local MP3s, discover videos, process
-the queue, test a phrase, manage the queue, run the corpus analyzer,
-manually review mutations) and session-level state like the loaded
-Whisper model -- all the actual linguistics and corpus I/O live in
-mutation_engine.py and corpus_ops.py.
+the interactive menu (find videos, process the queue, process Siarad /
+Patagonia, update results after a code change, corpus analyzer, precision
+audit; queue manager, hand review, phrase test and local MP3s under "More
+tools") and session-level state like the loaded Whisper model -- all the
+actual linguistics and corpus I/O live in mutation_engine.py and
+corpus_ops.py.
 
 For queue-processed (YouTube) videos, caption corroboration
 (mutation_captions.py) now runs automatically per video: captions are fetched
@@ -42,7 +43,7 @@ from corpus_io import (
     load_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
     append_output_csv, cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
-    pipeline_version, set_session_label,
+    pipeline_version, set_session_label, keep_awake,
 )
 from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
@@ -52,6 +53,8 @@ from corpus_ops import (
     MIN_EPISODE_SECONDS, _probe_duration_seconds,
 )
 import corpus_analyzer
+from output_merge import merge_with_previous, copy_previous_captions
+from run_progress import VideoProgress
 # PATCH: fetch_captions is now a normal top-level import rather than
 # lazy-imported inside a menu branch -- it's no longer an optional manual
 # step (former option 8), it's part of the standard choice-3 video loop
@@ -61,33 +64,35 @@ import mutation_captions as fetch_captions
 import csv
 import pandas as pd
 import time
+from pathlib import Path
 
 # ========================= MAIN =========================
 
 # ========================= QUEUE MANAGER =========================
 def manage_queue():
-    """Interactive queue management submenu."""
+    """Queue manager: show, remove, add, clear. (The per-channel removal and
+    filter options were dropped 2026-09-30 as unused; "show" now opens with
+    the per-channel counts that used to be a separate option.)"""
     while True:
         queue = load_queue()
-        print(f"\n── Queue Manager ({len(queue)} videos) ──────────────────")
+        print(f"\n── Queue ({len(queue)} videos) ──")
         print("  a = Show queue")
-        print("  b = Remove videos by index")
-        print("  c = Remove videos by channel/source")
-        print("  d = Filter queue to specific channels only")
-        print("  e = Clear entire queue")
-        print("  f = Add a single YouTube URL")
-        print("  g = Show channel breakdown")
-        print("  q = Back to main menu")
+        print("  b = Remove videos by number")
+        print("  c = Add a YouTube URL")
+        print("  d = Clear the whole queue")
+        print("  q = Back")
         cmd = input("Choice: ").strip().lower()
 
         if cmd == "q":
-            print("Returning to main menu...")
             break
 
         elif cmd == "a":
             if not queue:
                 print("  Queue is empty.")
             else:
+                from collections import Counter
+                counts = Counter(channel_display_name(v.get("source", "?")) for v in queue)
+                print("  " + ", ".join(f"{name}: {n}" for name, n in counts.most_common()))
                 print(f"\n  {'#':<5} {'Title':<50} {'Source'}")
                 print("  " + "-" * 95)
                 for i, v in enumerate(queue):
@@ -133,64 +138,7 @@ def manage_queue():
             save_queue(new_queue)
             print(f"  Removed {removed} video(s). Queue now has {len(new_queue)}.")
 
-        elif cmd == "c":
-            if not queue:
-                print("  Queue is empty.")
-                continue
-            # show unique sources
-            sources = sorted(set(v.get("source", "?") for v in queue))
-            print("\n  Sources in queue:")
-            for i, s in enumerate(sources):
-                count = sum(1 for v in queue if v.get("source") == s)
-                # PATCH: show the friendly name (channel_display_name)
-                # alongside the raw URL -- `sources` itself still holds
-                # the real URL, since that's what the removal logic
-                # below matches against.
-                print(f"  {i}  {channel_display_name(s):<32} {s}  ({count} videos)")
-            raw = input("  Enter source indices to remove: ").strip()
-            if not raw:
-                continue
-            try:
-                idxs = {int(x) for x in raw.split()}
-                remove_sources = {sources[i] for i in idxs if i < len(sources)}
-            except ValueError:
-                print("  Invalid input.")
-                continue
-            new_queue = [v for v in queue if v.get("source") not in remove_sources]
-            removed = len(queue) - len(new_queue)
-            save_queue(new_queue)
-            print(f"  Removed {removed} video(s) from {len(remove_sources)} source(s). "
-                  f"Queue now has {len(new_queue)}.")
-
         elif cmd == "d":
-            if not queue:
-                print("  Queue is empty.")
-                continue
-            sources = sorted(set(v.get("source", "?") for v in queue))
-            print("\n  Sources in queue:")
-            for i, s in enumerate(sources):
-                count = sum(1 for v in queue if v.get("source") == s)
-                # PATCH: show the friendly name (channel_display_name)
-                # alongside the raw URL -- `sources` itself still holds
-                # the real URL, since that's what the removal logic
-                # below matches against.
-                print(f"  {i}  {channel_display_name(s):<32} {s}  ({count} videos)")
-            raw = input("  Enter indices of sources to KEEP (all others will be removed): ").strip()
-            if not raw:
-                continue
-            try:
-                idxs = {int(x) for x in raw.split()}
-                keep_sources = {sources[i] for i in idxs if i < len(sources)}
-            except ValueError:
-                print("  Invalid input.")
-                continue
-            new_queue = [v for v in queue if v.get("source") in keep_sources]
-            removed = len(queue) - len(new_queue)
-            save_queue(new_queue)
-            print(f"  Kept {len(keep_sources)} source(s), removed {removed} video(s). "
-                  f"Queue now has {len(new_queue)}.")
-
-        elif cmd == "e":
             if not queue:
                 print("  Queue is already empty.")
                 continue
@@ -201,7 +149,7 @@ def manage_queue():
             else:
                 print("  Cancelled.")
 
-        elif cmd == "f":
+        elif cmd == "c":
             url = input("  YouTube URL or video ID: ").strip()
             if not url:
                 continue
@@ -226,30 +174,21 @@ def manage_queue():
             except Exception as e:
                 print(f"  Failed to fetch video info: {e}")
 
-        elif cmd == "g":
-            if not queue:
-                print("  Queue is empty.")
-                continue
-            from collections import Counter
-            # PATCH (Phase 3): register-level rollup removed -- that hand-
-            # assigned label is gone. See corpus_formality.py for the
-            # grounded, per-video replacement (computed after
-            # transcription, so it has nothing to show for a still-queued,
-            # unprocessed video anyway).
-            sources = [channel_display_name(v.get("source", "?")) for v in queue]
-            counts  = Counter(sources).most_common()
-            print(f"\n  {'Channel':<40} {'Videos':>7}")
-            print("  " + "-" * 48)
-            for s, n in counts:
-                print(f"  {s:<40} {n:>7}")
-            print("  " + "-" * 48)
-            print(f"  {'TOTAL':<40} {len(queue):>7}")
-
         else:
             print("  Unknown command.")
 
 def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     ensure_dirs()
+    # Which data folder and Windows account this run uses -- a cmd window
+    # running as another account (C:\Users\등록관리자, 2026-09-30) doesn't see
+    # the setx variables (Cysill key!) set under the account that owns the data.
+    print(f"Data folder: {BASE_DIR}   (running as: {Path.home().name})")
+    parts = [p.lower() for p in BASE_DIR.resolve().parts]
+    owner = parts[parts.index("users") + 1] if "users" in parts[:-1] else None
+    if owner and owner != Path.home().name.lower():
+        print("⚠️  This window is running as a different Windows account from the one that "
+              "owns the data. Its setx variables (Cysill key, lexicon path) are not visible "
+              "here -- open cmd normally (not 'Run as administrator') under your own account.")
     # PATCH: resolves and confirms the transcription preset once, up front,
     # rather than silently inside analyze() on the first call. preset=None
     # (no CLI arg given) falls back to DEFAULT_TRANSCRIBE_PRESET, which is
@@ -279,11 +218,12 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     load_lemma_cache()
     print("Loading Welsh dependency parser...")
     load_spacy()
-    # PATCH: optional offline lookup that reduces live Cysill traffic --
-    # see load_bangor_lexicon()'s own docstring for why this is called
-    # once here rather than lazily. A missing file just means "run
-    # exactly as before this existed", not a startup failure.
-    load_bangor_lexicon()
+    # Called once here rather than lazily -- see load_bangor_lexicon()'s
+    # docstring. Required since detection started reading it live (object
+    # rule, bod/preposition guards, number): the YouTube run of 2026-09-29
+    # 22:27 went without it and its rows aren't comparable (2026-09-30).
+    if not load_bangor_lexicon():
+        raise SystemExit("Stopped: the Bangor lexicon is required (see the message above).")
     print(cysill_status_line())
     print(f"Pipeline version: {pipeline_version()}")
 
@@ -294,12 +234,12 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     current_model_size = None
 
     def _ensure_model():
+        """Loads Whisper the first time it's needed and keeps it for the
+        session -- no "switch models?" question before every run any more;
+        restart the program to use a different size."""
         nonlocal model, current_model_size
         if model is not None:
-            switch = input(f"  Current Whisper model: {current_model_size}. "
-                           "Switch models? (y/N): ").strip().lower()
-            if switch != "y":
-                return model
+            return model
         print()
         model_size = input("Enter model (small / medium / large-v3 / large-v3-turbo) "
                            "[default: small]: ").strip() or "small"
@@ -318,125 +258,60 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
         print("✅ Whisper model loaded!\n")
         return model
 
-    # PATCH: the whole menu now lives inside a loop so every choice -- not
-    # just option 5 -- returns to the menu afterward. Only an explicit "q"
-    # (at either menu level) breaks out and ends the program.
-    #
-    # PATCH: the menu was flattened across 8 numbered options, which got
-    # crowded and gave no sense of which options are related. Restructured
-    # into three themed categories -- Queue & Processing, Analysis,
-    # Testing -- each with its own sub-menu. Deliberately minimal-risk:
-    # every original numbered option still maps to the exact same `choice`
-    # value it always did (CATEGORY_MENUS below), so the entire if/elif
-    # chain that follows (all the actual per-option logic) is completely
-    # untouched -- only how a person navigates to a given `choice` value
-    # changed, not what any `choice` value does.
-    #
-    # PATCH: category labels/descriptions and each sub-menu's options now
-    # live in one data structure (CATEGORY_MENUS) instead of separate
-    # hand-spaced print() calls -- the previous version's column alignment
-    # drifted out of sync by eye (e.g. "Queue & Processing" vs "Analysis"
-    # landing their descriptions one character apart) because nothing
-    # actually computed a shared column width; it just hoped hand-counted
-    # spaces matched. The "=" border below gives each menu a clearer visual
-    # edge instead of blending into whatever printed just above it.
-    #
-    # NOTE: an earlier version of this also cleared the terminal between
-    # menu transitions -- reverted (see PATCH note near _print_top_menu):
-    # it swapped screens faster than a person could actually read the
-    # previous one's output before it vanished.
-    # PATCH: dropped the parenthetical descriptions after each label --
-    # README.md now documents what every option does, so repeating it here
-    # was redundant and (at typical half-screen terminal widths) is what
-    # caused wrapping in the first place, e.g. option "e"'s description
-    # wrapping mid-word onto a second line. Bare labels only; details live
-    # in one place (the README) instead of two that can drift apart.
-    CATEGORY_MENUS = {
-        "1": {
-            "title": "Queue & Processing",
-            "options": [
-                ("a", "Discover new videos"),
-                ("b", "Process queue"),
-                ("c", "Manage queue"),
-                ("d", "Manually review mutations"),
-                ("e", "Re-run mutation rule(s)"),
-            ],
-            "choice_map": {"a": "2", "b": "3", "c": "5", "d": "7", "e": "8"},
-        },
-        "2": {
-            "title": "Analysis",
-            "options": [
-                ("a", "Run corpus analyzer"),
-            ],
-            "choice_map": {"a": "6"},
-        },
-        "3": {
-            "title": "Testing",
-            "options": [
-                ("a", "Test a Welsh phrase"),
-                ("b", "Analyze local MP3 files"),
-            ],
-            "choice_map": {"a": "4", "b": "1"},
-        },
-    }
+    # One flat menu in the order the work is usually done; rarely used tools
+    # sit under "More tools" (2026-09-30 -- replaced the three-category
+    # menu, which took two keypresses for everything). Each entry maps to
+    # the internal choice code the if/elif chain below handles; the codes
+    # are the old option numbers, so that chain didn't have to move.
+    MAIN_MENU = [
+        ("1", "Find new YouTube videos",                "2"),
+        ("2", "Process the queue",                      "3"),
+        ("3", "Process transcripts (Siarad / Patagonia / news)", "9"),
+        ("4", "Update all results after a code change", "8"),
+        ("5", "Show the numbers (corpus analyzer)",     "6"),
+        ("6", "Precision audit",                        "10"),
+        ("7", "More tools",                             None),
+    ]
+    MORE_MENU = [
+        ("a", "Manage the queue",                "5"),
+        ("b", "Review flagged erosions by hand", "7"),
+        ("c", "Test a Welsh phrase",             "4"),
+        ("d", "Analyze local MP3 files",         "1"),
+    ]
+    MENU_WIDTH = 60   # fits a half-screen terminal without wrapping
 
-    # PATCH: was 78 -- still wrapped on a half-screen-width terminal (the
-    # explicit goal here), since a split/half window is commonly narrower
-    # than that even before accounting for the terminal's own margins.
-    # 60 comfortably fits a half-screen window at a normal font size.
-    MENU_WIDTH = 60
-
-    def _border():
+    def _menu(entries, title, back_label):
+        """Prints a menu and returns the chosen entry's code, "q", or None."""
         print("=" * MENU_WIDTH)
-
-    def _print_top_menu():
-        _border()
-        for k, m in CATEGORY_MENUS.items():
-            print(f"{k} = {m['title']}")
-        print("q = Quit")
-        _border()
-
-    def _print_sub_menu(category):
-        m = CATEGORY_MENUS[category]
-        print(f"-- {m['title']} --")
-        for key, label in m["options"]:
-            print(f"  {key} = {label}")
-        print("  q = Back to main menu")
-        _border()
+        print(title)
+        print("-" * MENU_WIDTH)
+        for key, label, _ in entries:
+            print(f"  {key}  {label}")
+        print(f"  q  {back_label}")
+        print("=" * MENU_WIDTH)
+        key = input("Choice: ").strip().lower()
+        if key == "q":
+            return "q"
+        return next((code or "more" for k, _, code in entries if k == key), None)
 
     while True:
-        _print_top_menu()
-        category = input("Enter 1, 2, 3, or q: ").strip().lower()
-
-        if category == "q":
+        choice = _menu(MAIN_MENU, f"Welsh pipeline  |  queue: {len(load_queue())} videos"
+                                  f"  |  version {pipeline_version()}", "Quit")
+        if choice == "q":
             print("Goodbye!")
             save_lemma_cache()
             return
-
-        if category not in CATEGORY_MENUS:
+        if choice == "more":
+            choice = _menu(MORE_MENU, "More tools", "Back")
+            if choice == "q":
+                continue
+        if choice is None:
             print("Unknown choice.")
             continue
 
-        # PATCH: this used to fall all the way back out to the main
-        # category menu after every single action -- annoying when doing
-        # several related things in a row (e.g. discover, then process).
-        # Now it loops back to THIS category's sub-menu instead; only an
-        # explicit "q" here returns to the main menu. Everything from
-        # here down to the end of the if/elif chain now lives one level
-        # deeper inside this loop, so every existing "continue" inside a
-        # branch already does the right thing automatically -- it
-        # continues this sub-menu loop, not the outer one.
-        while True:
-            _print_sub_menu(category)
-            sub_choice = input("Choice: ").strip().lower()
-
-            if sub_choice == "q":
-                break
-
-            choice = CATEGORY_MENUS[category]["choice_map"].get(sub_choice)
-            if choice is None:
-                print("Unknown choice.")
-                continue
+        # One pass per action: a "continue" inside a branch below ends the
+        # action and returns to the menu, as does reaching the end.
+        for _action in range(1):
 
             stamp = run_stamp()
             all_mutation_rows = []
@@ -533,10 +408,13 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     # got written (e.g. a disk-write error in append_output_csv()).
                     vpaths = None
                     try:
-                        with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
-                        all_mutation_rows.extend(muts)
+                        # Folder first, so analyze() can save the tagged words
+                        # there (mutation_rerun_rules.py); a failed attempt's
+                        # empty folder is removed by the except block below.
                         vpaths = _video_slug(meta, stamp) if save_results else _preview_video_slug(meta, stamp)
+                        with VideoProgress() as sub:
+                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants, dur = analyze(str(p), model, meta, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds, tagged_cache_path=vpaths.get("tagged"))
+                        all_mutation_rows.extend(muts)
                         outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants]
                         h = [True] * len(outputs)   # fresh header flags per video (new file each time)
                         any_written = False
@@ -558,6 +436,13 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         if not any_written:
                             tqdm.write(f"  ⚠️  {p.stem}: 0 segments survived filtering -- "
                                        f"nothing saved for this video (folder created but empty).")
+                        elif save_results:
+                            # same one-folder-per-video merge as the queue loop
+                            try:
+                                merge_with_previous(vpaths, meta["url"], meta.get("_coverage_window"))
+                            except Exception as e:
+                                tqdm.write(f"  ⚠️ Merge with earlier output failed ({e}) -- this "
+                                           f"run's output is saved on its own; earlier folders untouched.")
                         if save_results:
                             stat = p.stat()
                             local_processed[str(p.resolve())] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -652,6 +537,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 nlp = spacy_tagging.SPACY_NLP if load_spacy() else None
                 keys = ["segments", "words", "lemmas", "pos", "mutations", "prep_mutations",
                         "plural_mutations", "numeral_mutations", "quantifier_mutations"]
+                keep_awake()   # released after the loop, below
                 for video in tqdm(videos_to_process, desc="Videos", unit="video"):
                     # PATCH: defined before the try block (not just inside it)
                     # so the except block below can tell whether _video_slug()
@@ -677,6 +563,13 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                         # directories, it doesn't depend on anything analyze()
                         # produces.
                         vpaths = _video_slug(video, stamp)
+                        # A re-run of a video processed before: reuse its saved
+                        # captions (whole-video files) instead of asking YouTube
+                        # again -- the cached-.vtt branch below picks them up.
+                        try:
+                            copy_previous_captions(video["url"], vpaths["captions_dir"])
+                        except Exception as e:
+                            tqdm.write(f"  ⚠️ Couldn't reuse earlier captions: {e}")
                         # PATCH: fetch captions FIRST, before transcription --
                         # this is "getting transcription data and validating
                         # it" as one step, not transcribe-now/validate-later.
@@ -751,8 +644,8 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             processed.add(video["id"])
                             save_processed(processed)
                             continue
-                        with tqdm(total=4, desc="Starting", leave=False, unit="step") as sub:
-                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds)
+                        with VideoProgress() as sub:
+                            segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants, dur = analyze(mp3_path, model, video, substeps=sub, preset=active_preset, sample_seconds=active_sample_seconds, skip_seconds=active_skip_seconds, tagged_cache_path=vpaths["tagged"])
                         all_mutation_rows.extend(muts)
                         outputs = [segs, words, lemmas, pos_r, muts, preps, plurs, nums, quants]
                         h = [True] * len(outputs)   # fresh header flags per video (new file each time)
@@ -769,6 +662,18 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             tqdm.write(f"  ⚠️  {video.get('title', video['id'])}: 0 segments "
                                        f"survived filtering -- nothing saved for this video "
                                        f"(folder created but empty).")
+                        else:
+                            # One folder per video: fold any earlier output of
+                            # this video into this run's folder (see
+                            # output_merge.py). Before corroboration, so the
+                            # corroborated file covers the merged rows. A run
+                            # that saved nothing leaves earlier output alone.
+                            try:
+                                merge_with_previous(vpaths, video["url"],
+                                                    video.get("_coverage_window"))
+                            except Exception as e:
+                                tqdm.write(f"  ⚠️ Merge with earlier output failed ({e}) -- this "
+                                           f"run's output is saved on its own; earlier folders untouched.")
 
                         # PATCH: corroborate immediately, same run -- mutations
                         # + words for this video were just written above, so
@@ -816,6 +721,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             save_processed(processed)
                             tqdm.write("  Retry limit reached; marked as processed. See failed_videos.json for details.")
                     time.sleep(2.0)   # rate limit buffer + session stabilization between videos
+                keep_awake(False)
                 save_queue(retry_queue + remaining_queue)
 
             elif choice == "4":
@@ -880,43 +786,68 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 continue   # skip video-processing summary + email -- nothing was processed here
 
             elif choice == "8":
-                # PATCH: mutation_rerun_rules.py re-evaluates already-cached
-                # tagging data (re-parsing spaCy fresh per segment, reusing
-                # cached Cysill fields, never re-transcribing or re-hitting
-                # Cysill) after a change to a rule in mutation_engine.py or a
-                # table in mutation_tables.py -- see mutation_rerun_rules.py's
-                # module docstring for exactly what it does and doesn't touch.
-                # Unlike choice 7, this genuinely has no sensible default
-                # (there's no "just rerun everything" mode by design -- that's
-                # what choice 3 is for), so the filter has to be gathered here
-                # rather than falling through to a documented default the way
-                # mutation_manual_editing.py's does.
+                # Re-runs all five branches on every processed folder from its
+                # saved tagging (mutation_rerun_rules.py): no transcription, no
+                # Cysill calls; manual reviews are carried over or set aside,
+                # never lost. One question instead of five -- the per-branch,
+                # per-trigger and per-folder filters are still on the command
+                # line (python mutation_rerun_rules.py --help).
                 import mutation_rerun_rules
-                print("\nRe-run mutation rule(s) on already-transcribed videos.")
-                print("Leave both blank to cancel -- at least one is required.")
-                trig_input = input("Trigger word(s), comma-separated (e.g. yn,ei) [blank = any]: ").strip()
-                rule_input = input("Rule name(s), comma-separated (e.g. word_trigger) [blank = any]: ").strip()
-                if not trig_input and not rule_input:
-                    print("Nothing specified -- cancelled.")
-                    save_lemma_cache()
+                print("\nUpdates every processed video and conversation with the current "
+                      "detection code.\nNo re-transcription, no Cysill calls; your manual "
+                      "reviews are kept.")
+                mode = input("Apply now (y), preview only (p), or cancel (n)? [y]: ").strip().lower() or "y"
+                if mode not in ("y", "p"):
+                    print("Cancelled -- nothing was written.")
                     continue
-                video_input = input("Video folder-name substring to limit to [default: all]: ").strip() or "all"
-                mode_input = input("Write a comparison file first, or apply in place? "
-                                   "(compare/apply) [compare]: ").strip().lower()
-                commit = mode_input == "apply"
-                if commit:
-                    confirm = input("This will overwrite matching rows in the real mutations "
-                                    "CSVs (manual-reviewed rows are always protected). "
-                                    "Type 'yes' to continue: ").strip().lower()
-                    if confirm != "yes":
-                        print("Cancelled -- nothing was written.")
-                        save_lemma_cache()
-                        continue
-                mutation_rerun_rules.run_rerun(trigger_arg=trig_input or None,
-                                       rule_arg=rule_input or None,
-                                       video=video_input, commit=commit)
+                if mutation_rerun_rules.run_rerun(trigger_arg=None, rule_arg=None, video="all",
+                                                  commit=(mode == "y"), branches=None) and mode == "y":
+                    print("Done. Choose 5 to see the updated numbers.")
                 save_lemma_cache()
                 continue   # skip video-processing summary + email -- nothing was transcribed here
+
+            elif choice == "9":
+                # corpus_siarad.py on the Siarad or Patagonia folder. Finished
+                # conversations (current version, Cysill-tagged) are skipped, so
+                # after a Cysill limit stop just choose this again.
+                import corpus_siarad
+                import news_text
+                print("\n  s = Siarad   p = Patagonia   n = News articles (text baseline)"
+                      "\n  (or type the path to a .cha file / folder)")
+                raw = input("Corpus [s]: ").strip()
+                if raw.lower() == "n":
+                    # news_text finds the scraper's news_corpus folder(s) itself
+                    runner, args = news_text.main, []
+                else:
+                    target = {"": BASE_DIR / "siarad", "s": BASE_DIR / "siarad",
+                              "p": BASE_DIR / "patagonia"}.get(raw.lower(), Path(raw))
+                    if not target.exists():
+                        print(f"  Not found: {target}")
+                        continue
+                    runner, args = corpus_siarad.main, [str(target)]
+                keep_awake()
+                try:
+                    runner(args)
+                except SystemExit:
+                    pass
+                finally:
+                    keep_awake(False)
+                save_lemma_cache()
+                continue
+
+            elif choice == "10":
+                # audit_sample.py: draw a seeded sample to judge, or score the
+                # verdicts (Siarad). Other sources: python audit_sample.py --source ...
+                import audit_sample
+                print("\n  a = Draw / refresh the audit sample   b = Score the verdicts")
+                sub = input("Choice [b]: ").strip().lower() or "b"
+                if sub == "a":
+                    audit_sample.draw("siarad", force=False)
+                elif sub == "b":
+                    audit_sample.score("siarad")
+                else:
+                    print("Unknown choice.")
+                continue
 
             else:
                 print("Unknown choice.")

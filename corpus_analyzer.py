@@ -1447,8 +1447,12 @@ def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, m
         pts["erosion_rate_pct"] = pts["erosion_rate"] * 100
         sns.regplot(data=pts, x="f_score", y="erosion_rate_pct", ax=ax, scatter=False,
                     line_kws={"color": "#C44E52"})
-        kind = pts["source"].eq("siarad").map({True: "Siarad (human transcript)",
-                                               False: "Whisper transcript"})
+        kind = pts["source"].map({"siarad": "Siarad (human transcript)",
+                                  "patagonia": "Patagonia (human transcript)",
+                                  "news-narration": "News articles: narration (text)",
+                                  "news-quote": "News articles: interview quotes (text)",
+                                  "news-statement": "News articles: press statements (text)"}
+                                 ).fillna("Whisper transcript")
         for name, grp in pts.groupby(kind):
             ax.scatter(grp["f_score"], grp["erosion_rate_pct"], s=grp["contexts"].clip(upper=200),
                        alpha=0.6, label=name)
@@ -1502,8 +1506,10 @@ def fig_branches_by_formality_band(branch_rows, formality_df, keys, filename, un
             low, high = _wilson_interval(k, n)
             xs.append(band + offset)
             ys.append(100 * k / n)
-            lo.append(100 * (k / n - low))
-            hi.append(100 * (high - k / n))
+            # clamp: at k=0 (or k=n) float rounding can leave the bound a
+            # hair past the point estimate, and errorbar rejects negatives
+            lo.append(max(0.0, 100 * (k / n - low)))
+            hi.append(max(0.0, 100 * (high - k / n)))
             ns.append(n)
         ax.errorbar(xs, ys, yerr=[lo, hi], marker="o", capsize=4,
                     linestyle="--" if prediction == "resist" else "-",
@@ -1738,6 +1744,15 @@ def main():
         n_video = rows["video_url"].nunique() if not rows.empty else 0
         rate = f"{rows['is_erosion'].mean():.1%}" if not rows.empty else "n/a"
         print(f"  {label:<26} {len(rows):>6,} evaluable contexts, {n_video:>4} videos, erosion {rate}")
+        # the pooled line mixes corpora with very different speakers
+        # (Patagonia = mostly learners/heritage speakers), so report each too
+        if not rows.empty and "source" in rows.columns:
+            kind = rows["source"].where(rows["source"].isin(
+                ["siarad", "patagonia", "news-narration", "news-quote", "news-statement"]),
+                "youtube")
+            for name, grp in rows.groupby(kind):
+                print(f"      {name:<22} {len(grp):>6,} contexts, {grp['video_url'].nunique():>4} videos, "
+                      f"erosion {grp['is_erosion'].mean():.1%}")
         report_pipeline_versions(rows, label)
     if not formality_df.empty:
         fig_branches_vs_formality(branch_rows, formality_df, ["video_url"],

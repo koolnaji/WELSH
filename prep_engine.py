@@ -97,6 +97,47 @@ def _before_verb_noun(words_list, target):
     return _is_verb(nxt)
 
 
+# Words "o" can mean "of" after besides nouns and numerals: quantities and
+# the superlative in "rhan fwya o".
+PARTITIVE_HEADS = {"lot", "llawer", "lawer", "rhan", "fwya", "mwya", "dipyn", "gweddill",
+                   "rhai", "rhei", "rei", "un", "dau", "ddau", "dwy", "ddwy", "cannoedd",
+                   "miloedd", "llwyth", "llwythi", "digon", "faint", "gormod", "ormod",
+                   "mwy", "fwy", "llai", "lai", "cymaint", "gymaint", "llond", "loads"}
+
+# What follows "o fi" / "o chdi" when it's o'n i / o'ch chdi (I was / were
+# you): the rest of the verb phrase. After the first fix, all 5 left in the
+# Siarad run were this -- "yeah o fi wedi wneud", "pryd o fi yn mynd", "bob
+# ffordd o chdi yn mynd" -- where the word before happened to be tagged NOUN.
+VERBAL_AFTER_PRONOUN = {"yn", "wedi", "ddim", "dim", "heb", "isio", "eisiau", "erioed",
+                        "byth", "just", "am"}
+
+
+def _o_can_mean_of(words_list, i):
+    """True when the word before "o" is one it can be "of" after: a noun,
+    numeral or quantity word ("un o fi", "llun o fi"). Otherwise "o fi" /
+    "o chdi" is the past of bod -- o'n i / o'ch chdi (I was / were you),
+    transcribed without the apostrophe: 6 of 50 flagged prep erosions in
+    the Siarad audit (2026-09-29), all confirmed by the transcribers'
+    English ("because o fi yn y party" = because I was at this party)."""
+    k = i - 1
+    while k >= 0 and words_list[k].get("synthetic"):
+        k -= 1
+    if k < 0 or words_list[k].get("_clause_boundary_after"):
+        return False
+    prev = words_list[k]
+    prev_norm = normalize_word(prev["word"])
+    if prev_norm == "gloch":    # "faint o gloch o chdi adre" (what time were you home)
+        return False
+    if prev_norm in PARTITIVE_HEADS:
+        return True
+    # An English word before it is a discourse word, not a head: "(be)cause@s
+    # o fi yn y party" -- spaCy tags "because" NOUN.
+    if prev.get("_lang") not in (None, "cym", "mixed", "und") or prev.get("_code_switch"):
+        return False
+    return (tagged_as(prev, "NOUN", ("N",))
+            or tagged_as(prev, "PROPN", ("N",)) or tagged_as(prev, "NUM", ("CARD",)))
+
+
 def _find_pronoun_target(i, words_list):
     """Lookahead for the next non-filler, non-synthetic word -- mirrors
     mutation_engine._find_lookahead_target's shape (same reasoning: absorb
@@ -154,6 +195,11 @@ def process_preposition_erosion(words_list):
     for i, current_node in enumerate(words_list):
         if current_node.get("synthetic") or was_consumed(current_node):
             continue
+        # Tagged as another language by a transcriber (Patagonia "o@s:spa" =
+        # Spanish "or"): not a Welsh preposition -- same rule as the mutation
+        # branch's triggers.
+        if current_node.get("_lang") not in (None, "cym", "mixed", "und"):
+            continue
         conf = current_node.get("confidence", 0.0)
         if conf < 0.65:
             continue
@@ -183,6 +229,12 @@ def process_preposition_erosion(words_list):
         person = _person_for_pronoun(target_norm)
         if person is None:
             continue  # next word isn't a recognized independent pronoun -- not this phenomenon
+        if norm == "o" and target_norm in ("fi", "chdi"):
+            after = i + lookahead + 1
+            verbal_next = (after < len(words_list) and not target.get("_clause_boundary_after")
+                           and normalize_word(words_list[after]["word"]) in VERBAL_AFTER_PRONOUN)
+            if verbal_next or not _o_can_mean_of(words_list, i):
+                continue  # o'n i / o'ch chdi, see _o_can_mean_of and VERBAL_AFTER_PRONOUN
         # "i", "o", "ni", "fi" are also pronouns/particles/interjections, so the
         # word after the preposition must actually be tagged as a pronoun --
         # applied to correct AND eroded cases alike, so it can't tilt the rate.

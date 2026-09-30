@@ -54,8 +54,25 @@ from youtube_access import configure as configure_youtube_access
 # Keep data outside the source tree so the program can be copied, installed,
 # or run from any working directory. Set WELSH_ANALYSIS_DIR to override this
 # location (for example, to use an external drive or a shared project folder).
-BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR",
-                                   str(Path.home() / "welsh_analysis"))).expanduser()
+#
+# Without the variable, the welsh_analysis folder of the user whose Desktop
+# holds this code (C:\Users\김지안\welsh_analysis for Desktop\WELSH) comes
+# first, not the CURRENT user's home: on the school laptop cmd can run as a
+# different Windows account (C:\Users\등록관리자, 2026-09-30), whose home has
+# no data -- the pipeline then silently worked on an empty folder.
+CODE_DIR      = Path(__file__).resolve().parent
+_OWNER_HOME   = CODE_DIR.parent.parent          # ...\<user>\Desktop\WELSH -> ...\<user>
+
+
+def _default_data_dir():
+    for candidate in (_OWNER_HOME / "welsh_analysis", Path.home() / "welsh_analysis"):
+        if candidate.is_dir():
+            return candidate
+    return Path.home() / "welsh_analysis"
+
+
+BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR", "").strip()
+                     or str(_default_data_dir())).expanduser()
 configure_youtube_access(BASE_DIR)
 
 # PATCH: restructured from five separate top-level folders (audio/,
@@ -389,6 +406,8 @@ def _video_slug(meta, stamp):
         "plural_mutations": video_dir / f"plural_mutations_{folder_name}.csv",
         "numeral_mutations": video_dir / f"numeral_mutations_{folder_name}.csv",
         "quantifier_mutations": video_dir / f"quantifier_mutations_{folder_name}.csv",
+        # the tagged word stream, for mutation_rerun_rules.py (save_tagged_cache)
+        "tagged": video_dir / f"tagged_{folder_name}.json.gz",
         "captions_dir": video_dir,
         "audio_dir":    video_dir,
     }
@@ -446,7 +465,8 @@ def source_kind(source):
     """Short platform name for a video's "source" (channel/feed URL, or the
     marker Siarad/local-MP3 runs set)."""
     s = str(source or "").lower()
-    for marker, kind in (("siarad", "siarad"), ("youtube", "youtube"), ("youtu.be", "youtube"),
+    for marker, kind in (("siarad", "siarad"), ("patagonia", "patagonia"),
+                         ("youtube", "youtube"), ("youtu.be", "youtube"),
                          ("spreaker", "spreaker"), ("fireside", "fireside"),
                          ("anchor.fm", "anchor"), ("spotify", "anchor"), ("ypod", "ypod")):
         if marker in s:
@@ -542,6 +562,12 @@ _pipeline_version = None
 # a pointless redo of all 69 Siarad conversations once (2026-09-28).
 _UNVERSIONED_START = b"# >>> NOT VERSIONED"
 _UNVERSIONED_END = b"# <<< NOT VERSIONED"
+# Single lines that don't affect any output row (progress-bar hooks,
+# run_progress.py) end with this comment and are left out of the hash, whole
+# line included, so adding or changing them doesn't change the version.
+# (The region markers above leave their line's indentation and newline
+# behind, so they can't be used for a line inserted into existing code.)
+_UNVERSIONED_LINE = b"# unversioned"
 
 # Older versions whose detection code is identical to a given current one,
 # as {older_version: current_version}. Only honoured while pipeline_version()
@@ -551,19 +577,22 @@ VERSION_EQUIVALENTS = {}
 
 
 def _versioned_bytes(data):
-    """The file's bytes minus every NOT VERSIONED region (markers included)."""
+    """The file's bytes minus every NOT VERSIONED region (markers included)
+    and every line tagged "# unversioned"."""
     out, pos = [], 0
     while True:
         start = data.find(_UNVERSIONED_START, pos)
         if start < 0:
             out.append(data[pos:])
-            return b"".join(out)
+            break
         end = data.find(_UNVERSIONED_END, start)
         if end < 0:     # unterminated region: hash everything (safe direction)
             out.append(data[pos:])
-            return b"".join(out)
+            break
         out.append(data[pos:start])
         pos = end + len(_UNVERSIONED_END)
+    return b"".join(line for line in b"".join(out).splitlines(keepends=True)
+                    if _UNVERSIONED_LINE not in line)
 
 
 def pipeline_version():
@@ -851,6 +880,59 @@ def save_enrich_checkpoint(checkpoint_path, checkpoint_key, fingerprint,
 
 def delete_enrich_checkpoint(checkpoint_path):
     checkpoint_path.unlink(missing_ok=True)
+
+
+# ========================= KEEP THE MACHINE AWAKE =========================
+# An overnight queue run (2026-09-29 22:27) finished two videos by 23:34 and
+# then sat on the third's freshly downloaded audio until morning: Windows
+# had put the laptop to sleep, which freezes the process. While a long run
+# is working, ask Windows not to sleep on idle (SetThreadExecutionState --
+# no admin rights needed; it lapses by itself if the program exits). It
+# can't stop sleep on closing the lid or pressing the power button, and a
+# managed device's policy may still win.
+_ES_CONTINUOUS, _ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+
+
+def keep_awake(on=True):
+    """keep_awake() before a long run, keep_awake(False) after it. Windows
+    only; elsewhere, and if the call fails, it just says so and carries on."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if on else 0)
+        if not ctypes.windll.kernel32.SetThreadExecutionState(flags) and on:
+            tqdm.write(" ⚠️ Couldn't stop Windows from sleeping -- set Sleep to 'Never' "
+                       "while plugged in, or the run will pause when the laptop sleeps.")
+    except Exception as e:
+        if on:
+            tqdm.write(f" ⚠️ Couldn't stop Windows from sleeping ({e}).")
+
+
+# ========================= SAVED TAGGING =========================
+# One run's word stream after tagging (Whisper filters, contraction
+# splitting, Cysill, spaCy, Bangor lexicon) and before detection, with what
+# detection needs besides the words (segment spans, per-video counts, the
+# covered window). mutation_rerun_rules.py replays it through the CURRENT
+# detection code, so a detection change doesn't need a new transcription or
+# new Cysill calls. gzip JSON: a Siarad conversation is a few MB.
+def save_tagged_cache(path, words, context):
+    import gzip
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump({"format": 1, **context, "words": words}, f, ensure_ascii=False)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    _replace_with_retry(tmp, path)
+
+
+def load_tagged_cache(path):
+    import gzip
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ========================= CSV OUTPUT WRITER =========================

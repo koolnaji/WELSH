@@ -33,6 +33,7 @@ from spacy_tagging import (
     extract_gender_from_spacy, extract_number_from_spacy,
 )
 import bangor_lexicon
+import run_progress  # unversioned
 
 
 try:
@@ -138,6 +139,7 @@ from mutation_tables import (
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
     OEDD_CONTRACTIONS, OEDD_PERSON_ENDINGS, CLIPPED_BOD_FORMS, FIXED_EXPRESSIONS,
+    CAPITALISED_COMMON_WORDS, PLACE_NAME_HEADS,
     SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS, DISCOURSE_PARTICLES, NEVER_MUTATING,
     POSSESSIVE_TRIGGERS, FIRST_PERSON_VERB_FORMS, SUBJECT_PRONOUNS,
     CARDINAL_WORDS, YN_ELIDED_ARTICLE_NOUNS, FUSED_PREPOSITION_FORMS,
@@ -739,6 +741,8 @@ def preprocess_segment(seg, seg_id=None):
             "_clause_boundary_after": clause_boundary_after,
             # human language tag from an annotated transcript (Siarad), else None
             "_lang":      getattr(w, "lang", None),
+            # part of a CHAT underscore name ("Pen_y_groes"), see _is_unmeasured_name
+            "_name_part": getattr(w, "name_part", False),
         })
     return expand_whisper_tokens(raw_words)
 
@@ -915,6 +919,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
     there's nothing worth resuming.
     """
     chunks   = chunk_words_for_pos(all_preprocessed_words)
+    run_progress.phase(total=len(all_preprocessed_words), unit="words")  # unversioned
     enriched = []
     start_chunk_idx = 0
     last_checkpoint_at = time.monotonic()
@@ -936,6 +941,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
 
     for chunk_idx, chunk in enumerate(chunks):
         if chunk_idx < start_chunk_idx:
+            run_progress.advance(len(chunk))  # unversioned
             continue
         chunk_text = tagger_text_for_chunk(chunk)
 
@@ -1146,6 +1152,7 @@ def enrich_words(all_preprocessed_words, checkpoint_key=None):
             entry["collision_note"]       = KNOWN_HOMOGRAPH_COLLISIONS.get(
                 normalize_word(w["word"]))
             enriched.append(entry)
+            run_progress.advance()  # unversioned
 
         # At most every CHECKPOINT_INTERVAL_SECONDS, not after every chunk:
         # each save rewrites ALL words tagged so far, and a Siarad chunk is a
@@ -2381,7 +2388,11 @@ def _evaluate_mixed_mutation(current_node, target_node, trigger_word):
     )
     if t2.get("skip_reason"):
         return None
-    expected = _resolve_mixed_mutation_expected(t2["raw_word"])
+    # Aspirate-vs-soft is a property of the RADICAL, as in _evaluate_feminine_ei:
+    # classifying the spoken surface meant a correctly aspirated "chawn"
+    # (cluster "ch", not in ASPIRATE_INITIALS) was expected to be soft and
+    # scored as a wrong-type erosion ("na chawn", Siarad fusser30 audit).
+    expected = _resolve_mixed_mutation_expected(t2["lemma"] or t2["raw_word"])
     outcome  = _evaluate_mutation_outcome(target_node, expected)
     if outcome["skip"]:
         return None
@@ -2589,6 +2600,38 @@ def _find_lookahead_target(i, words_list, norm_current):
     return target_found, lookahead
 
 
+def _is_unmeasured_name(node, target_norm):
+    """Place and other proper names aren't measured (decision 2026-09-29):
+    fluent speakers often leave them unmutated to keep them recognisable
+    ("yn Canada", "o Cymru"), so their mutation isn't a measure of erosion.
+    Person names stay in (decision 2026-09-26) -- but only ones Cysill tags
+    PERSON can be told apart from places.
+
+    A name is: Cysill's PLACE tag; a proper noun the lexicon doesn't know
+    ("yn Palermo"); or a capitalised word -- a target is never
+    sentence-initial, so a capital marks a name in both the Siarad
+    transcripts and Whisper's output. The capital catches names built from
+    common nouns, which the lexicon knows: "i Pen y Bont Fawr", "o Cwm
+    Nantcol", "yn Blaenau" were 7 of 80 flagged erosions in the Siarad
+    audit (2026-09-29). Parts of a CHAT underscore name ("Pen_y_groes") are
+    flagged by corpus_siarad whatever their case. Months, days, languages
+    etc. (CAPITALISED_COMMON_WORDS) are capitalised but mutate normally."""
+    cysill = (node.get("cysill_pos") or "").upper()
+    if "PLACE" in cysill:
+        return True
+    if "PERSON" in cysill:
+        return False
+    pos = (node.get("spacy_token") or {}).get("pos", "")
+    if pos == "PROPN" and not bangor_lexicon.lookup(target_norm):
+        return True
+    raw = node.get("word") or ""
+    if not (node.get("_name_part") or (raw[:1].isupper() and not raw.isupper())):
+        return False
+    if target_norm in CAPITALISED_COMMON_WORDS:
+        return False
+    return get_welsh_lemma(target_norm, node) not in CAPITALISED_COMMON_WORDS
+
+
 def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_current):
     target_found, lookahead = _find_lookahead_target(i, words_list, norm_current)
     if not target_found or target_found.get("confidence", 0) < 0.65:
@@ -2613,6 +2656,15 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if target_lex and (all(e["pos"] == "ADP" for e in target_lex) or
                        all(e["pos"] in ("VERB", "AUX") and e["lemma"].lower() == "bod"
                            for e in target_lex)):
+        return None, lookahead
+    # Vowel-initial forms of "bod" have no consonant to mutate, yet "ydan" (we
+    # are) was read as soft-mutated "*gydan" (g -> nothing) and scored a
+    # correct mutation after na/sut/beth: 44 Siarad rows, and Patagonia 01
+    # (2026-09-29). The lexicon check above misses colloquial forms it doesn't
+    # list ("ydan", "ydach"); the tagger's lemma catches them.
+    if target_norm[:1] in WELSH_VOWELS and (
+            target_norm in BOD_SURFACE_FORMS
+            or get_welsh_lemma(target_norm, target_found) == "bod"):
         return None, lookahead
     # "yna" mutates only as the existential "(mae) yna gi" (there is a dog).
     # After a noun it's the demonstrative "y pnawn yna" (that afternoon), and
@@ -2684,6 +2736,10 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     # interrogative "pwy" does ("i bwy"), so it stays.
     if (target_pos == "PRON" or target_cysill.startswith("PRON")) \
             and target_norm not in ("pwy", "bwy", "mhwy"):
+        return None, lookahead
+    # Place names aren't measured -- skipped mutated or not, see
+    # _is_unmeasured_name.
+    if _is_unmeasured_name(target_found, target_norm):
         return None, lookahead
     # Function words aren't soft/nasal targets: "yna gyda", "o gyda", "sy
     # gyda", "yna drwy", "i mewn" were all scored as erosion (davies1.cha,
@@ -2952,6 +3008,14 @@ def _process_gender_trigger(current_node, target_node, expected, trigger_label,
     target_norm = normalize_word(target_node["word"])
     if target_norm in DISCOURSE_PARTICLES or target_norm in NEVER_MUTATING:
         return None     # "noson braf": braf never mutates
+    # The same exclusions as word triggers: noun-headed fixed expressions
+    # ("argoel fawr", "bobl bach") and names ("Merched y Wawr", "y Gŵyl
+    # Dewi"), both scored as erosion in the Siarad audit (2026-09-29).
+    if target_norm in FIXED_EXPRESSIONS.get(trigger_label, ()):
+        mark_consumed(target_node)
+        return None
+    if _is_unmeasured_name(target_node, target_norm):
+        return None
     target_lemma = get_welsh_lemma(target_norm, target_node)
     if _is_code_switch(target_node, target_norm, target_lemma):
         return _build_cs_row(
@@ -3105,9 +3169,34 @@ def _process_phantom_check(current_node, cysill_pos, conf_current):
     }
 
 
+def _is_capitalised(node):
+    raw = (node or {}).get("word") or ""
+    return raw[:1].isupper() and not raw.isupper()
+
+
+def _mark_place_name_heads(words_list):
+    """Flags a place-name head noun (PLACE_NAME_HEADS) as part of a name when
+    a capitalised word follows it, skipping one article: "i cwm Ffynnon
+    Lloer", "yn dyffryn Ogwen", "pen y Bryn". Sets the same "_name_part"
+    flag corpus_siarad gives CHAT underscore names, so _is_unmeasured_name
+    skips it in every rule."""
+    for k, node in enumerate(words_list):
+        if node.get("_clause_boundary_after") or \
+                normalize_word(node["word"]) not in PLACE_NAME_HEADS:
+            continue
+        nxt = k + 1
+        if nxt < len(words_list) and normalize_word(words_list[nxt]["word"]) in ("y", "yr", "'r") \
+                and not words_list[nxt].get("_clause_boundary_after"):
+            nxt += 1
+        if nxt < len(words_list) and _is_capitalised(words_list[nxt]) \
+                and normalize_word(words_list[nxt]["word"]) not in CAPITALISED_COMMON_WORDS:
+            node["_name_part"] = True
+
+
 # ========================= MAIN MUTATION PROCESSOR =========================
 def process_comprehensive_mutations(words_list):
     mutation_rows = []
+    _mark_place_name_heads(words_list)
     i = 0
     while i < len(words_list):
         current_node  = words_list[i]
@@ -3164,6 +3253,15 @@ def process_comprehensive_mutations(words_list):
         # PATCH: skip tokens with impossible Welsh diacritics (Whisper
         # hallucinations). These cannot be trigger words or valid targets.
         if not _is_plausible_welsh_token(norm_current):
+            i += 1
+            continue
+
+        # A word a transcriber tagged as another language is not a Welsh
+        # trigger, however it's spelled: Spanish "y" (and), "o" (or), "a" (to),
+        # "un", "mi" are all Welsh trigger spellings in the Patagonia corpus,
+        # and English "a"/"i" are in Siarad. Only explicit human tags count
+        # here; untagged (Whisper) words keep the per-target check below.
+        if current_node.get("_lang") not in (None, "cym", "mixed", "und"):
             i += 1
             continue
 
@@ -3431,8 +3529,11 @@ def process_comprehensive_mutations(words_list):
         # mutated or not, so the rate can't tilt.
         spacy_says_obj = bool(spacy_tok) and spacy_tok.get("dep") in OBJ_DEPS and \
             spacy_tok.get("pos") in ("NOUN", "PROPN", "NUM")
+        # Names are skipped here too ("Dewi Cwm_Bach dan ni yn alw fo" scored
+        # "Cwm" as an eroded object, davies10.cha, 2026-09-30).
         if not was_consumed(current_node) and not current_node.get("synthetic") and \
                 _is_object_candidate(current_node) and \
+                not _is_unmeasured_name(current_node, norm_current) and \
                 _object_follows_finite_verb(words_list, i, spacy_says_obj):
             t2 = layer_2_lemma_analysis(
                 current_node["word"],
@@ -3463,7 +3564,8 @@ def process_comprehensive_mutations(words_list):
         # future second vocative-marking dep label only needs adding in
         # one place.
         # PATCH (2.2): same consumption guard as Layer 1H above.
-        if not was_consumed(current_node) and spacy_tok and spacy_tok.get("dep") in VOCAT_DEPS:
+        if not was_consumed(current_node) and spacy_tok and spacy_tok.get("dep") in VOCAT_DEPS \
+                and not _is_unmeasured_name(current_node, norm_current):
             t2 = layer_2_lemma_analysis(
                 current_node["word"],
                 cysill_pos=cysill_pos,

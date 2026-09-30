@@ -43,5 +43,12 @@ NUMERAL_FORMS = {
 # by design -- not a numeral + noun context.
 PARTITIVE_WORDS = {"o", "o'r", "or"}
 
+# Hundreds/thousands/millions after a numeral make a bigger number ("pedwar
+# cant" = 400), not a counted noun: English "four hundred" is singular too,
+# so there's no contrast. 5 of 50 correct rows in the Siarad audit
+# (2026-09-29). Radical and mutated spellings.
+NUMBER_WORDS = {"cant", "gant", "chant", "nghant", "mil", "fil", "miliwn", "filiwn",
+                "biliwn"}
+
 # Hesitation sounds only -- same convention as prep_tables/plural_tables.
 WELSH_FILLERS = {"ym", "er", "ah"}
