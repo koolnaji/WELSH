@@ -139,7 +139,8 @@ from mutation_tables import (
     ENGLISH_FUNCTION_WORDS, WELSH_ENGLISH_HOMOGRAPHS, BOD_SURFACE_FORMS,
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
     OEDD_CONTRACTIONS, OEDD_PERSON_ENDINGS, CLIPPED_BOD_FORMS, FIXED_EXPRESSIONS,
-    CAPITALISED_COMMON_WORDS, PLACE_NAME_HEADS,
+    CAPITALISED_COMMON_WORDS, PLACE_NAME_HEADS, LANGUAGE_NOUNS, PREPOSED_ONLY_ADJECTIVES,
+    FEM_ADJ_TRIGGER_EXCLUDED,
     SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS, DISCOURSE_PARTICLES, NEVER_MUTATING,
     POSSESSIVE_TRIGGERS, FIRST_PERSON_VERB_FORMS, SUBJECT_PRONOUNS,
     CARDINAL_WORDS, YN_ELIDED_ARTICLE_NOUNS, FUSED_PREPOSITION_FORMS,
@@ -659,6 +660,18 @@ def expand_whisper_tokens(raw_words):
                     # real boundary.
                     "_clause_boundary_after": w.get("_clause_boundary_after", False) if is_last else False,
                 })
+        elif len(surface) > 2 and surface[-2:] in ("'r", "'i", "'w") and surface[-3].isalpha():
+            # Any other word + clitic article/pronoun ("â'r", "gyda'r",
+            # "mae'r", "dyma'r", "gyda'i"): Cysill splits these in two just
+            # like i'r/o'r above. Kept whole, "â'r" normalized to "â", which
+            # then claimed the noun after the article as its own target
+            # ("â tîm", "gyda cais", "dyma tro" -- news narration,
+            # 2026-10-01). The clitic is synthetic, as for i'r/o'r: the
+            # lookahead stops at it, and it still acts as the article.
+            orig = w["word"].strip().replace("’", "'")
+            expanded.append({**w, "word": orig[:-2], "synthetic": False,
+                             "_clause_boundary_after": False})
+            expanded.append({**w, "word": surface[-2:], "synthetic": True})
         elif surface == "'n":
             # Whisper already split it off as its own token -- just
             # canonicalize the spelling so it survives downstream and
@@ -770,25 +783,34 @@ def _tokens_match_fuzzy(norm_whisper, norm_tagger, tagger_token=None):
     if norm_whisper == norm_tagger:
         return True
 
-    # Stage 2: substring containment
-    if norm_whisper in norm_tagger or norm_tagger in norm_whisper:
+    # Stage 2: substring containment. A one-letter token (the article "'r"
+    # normalizes to "r") is only allowed against a word of two letters at
+    # most ("n" / "yn"): "r" is inside half the words of the language.
+    shorter, longer = sorted((norm_whisper, norm_tagger), key=len)
+    if shorter in longer and (len(shorter) > 1 or len(longer) <= 2):
         return True
 
     # Stage 3: lemma fallback
     if tagger_token:
-        # spaCy provides a lemma field directly
+        # spaCy's lemma belongs to the TAGGER token: the Whisper word may be
+        # a mutated form of it ("nghi" vs lemma "ci" -- same last 2 letters).
         spacy_lemma = normalize_word(tagger_token.get("lemma", "") or "")
-        # Cysill doesn't -- but the Techiaith lemma cache may have it
-        cached_lemma = normalize_word(LEMMA_CACHE.get(norm_whisper, "") or "")
-
-        for lemma in filter(None, [spacy_lemma, cached_lemma]):
-            if norm_whisper == lemma or norm_tagger == lemma:
+        if spacy_lemma:
+            if norm_whisper == spacy_lemma or norm_tagger == spacy_lemma:
                 return True
-            # Radical reconstruction: mutated form shares a suffix with radical
-            # e.g. "nghi" vs "ci" -- last 2 chars match
-            if len(norm_whisper) >= 2 and len(lemma) >= 2:
-                if norm_whisper.endswith(lemma[-2:]) or lemma.endswith(norm_whisper[-2:]):
-                    return True
+            if len(norm_whisper) >= 2 and len(spacy_lemma) >= 2 and (
+                    norm_whisper.endswith(spacy_lemma[-2:]) or spacy_lemma.endswith(norm_whisper[-2:])):
+                return True
+        # The lemma cache belongs to the WHISPER word, so it can only match
+        # the tagger token exactly. It used to go through the same suffix
+        # test, which compared the word with its own lemma -- true for nearly
+        # every word, so any tagger token matched and alignment fell back to
+        # position: after "â'r" (which Cysill splits in two) every later tag
+        # in the sentence was one word off ("â'r cwmni": "cwmni" got the
+        # article's DET tag). News narration, 2026-10-01.
+        cached_lemma = normalize_word(LEMMA_CACHE.get(norm_whisper, "") or "")
+        if cached_lemma and norm_tagger == cached_lemma:
+            return True
 
     return False
 
@@ -2064,6 +2086,14 @@ def _evaluate_mutation_outcome(target_node, expected):
             status, is_erosion = "erosion_unverified", False
             note = (f"Wrong mutation type apparent (expected {expected}, got "
                     f"{surface_mut}) but both taggers absent -- unverified")
+        elif not t2.get("lemma"):
+            # No lemma = no known word behind the "mutated" initial: an m-/n-
+            # word read as nasal ("moen", "mwylio", "myndig" in YouTube ASR,
+            # the place "Nantgaredig", "moonwalkio" in Siarad) is just a word
+            # starting with m/n, not a wrong mutation (2026-10-01).
+            status, is_erosion = "erosion_unverified", False
+            note = (f"Wrong mutation type apparent (expected {expected}, got "
+                    f"{surface_mut}) but no known radical -- unverified")
         else:
             status, is_erosion = "wrong_mutation_type", True
             note = f"**EROSION (wrong type)**: expected {expected}, got {surface_mut}"
@@ -2492,6 +2522,17 @@ def _is_finite_verb(node):
     return all("Person" in e["morph"] and e["lemma"].lower() != "bod" for e in verbs)
 
 
+def _is_inflected_verb(node):
+    """An inflected (finite) verb, not a verb-noun: Cysill's first reading
+    VBF..., or spaCy VerbForm Fin/FinRel, or the lexicon (_is_finite_verb).
+    A verb-noun reading (Cysill "VB", spaCy Vnoun) rules it out."""
+    first = (node.get("cysill_pos") or "").split("+")[0].strip().upper()
+    verbform = ((node.get("spacy_token") or {}).get("morph") or {}).get("VerbForm")
+    if first == "VB" or verbform == "Vnoun":
+        return False
+    return first.startswith("VBF") or verbform in ("Fin", "FinRel") or _is_finite_verb(node)
+
+
 def _prev_real_index(words_list, idx):
     """Index of the nearest earlier word that isn't a synthetic token or a
     hesitation, or None at an utterance/clause boundary."""
@@ -2520,15 +2561,19 @@ def _object_follows_finite_verb(words_list, idx, spacy_says_obj=False):
     pronoun must be tagged a pronoun AND agree with the verb in person and
     number: "i" and "o" are also prepositions, and "aeth i Fangor" (went to
     Bangor) is not "welais i gi". With no pronoun, the noun right after the
-    verb is normally its SUBJECT (Welsh is verb-subject-object: "daeth dyn"),
-    so that is only accepted when spaCy's parse also calls it the object.
-    Anything else in between ("toedd yna ddim gwynt", "fuais i nôl papur")
-    means this isn't the position."""
+    verb is normally its SUBJECT (Welsh is verb-subject-object: "daeth dyn",
+    "dywedodd llefarydd") and isn't scored, whatever spaCy's parse says: it
+    called "dywedodd llefarydd", "cyhoeddodd cwmni" objects, 22 of 120
+    flagged erosions in the edited news narration (2026-10-01). (A dropped
+    subject before a real object, "gwelodd gi", is lost with them -- rare in
+    speech, where the pronoun is said.) Anything else in between ("toedd
+    yna ddim gwynt", "fuais i nôl papur") means this isn't the position.
+    `spacy_says_obj` is no longer used."""
     k = _prev_real_index(words_list, idx)
     if k is None:
         return False
     if _is_finite_verb(words_list[k]):
-        return spacy_says_obj
+        return False
     person_number = SUBJECT_PRONOUNS.get(normalize_word(words_list[k]["word"]))
     if person_number is None or not _tagged_pronoun(words_list[k]):
         return False
@@ -2601,11 +2646,12 @@ def _find_lookahead_target(i, words_list, norm_current):
 
 
 def _is_unmeasured_name(node, target_norm):
-    """Place and other proper names aren't measured (decision 2026-09-29):
-    fluent speakers often leave them unmutated to keep them recognisable
-    ("yn Canada", "o Cymru"), so their mutation isn't a measure of erosion.
-    Person names stay in (decision 2026-09-26) -- but only ones Cysill tags
-    PERSON can be told apart from places.
+    """Names aren't measured. Places (decision 2026-09-29): fluent speakers
+    often leave them unmutated to keep them recognisable ("yn Canada", "o
+    Cymru"). Person names too (decision 2026-10-01, reversing 2026-09-26):
+    even edited news leaves them unmutated ("gan Deian", "i Gethin", "i
+    Lleuwen" -- 19 flagged rows in the news narration), so name mutation is
+    optional in standard Welsh and doesn't measure erosion.
 
     A name is: Cysill's PLACE tag; a proper noun the lexicon doesn't know
     ("yn Palermo"); or a capitalised word -- a target is never
@@ -2615,16 +2661,24 @@ def _is_unmeasured_name(node, target_norm):
     Nantcol", "yn Blaenau" were 7 of 80 flagged erosions in the Siarad
     audit (2026-09-29). Parts of a CHAT underscore name ("Pen_y_groes") are
     flagged by corpus_siarad whatever their case. Months, days, languages
-    etc. (CAPITALISED_COMMON_WORDS) are capitalised but mutate normally."""
+    etc. (CAPITALISED_COMMON_WORDS) are capitalised but mutate normally.
+    Acronyms ("y DU" = the UK, "y BBC") are read as letters and never
+    mutate: 52 "y du" rows were scored as erosion in the news narration
+    (2026-10-01) -- the word-trigger path already skipped them."""
+    raw = node.get("word") or ""
+    if len(raw) >= 2 and raw.isupper():
+        return True
     cysill = (node.get("cysill_pos") or "").upper()
     if "PLACE" in cysill:
         return True
     if "PERSON" in cysill:
-        return False
+        # Only a capitalised or unknown word: Cysill also tags common words
+        # that double as names ("gwyn" white / Gwyn), and lowercase they
+        # are the common word.
+        return raw[:1].isupper() or not bangor_lexicon.lookup(target_norm)
     pos = (node.get("spacy_token") or {}).get("pos", "")
     if pos == "PROPN" and not bangor_lexicon.lookup(target_norm):
         return True
-    raw = node.get("word") or ""
     if not (node.get("_name_part") or (raw[:1].isupper() and not raw.isupper())):
         return False
     if target_norm in CAPITALISED_COMMON_WORDS:
@@ -2751,6 +2805,12 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     if norm_current in ("dyna", "dyma", "yna") and \
             target_norm in ("pam", "lle", "ble", "pryd", "sut", "beth", "pwy"):
         return None, lookahead
+    # "ar hyd" = along ("ar hyd llwybr", "ar hyd rhan o'r arfordir"): the
+    # compound preposition doesn't mutate; only "hyd" (until) alone does.
+    if norm_current == "hyd":
+        k = _prev_real_index(words_list, i)
+        if k is not None and normalize_word(words_list[k]["word"]) == "ar":
+            return None, lookahead
     # "cyn" is mostly "before" ("cyn mynd", "cyn cinio"), which doesn't
     # mutate; only equative "cyn" + adjective ("cyn gynted") does.
     if norm_current == "cyn" and target_pos != "ADJ" and not target_cysill.startswith("ADJ"):
@@ -2874,6 +2934,7 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     # "yng nghanol y dre" (noun + definite genitive), which is nasal.
     # Names stay in ("yn Porthmadog" is real erosion). Skipped mutated or
     # not, so the rate can't tilt.
+    yn_nasal_forced = False
     if norm_current == "yn" and expected and not looks_like_name and target_pos != "PROPN":
         genitive_follows = next_node is not None and not target_found.get("_clause_boundary_after") and (
             normalize_word(next_node["word"]) in DEFINITE_ARTICLE_FORMS
@@ -2885,10 +2946,29 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         if target_norm in YN_ELIDED_ARTICLE_NOUNS or target_lemma in YN_ELIDED_ARTICLE_NOUNS:
             if genitive_follows:
                 expected = ["nasal"]
+                yn_nasal_forced = True
             elif not adjective_follows:     # "mae'n fore braf" stays predicative
                 return None, lookahead
         elif expected == ["nasal"] and target_pos == "NOUN" and not genitive_follows:
             return None, lookahead
+
+    # "yn" is two triggers in one spelling -- the predicative/adverbial
+    # particle (soft: "yn wreiddiol", "yn gyn-lywydd", "yn dair oed") and the
+    # preposition "in" (nasal: "yn ninas", "yn nhafarn", or "(fy) nhad" with
+    # the possessive dropped) -- and the tags don't reliably tell them apart.
+    # Either mutation counts as kept; only the radical is erosion. The other
+    # reading was scored "wrong type" in 116 Siarad rows (with "a" below) and
+    # 51 news-narration rows (2026-10-01). Not for "yng nghanol y dre" above,
+    # where only the preposition is possible.
+    if norm_current == "yn" and expected and not yn_nasal_forced:
+        expected = list(dict.fromkeys([*expected, "soft_limited", "nasal"]))
+    # "a" before an inflected verb is the relative/interrogative particle
+    # ("a gafodd", "a gyhoeddwyd", "a ges i?"), which takes SOFT mutation;
+    # "and" (aspirate, "a chafodd") is also possible there, so both count.
+    if norm_current == "a" and expected and (
+            _is_finite_verb(target_found)
+            or (target_found.get("cysill_pos") or "").split("+")[0].upper() == "VBF"):
+        expected = list(dict.fromkeys([*expected, "soft"]))
 
     # Pronoun "i" (I) before a verb-noun, with the spoken "yn" dropped: "sa i
     # credu" / "o'n i meddwl" / "sa i gwybod" (I don't think / I was
@@ -2931,7 +3011,10 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         # "no" -- "na byth" (no, never) was scored as soft-mutation erosion
         # three times in davies1.cha (2026-09-26). ni/nid/oni before a
         # non-verb mutate nothing.
-        if _is_verb_target(target_found):
+        # Only an INFLECTED verb: before a verb-noun "nid"/"na" negate a
+        # non-verbal phrase ("nid digalonni", "na derbyn", "na mynd" were 7 of
+        # 120 flagged erosions in the news narration, 2026-10-01).
+        if _is_verb_target(target_found) and _is_inflected_verb(target_found):
             return _evaluate_mixed_mutation(current_node, target_found, norm_current), lookahead
         if norm_current != "na" or i == 0 or words_list[i - 1].get("_clause_boundary_after"):
             return None, lookahead
@@ -3344,7 +3427,20 @@ def process_comprehensive_mutations(words_list):
             # reading: "constable baswn" / "ffordd deuda" (verbs "I would" /
             # "say!") were tagged ADJ and scored (fusser12.cha, 2026-09-27).
             next_lex = next_node.get("lex_pos")
-            if (nsp == "ADJ" or ncp.startswith("ADJ")) and not (next_lex and "ADJ" not in next_lex):
+            # Not a feminine noun + its adjective (news narration, 2026-10-01):
+            # a language name without "y" ("Cymraeg mwyaf" -- LANGUAGE_NOUNS),
+            # a name ("Renault gwyn"), or a preposed adjective that belongs to
+            # the next noun ("swyddfa prif weinidog").
+            k_prev = _prev_real_index(words_list, i)
+            after_article = k_prev is not None and \
+                normalize_word(words_list[k_prev]["word"]) in DEFINITE_ARTICLE_FORMS
+            # (A sentence-initial capital isn't a name, hence k_prev.)
+            not_this_pair = (norm_current in LANGUAGE_NOUNS and not after_article) \
+                or norm_current in FEM_ADJ_TRIGGER_EXCLUDED \
+                or (k_prev is not None and _is_unmeasured_name(current_node, norm_current)) \
+                or normalize_word(next_node["word"]) in PREPOSED_ONLY_ADJECTIVES
+            if (nsp == "ADJ" or ncp.startswith("ADJ")) and not (next_lex and "ADJ" not in next_lex) \
+                    and not not_this_pair:
                 row = _process_gender_trigger(
                     current_node, next_node, ["soft"],
                     norm_current, "fem_noun+adjective", None, False)

@@ -35,6 +35,22 @@ COLLECTIVE_NOUNS = {"pobl", "bobl"}
 MASS_NOUNS = {
     "amser", "amserau", "arian", "bwyd", "bwydydd", "dŵr", "dwr", "dyfroedd",
     "gwaith", "gweithiau", "help", "cariad", "cariadon", "tywydd",
+    # 2026-10-01: Patagonia's 5 rhai "erosions" were "rhai cig", "rhai caws",
+    # "rhai Sbaeneg" (some meat / cheese / Spanish) and two non-contexts --
+    # so the list now matches quantifier_tables.MASS_NOUN_LEMMAS (duplicated
+    # per the convention below; "rhai" doesn't mutate its noun, so radical
+    # forms are enough), plus language names and "newid" (some change).
+    "pres", "sŵn", "swn", "sbort", "hwyl", "sbri", "stwff", "trafferth",
+    "gwybodaeth", "profiad", "sylw", "croeso", "lwc", "cyffro", "straen",
+    "cwrw", "gwin", "coffi", "llaeth", "llefrith", "bara", "cig", "caws",
+    "siwgr", "halen", "menyn", "gwaed", "petrol",
+    "glaw", "eira", "gwynt", "haul", "golau", "tân", "mwg", "mwd", "baw",
+    "llwch", "sbwriel", "tir", "tywod", "glo", "pren", "papur", "gwair",
+    "gwellt", "gwallt", "gwres", "oerfel",
+    "amynedd", "hyder", "parch", "cefnogaeth", "cymorth", "gofal", "egni",
+    "ynni", "ymchwil", "addysg", "iechyd", "ofn", "poen", "pwysau", "cwsg",
+    "diddordeb", "ymarfer", "newid",
+    "cymraeg", "saesneg", "sbaeneg", "ffrangeg", "almaeneg", "eidaleg",
 }
 
 # Pronouns that echo a possessive after its noun ("tad fi" = my dad). Same

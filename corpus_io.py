@@ -595,18 +595,54 @@ def _versioned_bytes(data):
                     if _UNVERSIONED_LINE not in line)
 
 
+def _version_on_disk():
+    here = Path(__file__).resolve().parent
+    digest = hashlib.sha1()
+    for name in _DETECTION_SOURCES:
+        source = here / name
+        if source.exists():
+            digest.update(name.encode("utf-8"))
+            digest.update(_versioned_bytes(source.read_bytes()))
+    return digest.hexdigest()[:10]
+
+
 def pipeline_version():
+    """The version of the detection code THIS program loaded at start."""
     global _pipeline_version
     if _pipeline_version is None:
-        here = Path(__file__).resolve().parent
-        digest = hashlib.sha1()
-        for name in _DETECTION_SOURCES:
-            source = here / name
-            if source.exists():
-                digest.update(name.encode("utf-8"))
-                digest.update(_versioned_bytes(source.read_bytes()))
-        _pipeline_version = digest.hexdigest()[:10]
+        _pipeline_version = _version_on_disk()
     return _pipeline_version
+
+
+def stale_code_warning():
+    """None, or a message when the detection code on disk has changed since
+    this program started. Python keeps running the code it loaded, so a menu
+    window left open across an edit processes with the OLD rules and stamps
+    the OLD version -- 2026-10-01: "Update all results" run in such a window
+    re-scored every corpus with the previous rules."""
+    loaded = pipeline_version()
+    on_disk = _version_on_disk()
+    if on_disk == loaded:
+        return None
+    return (f"The detection code was changed after this program started "
+            f"(running {loaded}, files now {on_disk}).\n"
+            f"Close this window and start the program again -- otherwise the "
+            f"OLD rules are used.")
+
+
+def has_lexicon_features(pos_csv):
+    """True if a saved pos_*.csv carries Bangor-lexicon features (lex_pos)
+    for at least one word. Tagging done while the lexicon failed to load has
+    none, and the version stamp can't show it (the lexicon is data, not
+    code): all 43 Patagonia conversations, tagged 2026-09-29, came out with
+    no numeral, rhai or quantifier rows at all, since those branches need the
+    lexicon's noun number. Such a run isn't "done" (corpus_siarad)."""
+    import csv
+    try:
+        with open(pos_csv, encoding="utf-8-sig", newline="") as f:
+            return any((row.get("lex_pos") or "").strip() for row in csv.DictReader(f))
+    except OSError:
+        return False
 
 
 def is_current_version(version):

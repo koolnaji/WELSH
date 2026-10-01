@@ -1774,6 +1774,12 @@ def rows_from_enriched(enriched, seg_boundaries, video_meta, context, step=None)
                 continue
             if len(norm_word) < 2 and norm_word not in TRIGGERS \
                     and norm_word not in DEFINITE_ARTICLE_FORMS:
+                # Not exported, but kept in the detection stream as a
+                # synthetic blocker: dropped outright, it made its neighbours
+                # adjacent -- "ar 5 Medi" became "ar Medi", scored as soft-
+                # mutation erosion (news narration, 2026-10-01). The lookahead
+                # stops at synthetic tokens and they're never targets.
+                words_only.append({**w, "synthetic": True})
                 continue
 
             lemma      = get_welsh_lemma(raw_word, w)
@@ -1863,6 +1869,12 @@ def rows_from_enriched(enriched, seg_boundaries, video_meta, context, step=None)
         # covers Whisper segments that end without punctuation.
         if len(words_only) > kept_before:
             words_only[-1]["_clause_boundary_after"] = True
+            # ...and on the last real word when a blocker (dropped one-letter
+            # token, see above) ends the segment, as before blockers existed.
+            for k in range(len(words_only) - 1, kept_before - 1, -1):
+                if not words_only[k].get("synthetic"):
+                    words_only[k]["_clause_boundary_after"] = True
+                    break
 
     _step("Detecting mutations")
     mutation_rows = process_comprehensive_mutations(words_only)

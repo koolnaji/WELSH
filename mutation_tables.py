@@ -140,9 +140,11 @@ LL_RH_SOFT_EXEMPT_TRIGGERS_NOUN_ONLY = {"y", "yr", "r", "un"}
 BOD_SUBJECT_EXEMPT_TRIGGERS = {"mae", "ydy", "oes"}
 NUMERAL_FEM_SOFT_LIMITED_TRIGGERS  = {"un"}
 NUMERAL_GENERAL_SOFT_TRIGGERS      = {"dau", "dwy"}
+# Digits ("12", "100") removed 2026-10-01 (user decision): "100 diwrnod" may be
+# said "can niwrnod" or "cant o ddiwrnodau", so a written digit sets no
+# expectation (news text and Whisper write digits; Siarad writes words).
 NASAL_NUMERAL_TRIGGERS             = {
     "pump", "saith", "wyth", "naw", "deng",
-    "12", "15", "18", "20", "100",
     "deuddeg", "pymtheg", "deunaw", "ugain", "cant",
 }
 NASAL_NUMERAL_VALID_TARGETS        = {"blynedd", "blwydd", "diwrnod"}
@@ -375,7 +377,41 @@ DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê",
 #    scored as erosion of predicative "yn" (runs/20260929_075603_youtube-10).
 #    The noun "bron" (breast) does mutate ("ei fron"), but a mutated form
 #    isn't "bron" and is still evaluated.
-NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu", "bron"}
+#  - "gêm"/"gôl" (game/goal): g-loans that standard Welsh leaves unmutated
+#    ("y gêm", "dwy gêm", "un gôl") -- 86 of 633 flagged erosions in the
+#    edited news narration (2026-10-01), where real erosion is ~0;
+#  - "bynnag" ("beth bynnag", "pwy bynnag") -- lexicalised, never "pynnag";
+#  - "gymaint" as an adverb ("a gymaint", "ddwywaith gymaint") is a frozen
+#    soft form; the radical "cymaint" is still evaluated.
+#  - more g-loans standard Welsh leaves unmutated ("o grŵp", "y gitâr"),
+#    6 of 120 remaining news-narration erosions after the first fixes; and
+#    "bellach" (now / any more), a fossilised soft form -- "pellach"
+#    (further) is still evaluated (2026-10-01).
+NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu", "bron",
+                  "gêm", "gem", "gêmau", "gemau", "gôl", "gol", "goliau", "gôliau",
+                  "bynnag", "gymaint",
+                  "grŵp", "grwp", "grwpiau", "grŵpiau", "gitâr", "gitar", "gitarau",
+                  "garej", "garejys", "gang", "gangiau", "gêr", "bellach"}
+
+# Feminine-looking nouns whose following adjective doesn't tell us anything:
+# "blynedd" after a numeral ("y pum mlynedd diwethaf" -- usage is split) and
+# day names after "dydd"/"nos" ("dydd Gwener diwethaf", where the head is the
+# masculine "dydd"). Skipped as fem_noun+adjective triggers (news, 2026-10-01).
+FEM_ADJ_TRIGGER_EXCLUDED = {"blynedd", "mlynedd", "flynedd",
+                            "llun", "lun", "mawrth", "fawrth", "mercher", "fercher",
+                            "iau", "gwener", "wener", "sadwrn", "sul"}
+
+# Language names without the article are treated as masculine: "Cymraeg da",
+# "Saesneg gwael" (only "y Gymraeg" is feminine) -- "Cymraeg mwyaf", "Saesneg
+# Cymreig" were scored as fem_noun+adjective erosion in the news narration.
+LANGUAGE_NOUNS = {"cymraeg", "saesneg", "ffrangeg", "almaeneg", "sbaeneg", "gwyddeleg",
+                  "eidaleg", "lladin", "llydaweg", "cernyweg"}
+
+# Adjectives that stand BEFORE their noun: after a feminine noun they belong to
+# the next noun phrase ("swyddfa prif weinidog"), so they aren't that noun's
+# adjective. "unig"/"annwyl" are left out -- they also follow nouns.
+PREPOSED_ONLY_ADJECTIVES = {"prif", "brif", "holl", "rhyw", "ryw", "unrhyw", "ambell",
+                            "amryw", "ychydig"}
 
 # Possessive determiners: after these, a noun + echo pronoun ("ei gŵr hi") is
 # the NORMAL possessive, not a dropped possessive (ECHO_PRONOUNS rule).
@@ -476,7 +512,16 @@ FIXED_EXPRESSIONS = {
     "bobl":   {"bach", "fach"}, "pobl":  {"bach", "fach"},
     "bobol":  {"bach", "fach"}, "pobol": {"bach", "fach"},
     "noson":  {"blaen", "flaen"},
+    # Added from the edited news narration (2026-10-01), all scored as
+    # erosion there: "pe bai/baent" (if it were) -- the subjunctive of
+    # "bod" after "pe" is standard unmutated; "yn bosibl" (possibly), whose
+    # lemma came back as the mutated form itself; "ar gau" (closed).
+    "pe":   {"bai", "fai", "baent", "faent", "bawn", "fawn", "baem", "faem",
+             "baech", "faech", "bait", "fait", "byddai", "fyddai", "buasai",
+             "fuasai", "basai", "fasai", "bydden", "fydden"},
+    "yn":   {"bosib", "posib", "bosibl", "posibl"},
 }
+FIXED_EXPRESSIONS["ar"] |= {"gau", "cau"}
 
 # Common nouns that head place names ("cwm Ffynnon Lloer", "dyffryn Ogwen",
 # "pen y Bryn"), radical and mutated spellings. Before a capitalised name
@@ -591,9 +636,11 @@ SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS = {
 # the true erosion rate by ~18 points). Both files now import this
 # constant instead of each maintaining -- and inevitably drifting from --
 # their own copy.
+# mutation_mismatch dropped 2026-10-01 (user decision): an unexplained form,
+# mostly a Welsh-spelled loan left unmutated ("pwer", "citio"), which counted
+# as CORRECT and padded the denominator.
 EVALUABLE_STATUSES = frozenset({
     "correct_mutation",
     "erosion",
     "wrong_mutation_type",
-    "mutation_mismatch",
 })

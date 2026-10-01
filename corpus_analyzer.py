@@ -124,8 +124,44 @@ _CHANNEL_ENTRIES = [
     ("local",                                        "local",       "Local MP3"),
 ]
 
+_CHANNEL_ENTRIES.insert(0, ("https://www.youtube.com/@NewyddionS4C/videos",
+                            "NewyddionS4C", "Newyddion S4C"))
+
 CHANNEL_MAP       = {url: name  for url, _slug, name in _CHANNEL_ENTRIES}
 CHANNEL_MAP_SHORT = {slug: name for _url, slug, name in _CHANNEL_ENTRIES}
+
+# Non-YouTube sources, as they should read in figures and tables.
+CORPUS_LABELS = {
+    "siarad":         "Siarad",
+    "patagonia":      "Patagonia",
+    "news-narration": "News articles: narration",
+    "news-quote":     "News articles: quotes",
+    "news-statement": "News articles: statements",
+}
+
+
+def source_label(source):
+    """Display name for a row's "source": a corpus name, a known channel, or
+    the @handle of any other YouTube channel URL -- never the raw URL, which
+    is what the figures showed for Newyddion S4C before 2026-10-01."""
+    s = str(source)
+    if s in CORPUS_LABELS:
+        return CORPUS_LABELS[s]
+    named = next((v for k, v in CHANNEL_MAP.items() if k in s), None)
+    if named:
+        return named
+    handle = re.search(r"youtube\.com/(?:@|c/|channel/)([^/?#]+)", s)
+    return handle.group(1) if handle else s
+
+
+def transcript_kind(source):
+    """Legend label: the source plus how its text was made."""
+    s = str(source)
+    if s in ("siarad", "patagonia"):
+        return f"{source_label(s)} (human transcript)"
+    if s.startswith("news-"):
+        return f"{source_label(s)} (text)"
+    return f"{source_label(s)} (Whisper transcript)"
 
 
 # ========================= BATCH SELECTION =========================
@@ -621,19 +657,31 @@ def prepare(df):
         )
 
     if "source" in df.columns:
-        df["channel"] = df["source"].map(
-            lambda s: next((v for k, v in CHANNEL_MAP.items() if k in str(s)), str(s))
-        )
+        df["channel"] = df["source"].map(source_label)
 
     return df
 
 
 # ========================= FIGURE HELPERS =========================
 def _save(fig, name):
+    """Saves a figure. If Windows won't let the old file be overwritten --
+    usually because it's open in an image viewer, which gave "OSError:
+    [Errno 22] Invalid argument" and stopped the whole analyzer on
+    2026-10-01 -- the figure goes to a second name instead."""
     path = FIG_DIR / name
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path.name}")
+    try:
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {path.name}")
+    except OSError as e:
+        alt = path.with_name(f"{path.stem}_{datetime.now():%H%M%S}{path.suffix}")
+        try:
+            fig.savefig(alt, dpi=150, bbox_inches="tight")
+            print(f"  ⚠️ Couldn't overwrite {path.name} ({e.strerror}) -- is it open in an "
+                  f"image viewer? Saved as {alt.name} instead.")
+        except OSError as e2:
+            print(f"  ⚠️ Couldn't save {path.name}: {e2}")
+    finally:
+        plt.close(fig)
 
 
 def _bar_with_counts(ax, x, y, counts, color="#4C72B0", fmt="{:.1f}%"):
@@ -1447,17 +1495,15 @@ def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, m
         pts["erosion_rate_pct"] = pts["erosion_rate"] * 100
         sns.regplot(data=pts, x="f_score", y="erosion_rate_pct", ax=ax, scatter=False,
                     line_kws={"color": "#C44E52"})
-        kind = pts["source"].map({"siarad": "Siarad (human transcript)",
-                                  "patagonia": "Patagonia (human transcript)",
-                                  "news-narration": "News articles: narration (text)",
-                                  "news-quote": "News articles: interview quotes (text)",
-                                  "news-statement": "News articles: press statements (text)"}
-                                 ).fillna("Whisper transcript")
+        kind = pts["source"].map(transcript_kind)
         for name, grp in pts.groupby(kind):
             ax.scatter(grp["f_score"], grp["erosion_rate_pct"], s=grp["contexts"].clip(upper=200),
                        alpha=0.6, label=name)
-        r = pts["f_score"].corr(pts["erosion_rate_pct"])
-        ax.set_title(f"{title}\n{unit}s={len(pts)}, r={r:.2f}", fontweight="bold")
+        # A branch with no variation (quantifier: 0% everywhere) has no
+        # correlation -- computing one gave numpy "invalid value" warnings.
+        varies = pts["erosion_rate_pct"].nunique() > 1 and pts["f_score"].nunique() > 1
+        r_text = f"{pts['f_score'].corr(pts['erosion_rate_pct']):.2f}" if varies else "n/a (no variation)"
+        ax.set_title(f"{title}\n{unit}s={len(pts)}, r={r_text}", fontweight="bold")
         ax.set_xlabel("F-score (higher = more formal)")
         ax.set_ylabel("Erosion rate (%)")
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
@@ -1747,11 +1793,9 @@ def main():
         # the pooled line mixes corpora with very different speakers
         # (Patagonia = mostly learners/heritage speakers), so report each too
         if not rows.empty and "source" in rows.columns:
-            kind = rows["source"].where(rows["source"].isin(
-                ["siarad", "patagonia", "news-narration", "news-quote", "news-statement"]),
-                "youtube")
+            kind = rows["source"].map(lambda s: CORPUS_LABELS.get(str(s), "YouTube (Whisper)"))
             for name, grp in rows.groupby(kind):
-                print(f"      {name:<22} {len(grp):>6,} contexts, {grp['video_url'].nunique():>4} videos, "
+                print(f"      {name:<26} {len(grp):>6,} contexts, {grp['video_url'].nunique():>4} videos, "
                       f"erosion {grp['is_erosion'].mean():.1%}")
         report_pipeline_versions(rows, label)
     if not formality_df.empty:

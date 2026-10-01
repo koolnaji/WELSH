@@ -46,23 +46,39 @@ import pandas as pd
 from corpus_io import MUT_DIR, OUT_DIR
 from mutation_tables import EVALUABLE_STATUSES
 
-AUDIT_DIR = OUT_DIR / "audit"
-SEED = 20260929
+# Round 1 (2026-09-29, Siarad, version 966c440c62) lives in analysis/audit/.
+# Round 2 (decided 2026-10-01: ~50 Siarad + ~50 YouTube mutation rows, on the
+# frozen version) gets its own folder per source, so neither overwrites the
+# other or round 1: analysis/audit2/<siarad|youtube|...>/.
+AUDIT_ROOT = OUT_DIR / "audit2"
+AUDIT_DIR = AUDIT_ROOT / "siarad"   # set per source by _use_source()
+SEED = 20261001
 VERDICTS = ("ok", "wrong", "invalid", "unsure")
 
+
+def _use_source(source):
+    global AUDIT_DIR
+    AUDIT_DIR = AUDIT_ROOT / re.sub(r"[^a-z0-9-]+", "_", source.lower())
+    return AUDIT_DIR
+
+
 # name, file prefix, sample size per stratum, detail columns shown to the reviewer
+# For the quantifier branch the "erosion" stratum is the singular CANDIDATES
+# (status erosion_unverified -- quantifier_engine never counts them on its
+# own, so the branch reads 0% by construction until they're judged): verdict
+# "ok" = a real slip, "wrong" = fine (a mass/degree reading).
 BRANCHES = [
-    ("mutation", "mutations", 80,
+    ("mutation", "mutations", 25,
      ["trigger_word", "following_word", "lemma", "rule", "expected_mutation", "mutation_found",
       "status", "cysill_pos", "spacy_pos", "spacy_dep", "detection_source", "note"]),
-    ("prep", "prep_mutations", 50,
+    ("prep", "prep_mutations", 20,
      ["preposition", "person", "surface_form", "following_pronoun", "expected_forms",
       "mutation_found", "status", "before_verb_noun", "note"]),
-    ("numeral", "numeral_mutations", 50,
+    ("numeral", "numeral_mutations", 20,
      ["numeral_surface", "following_word", "number_found", "number_source", "status", "note"]),
-    ("rhai", "plural_mutations", 50,
+    ("rhai", "plural_mutations", 20,
      ["trigger_word", "following_word", "number_found", "number_source", "status", "note"]),
-    ("quantifier", "quantifier_mutations", 50,
+    ("quantifier", "quantifier_mutations", 30,
      ["quantifier_surface", "following_word", "noun_lemma", "number_found",
       "is_loan_quantifier", "status", "note"]),
 ]
@@ -110,10 +126,18 @@ def load_rows(prefix, source):
         return pd.DataFrame()
     rows = pd.concat(frames, ignore_index=True)
     rows = rows[rows["_run"] == rows.groupby("video_url")["_run"].transform("max")]
-    rows = rows[rows["status"].isin(EVALUABLE_STATUSES)]
-    if source != "all":
-        rows = rows[rows["source"] == source]
-    rows = rows.assign(stratum=np.where(rows["is_erosion"].str.lower() == "true", "erosion", "correct"))
+    candidate = (rows["status"] == "erosion_unverified") if prefix == "quantifier_mutations" \
+        else pd.Series(False, index=rows.index)
+    rows = rows[rows["status"].isin(EVALUABLE_STATUSES) | candidate]
+    candidate = candidate.loc[rows.index]
+    if source == "youtube":     # every Whisper video: their "source" is the channel URL
+        keep = rows["source"].str.startswith("http")
+        rows, candidate = rows[keep], candidate[keep]
+    elif source != "all":
+        keep = rows["source"] == source
+        rows, candidate = rows[keep], candidate[keep]
+    rows = rows.assign(stratum=np.where((rows["is_erosion"].str.lower() == "true") | candidate,
+                                        "erosion", "correct"))
     return rows.drop(columns="_run").reset_index(drop=True)
 
 
@@ -191,7 +215,9 @@ def _saved_verdicts(name, out):
 
 
 def draw(source, force):
+    _use_source(source)
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Audit files for '{source}' in {AUDIT_DIR}")
     for name, prefix, n, detail in BRANCHES:
         out = AUDIT_DIR / f"audit_{name}.csv"
         saved = _saved_verdicts(name, out)
@@ -258,6 +284,8 @@ def _corrected_rate(E, C, v_ero, v_cor):
 
 
 def score(source):
+    _use_source(source)
+    print(f"\nScoring '{source}' ({AUDIT_DIR})")
     rng = np.random.default_rng(SEED)
     print(f"{'branch':<11} {'stratum':<8} {'pop.':>7} {'judged':>6}  "
           f"{'ok':>4} {'wrong':>5} {'invalid':>7} {'unsure':>6}   label precision (95% CI)")
@@ -297,12 +325,15 @@ def score(source):
         print(f"{name:<11} {raw:>9.1%} {est:>10.1%}   {lo:.1%}-{hi:.1%}")
     print("\nWhen a stratum was sampled in full (e.g. only 4 numeral erosions), the bootstrap "
           "still resamples it, so its interval is a little wider than it needs to be.")
+    print("Quantifier: its 'raw rate' counts every singular CANDIDATE; only the corrected "
+          "rate (candidates judged 'ok' = real slips) is a finding.")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--score", action="store_true", help="score the filled-in audit files")
-    ap.add_argument("--source", default="siarad", help="siarad (default), patagonia, a YouTube source, or all")
+    ap.add_argument("--source", default="siarad",
+                    help="siarad (default), youtube (every video), patagonia, news-narration, ..., or all")
     ap.add_argument("--force", action="store_true",
                     help="rewrite a file even if some of its verdicts no longer match the sample")
     args = ap.parse_args()

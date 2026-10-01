@@ -71,6 +71,7 @@ from corpus_io import (
     set_session_label, session_dir,
 )
 from corpus_ops import analyze_segments
+from corpus_io import has_lexicon_features  # unversioned
 from output_merge import merge_with_previous
 from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 from mutation_engine import (
@@ -431,6 +432,8 @@ def _already_done(path, corpus="siarad"):
         if pos_csv is None:
             continue
         version, cysill_share = _saved_run_quality(pos_csv)
+        if not has_lexicon_features(pos_csv):  # unversioned
+            continue  # unversioned
         if is_current_version(version) and (not TECHIAITH_API_KEY or cysill_share >= 0.9):
             return True
     return False

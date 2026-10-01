@@ -58,7 +58,7 @@ from corpus_io import (
     is_current_version, set_session_label, session_dir, keep_awake,
 )
 from corpus_ops import analyze_segments
-from output_merge import merge_with_previous
+from output_merge import merge_with_previous, _retire
 from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 from mutation_engine import (
     load_spacy, load_lemma_cache, save_lemma_cache, load_bangor_lexicon,
@@ -77,9 +77,12 @@ KINDS = ("narration", "quote", "statement")
 # continue the same speaker (a statement quoted over several paragraphs).
 STATEMENT_RE = re.compile(r"\b(llefarydd\w*|llefarwyr|datganiad\w*|ar ran|medden nhw)\b",
                           re.IGNORECASE)
-# Written into every quote/statement folder: folders from before the split
-# (quotes and statements mixed) lack it and are redone -- see _already_done.
-SPLIT_MARKER = "news_split_v2.txt"
+# Written into every news folder. Folders without it are redone -- see
+# _already_done: those from before the quote/statement split (v2), and all
+# made before contracted "â'r", "gyda'r", "mae'r"... were split for tagging
+# (v3, 2026-10-01: the tags after such a word were one word off, and the tagged
+# file keeps that, so "Update all results" can't repair these folders).
+SPLIT_MARKER = "news_tokens_v3.txt"
 OUTPUT_KEYS = ["segments", "words", "lemmas", "pos", "mutations",
                "prep_mutations", "plural_mutations", "numeral_mutations",
                "quantifier_mutations"]
@@ -203,8 +206,8 @@ def _already_done(path, kind):
     """Same rule as corpus_siarad._already_done: output on the CURRENT
     version, and (when a key is set) with Cysill tags."""
     for pos_csv in RUNS_DIR.glob(f"*/News_{kind}_{_doc_id(path)}/pos_*.csv"):
-        if kind != "narration" and not (pos_csv.parent / SPLIT_MARKER).exists():
-            continue    # made before quotes and statements were split
+        if not (pos_csv.parent / SPLIT_MARKER).exists():
+            continue    # made by an older news_text (see SPLIT_MARKER)
         try:
             pos = pd.read_csv(pos_csv, usecols=lambda c: c in ("cysill_pos", "pipeline_version"),
                               dtype=str, keep_default_na=False, encoding="utf-8-sig")
@@ -219,6 +222,19 @@ def _already_done(path, kind):
                 (not TECHIAITH_API_KEY or cysill_share > 0):
             return True
     return False
+
+
+def retire_stale(path, kind):
+    """Moves this article's `kind` folders to runs/_deleted/ -- for a kind the
+    article no longer has. After the statement split, an article whose quotes
+    were all spokesperson statements has no "quote" document, and its old
+    mixed quote folder (news-927) would otherwise stay and be counted."""
+    n = 0
+    for folder in RUNS_DIR.glob(f"*/News_{kind}_{_doc_id(path)}"):
+        if folder.is_dir() and "_deleted" not in folder.parts:
+            _retire(folder, folder, f"no {kind} text in the article any more")
+            n += 1
+    return n
 
 
 def process_document(path, kind, sentences, stamp):
@@ -246,10 +262,10 @@ def process_document(path, kind, sentences, stamp):
         for idx, key in enumerate(OUTPUT_KEYS):
             if outputs[key]:
                 append_output_csv(pd.DataFrame(outputs[key]), vpaths[key], header_flags, idx)
-        if kind != "narration":
-            (vpaths["segments"].parent / SPLIT_MARKER).write_text(
-                "quotes and spokesperson statements split (news_text.STATEMENT_RE)\n",
-                encoding="utf-8")
+        (vpaths["segments"].parent / SPLIT_MARKER).write_text(
+            "quotes/statements split (news_text.STATEMENT_RE); contracted words "
+            "split for tagging (mutation_engine.expand_whisper_tokens)\n",
+            encoding="utf-8")
         counts = ", ".join(f"{k.replace('_mutations', '')}={len(outputs[k])}" for k in DETECTION_KEYS)
         print(f"  {_doc_id(path)} {kind}: {len(outputs['words'])} words -- {counts}")
         try:
@@ -291,12 +307,17 @@ def main(argv):
           + (f" ({skipped_other} from other sites skipped -- e.g. BBC, whose terms rule it out)"
              if skipped_other else ""))
 
-    jobs = []
+    jobs, retired = [], 0
     for path in files:
         article = read_article(path)
         for kind in KINDS:
-            if article[kind] and (redo or not _already_done(path, kind)):
+            if not article[kind]:
+                retired += retire_stale(path, kind)
+            elif redo or not _already_done(path, kind):
                 jobs.append((path, kind, article[kind]))
+    if retired:
+        print(f"Moved {retired} outdated folder(s) to runs/_deleted/ "
+              f"(documents the articles no longer have).")
     if not jobs:
         print("Nothing left to process -- every article is done on this pipeline version.")
         return 0

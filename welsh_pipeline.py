@@ -43,7 +43,7 @@ from corpus_io import (
     load_failed, record_failure, clear_failure,
     load_local_processed, save_local_processed,
     append_output_csv, cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
-    pipeline_version, set_session_label, keep_awake,
+    pipeline_version, set_session_label, keep_awake, stale_code_warning,
 )
 from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
@@ -307,6 +307,12 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 continue
         if choice is None:
             print("Unknown choice.")
+            continue
+        # Everything except finding videos and editing the queue runs or reads
+        # detection results, so it must not run on code older than the files.
+        stale = stale_code_warning() if choice not in ("2", "5") else None
+        if stale:
+            print(f"\n⛔ {stale}")
             continue
 
         # One pass per action: a "continue" inside a branch below ends the
@@ -836,17 +842,20 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 continue
 
             elif choice == "10":
-                # audit_sample.py: draw a seeded sample to judge, or score the
-                # verdicts (Siarad). Other sources: python audit_sample.py --source ...
+                # audit_sample.py, round 2 (decided 2026-10-01): Siarad and the
+                # YouTube videos, each in analysis/audit2/<source>/. Other
+                # sources: python audit_sample.py --source ...
                 import audit_sample
-                print("\n  a = Draw / refresh the audit sample   b = Score the verdicts")
+                print("\n  a = Draw / refresh the audit samples (Siarad + YouTube)   b = Score the verdicts")
                 sub = input("Choice [b]: ").strip().lower() or "b"
-                if sub == "a":
-                    audit_sample.draw("siarad", force=False)
-                elif sub == "b":
-                    audit_sample.score("siarad")
-                else:
-                    print("Unknown choice.")
+                for audit_source in ("siarad", "youtube"):
+                    if sub == "a":
+                        audit_sample.draw(audit_source, force=False)
+                    elif sub == "b":
+                        audit_sample.score(audit_source)
+                    else:
+                        print("Unknown choice.")
+                        break
                 continue
 
             else:
