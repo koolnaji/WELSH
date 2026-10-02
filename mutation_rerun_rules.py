@@ -615,8 +615,15 @@ def diff_and_write(video_slug, old_df, new_df, out_path, commit, triggers, rules
 
 
 def _video_folders(video):
+    # CorCenCC output from an older reader (no READER_MARKER) is skipped: its
+    # word stream itself is out of date, so only re-reading it (menu 3 -> c)
+    # fixes it -- and re-scoring it while that runs could collide with the
+    # reader moving the same folder to _deleted (2026-10-02).
+    from corpus_corcencc import READER_MARKER
     folders = sorted({p.parent for p in RUNS_DIR.glob("*/*/segments_*.csv")
-                      if "_deleted" not in p.parts})
+                      if "_deleted" not in p.parts
+                      and not (p.parent.name.startswith("CorCenCC_")
+                               and not (p.parent / READER_MARKER).exists())})
     if video and video != "all":
         folders = [f for f in folders if video in f.name or video in f.parent.name]
     return folders

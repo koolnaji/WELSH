@@ -2,9 +2,11 @@
 quantifier_engine.py
 =====================
 Detection for the quantifier_* branch (see quantifier_tables.py for the
-linguistics): after a quantifier + "o" ("llawer o", "digon o", "lot o"),
-a count noun should be plural in both Welsh and English -- the second
-predicted-to-RESIST branch, alongside plural_engine.py ("rhai" + plural).
+linguistics): after a quantity word + "o" ("llawer o", "digon o", "lot o",
+and since 2026-10-02 the partitives "un o'r", "rhai o'r", "dau o'r", "y rhan
+fwyaf o'r"), a count noun should be plural in both Welsh and English -- the
+second predicted-to-RESIST branch, alongside plural_engine.py ("rhai" +
+plural); the analyzer also reports the two as one combined control.
 
 Same gates as plural_engine.py and numeral_engine.py, applied to correct
 and eroded cases alike so none can tilt the rate:
@@ -37,7 +39,7 @@ never another branch.
 import bangor_lexicon
 from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted
 from quantifier_tables import (QUANTIFIER_FORMS, LOAN_QUANTIFIERS, LINKING_WORDS,
-                               MASS_NOUN_LEMMAS, COLLECTIVE_NOUN_LEMMAS,
+                               ARTICLE_FORMS, MASS_NOUN_LEMMAS, COLLECTIVE_NOUN_LEMMAS,
                                WELSH_FILLERS, DISCOURSE_PARTICLES)
 
 
@@ -106,6 +108,8 @@ def process_quantifier_plurals(words_list):
             continue   # "llawer gwell" (much better), or "o" = "he"
 
         target_idx = _next_real(words_list, link_idx)
+        if target_idx is not None and normalize_word(words_list[target_idx]["word"]) in ARTICLE_FORMS:
+            target_idx = _next_real(words_list, target_idx)   # "o (y)r plant" -- see ARTICLE_FORMS
         if target_idx is None:
             continue
         target = words_list[target_idx]

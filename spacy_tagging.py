@@ -134,6 +134,15 @@ def is_noun_target(word_dict):
     if lex_pos and ("NOUN" not in lex_pos or _CONJUNCTION_POS & set(lex_pos)
                     or "ADJ" in lex_pos):
         return False
+    # Cysill's veto: when Cysill tagged the word and none of its readings is
+    # a noun (NM / NF / NPL...), it isn't one, whatever spaCy says. spaCy's
+    # tags can slip one word along a long sentence: CorCenCC "W ma rai ar y
+    # llawr" had spaCy ar = NOUN, y = ADV, llawr = CCONJ, while Cysill had ar
+    # = PREP -- a rhai "erosion" on a preposition (2026-10-02). Removes rows
+    # whatever their number, so it can't tilt a rate.
+    cysill = (word_dict.get("cysill_pos") or "").upper()
+    if cysill and not any(r.strip().startswith("N") for r in cysill.split("+")):
+        return False
     return tagged_as(word_dict, "NOUN", ("N",))
 
 
@@ -162,12 +171,31 @@ def noun_number(word_dict):
     Bangor lexicon's dictionary value ("lex_number", set by enrich_words()),
     then spaCy's morph tag, then Cysill. number may also be "collective" or
     None; source is None when nothing answered."""
+    if _southern_e_plural(word_dict.get("word")):
+        return "plural", "lexicon"
     for value, source in ((word_dict.get("lex_number"), "lexicon"),
                           (extract_number_from_spacy(word_dict.get("spacy_token")), "spacy"),
                           (word_dict.get("cysill_number"), "cysill")):
         if value:
             return value, source
     return None, None
+
+
+def _southern_e_plural(word):
+    """True for a southern spelling of an -au plural: "pethe" = pethau,
+    "ffrwythe" = ffrwythau, "hade" = hadau. CorCenCC's (largely southern)
+    transcribers write them so; the lexicon either doesn't know them or
+    calls "pethe" singular, which made "rhai pethe" (some things) a rhai
+    erosion (2026-10-02). The -au form must be a plural noun whose lemma is
+    NOT the word itself -- "boreau" is the plural of "bore", so "bore"
+    (morning) stays singular."""
+    import bangor_lexicon
+    w = (word or "").lower().strip(".,!?;:'\"")
+    if len(w) < 4 or not w.endswith("e") or not bangor_lexicon.is_loaded():
+        return False
+    plural = [e for e in bangor_lexicon.lookup(w[:-1] + "au")
+              if e["pos"] == "NOUN" and e["morph"].get("Number") == "Plur"]
+    return bool(plural) and all(e["lemma"].lower() != w for e in plural)
 
 
 def parse_spacy_doc(text):

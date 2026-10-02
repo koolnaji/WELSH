@@ -266,7 +266,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     MAIN_MENU = [
         ("1", "Find new YouTube videos",                "2"),
         ("2", "Process the queue",                      "3"),
-        ("3", "Process transcripts (Siarad / Patagonia / news)", "9"),
+        ("3", "Process transcripts (Siarad / Patagonia / CorCenCC / news)", "9"),
         ("4", "Update all results after a code change", "8"),
         ("5", "Show the numbers (corpus analyzer)",     "6"),
         ("6", "Precision audit",                        "10"),
@@ -818,12 +818,19 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # after a Cysill limit stop just choose this again.
                 import corpus_siarad
                 import news_text
-                print("\n  s = Siarad   p = Patagonia   n = News articles (text baseline)"
+                print("\n  s = Siarad   p = Patagonia   c = CorCenCC (spoken)   n = News articles (text baseline)"
                       "\n  (or type the path to a .cha file / folder)")
                 raw = input("Corpus [s]: ").strip()
                 if raw.lower() == "n":
                     # news_text finds the scraper's news_corpus folder(s) itself
                     runner, args = news_text.main, []
+                elif raw.lower() == "c":
+                    import corpus_corcencc
+                    target = BASE_DIR / "corcencc"
+                    if not target.exists():
+                        print(f"  Not found: {target}")
+                        continue
+                    runner, args = corpus_corcencc.main, [str(target)]
                 else:
                     target = {"": BASE_DIR / "siarad", "s": BASE_DIR / "siarad",
                               "p": BASE_DIR / "patagonia"}.get(raw.lower(), Path(raw))
@@ -846,11 +853,15 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # YouTube videos, each in analysis/audit2/<source>/. Other
                 # sources: python audit_sample.py --source ...
                 import audit_sample
-                print("\n  a = Draw / refresh the audit samples (Siarad + YouTube)   b = Score the verdicts")
+                print("\n  a = Draw / refresh the audit samples (Siarad + YouTube)   b = Score the verdicts\n"
+                      "  c = Redraw samples whose data changed (their old verdicts are dropped)")
                 sub = input("Choice [b]: ").strip().lower() or "b"
-                for audit_source in ("siarad", "youtube"):
-                    if sub == "a":
-                        audit_sample.draw(audit_source, force=False)
+                # CorCenCC joins once it has been processed (menu 3 -> c)
+                audit_sources = ["siarad", "youtube"] + \
+                    (["corcencc"] if any((BASE_DIR / "runs").glob("*/CorCenCC_*")) else [])
+                for audit_source in audit_sources:
+                    if sub in ("a", "c"):
+                        audit_sample.draw(audit_source, force=(sub == "c"))
                     elif sub == "b":
                         audit_sample.score(audit_source)
                     else:

@@ -12,7 +12,9 @@ Usage:
 Output (all written to welsh_analysis/analysis/):
     - merged_mutations.csv          : all runs merged, deduped, with batch tag
     - video_formality.csv / speaker_formality.csv : F-score etc. (corpus_formality.py)
-    - figures/erosion_by_type.png, erosion_by_rule.png, erosion_over_batches.png
+    - figures/erosion_by_type.png   : every expected_mutation label, all sources pooled
+    - figures/erosion_by_mutation_family.png : soft / nasal / aspirate / h-prothesis, per corpus
+    - figures/erosion_by_rule.png   : grammatical environment, per corpus
     - figures/erosion_by_channel.png: erosion rate per source channel
     - figures/codeswitch_by_channel.png: code-switch rate per channel
     - figures/status_distribution.png  : full status breakdown (stacked bar)
@@ -34,6 +36,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend -- saves files without needing a display
@@ -134,6 +137,7 @@ CHANNEL_MAP_SHORT = {slug: name for _url, slug, name in _CHANNEL_ENTRIES}
 CORPUS_LABELS = {
     "siarad":         "Siarad",
     "patagonia":      "Patagonia",
+    "corcencc":       "CorCenCC",
     "news-narration": "News articles: narration",
     "news-quote":     "News articles: quotes",
     "news-statement": "News articles: statements",
@@ -157,7 +161,7 @@ def source_label(source):
 def transcript_kind(source):
     """Legend label: the source plus how its text was made."""
     s = str(source)
-    if s in ("siarad", "patagonia"):
+    if s in ("siarad", "patagonia", "corcencc"):
         return f"{source_label(s)} (human transcript)"
     if s.startswith("news-"):
         return f"{source_label(s)} (text)"
@@ -769,47 +773,166 @@ def fig_erosion_by_type(df, filename_prefix=""):
     _save(fig, f"{filename_prefix}erosion_by_type.png")
 
 
+# ---- per-corpus comparisons (erosion_by_rule, erosion_by_mutation_family) ----
+# Pooling every source into one bar mixes edited news text (~2%) with
+# conversation (~20%), so these two figures show one bar per corpus group.
+# The text bar is news NARRATION only: edited copy, so its rate in each
+# environment is that environment's detector noise floor (2026-10-02: article +
+# feminine noun 0.9%, trigger words 1.1%, but feminine noun + adjective 6.6% --
+# "arolwg barn diweddar", where the adjective belongs to the first noun).
+# Quotes and press statements are partly speech, so they're left out here.
+CORPUS_GROUP_ORDER = ["News narration (noise floor)", "YouTube videos", "CorCenCC",
+                      "Siarad", "Patagonia"]
+CORPUS_GROUP_COLORS = {"News narration (noise floor)": "#9E9E9E", "YouTube videos": "#4C72B0",
+                       "CorCenCC": "#8172B3", "Siarad": "#DD8452", "Patagonia": "#55A868"}
+MIN_CELL_CONTEXTS = 20   # a corpus x category bar needs this many contexts
+
+# Readable names for the mutation rules, with an example of the environment.
+RULE_LABELS = {
+    "word_trigger":               "Trigger word: preposition, possessive, yn, a...\n(i Gaerdydd, ei gath, yn fawr)",
+    "definite_article+fem_noun":  "Article + feminine noun (y ferch)",
+    "fem_noun+adjective":         "Feminine noun + adjective (merch dda)",
+    "numeral+fem_noun":           "un + feminine noun (un ferch)",
+    "numeral_general+noun":       "dau/dwy + noun (dau gi)",
+    "restricted_nasal_numeral":   "Numeral + blynedd/diwrnod (pum mlynedd)",
+    "spacy_obj_soft":             "Direct object of inflected verb (welais i gi)",
+    "spacy_vocative_soft":        "Vocative (bore da, blant)",
+    "mixed_mutation":             "Negative particle + verb (ni chaf, na fydd)",
+    "h_mutation":                 "h- before a vowel (ei hafal, eu henwau)",
+    "feminine_ei":                "Feminine 'ei' (ei chath, ei henw)",
+    "preposed_adjective+noun":    "Preposed adjective + noun (hen ddyn)",
+    "feminine_ordinal+noun":      "Feminine ordinal + noun (ail waith)",
+}
+
+# Four mutation families. soft_limited is soft mutation minus ll/rh, so it is
+# soft; a context whose expectation spans two families (yn: soft or nasal;
+# a + inflected verb: aspirate or soft) has no single family and is left out
+# -- placing it by the mutation actually FOUND would send every correct case
+# to a family and every eroded one nowhere, which biases every family down.
+MUTATION_FAMILIES = {"soft": "Soft", "soft_limited": "Soft", "nasal": "Nasal",
+                     "aspirate": "Aspirate", "h-mutation": "h-prothesis"}
+FAMILY_ORDER = ["Soft", "Nasal", "Aspirate", "h-prothesis"]
+
+
+def _corpus_group(source):
+    s = str(source)
+    if s == "news-narration":
+        return "News narration (noise floor)"
+    if s.startswith("news-"):
+        return None     # quotes / statements: see CORPUS_GROUP_ORDER
+    if s in ("siarad", "patagonia", "corcencc"):
+        return CORPUS_LABELS[s]
+    return "YouTube videos"
+
+
+def _mutation_family(expected):
+    families = {MUTATION_FAMILIES.get(p.strip()) for p in str(expected).split("|")} - {None}
+    return families.pop() if len(families) == 1 else None
+
+
+def _evaluable_mutation_rows(df):
+    """Mutation rows that count toward a rate, with a corpus-group column."""
+    sub = df
+    if "is_code_switch" in sub.columns:
+        sub = sub[sub["is_code_switch"].isin([False])]
+    if "rule" in sub.columns:
+        sub = sub[sub["rule"] != "phantom_check"]
+    if "status" in sub.columns:
+        sub = sub[sub["status"].isin(EVALUABLE_STATUSES)]
+    sub = sub.dropna(subset=["is_erosion"])
+    sub = sub.assign(corpus=sub["source"].map(_corpus_group))
+    return sub.dropna(subset=["corpus"]).assign(is_erosion=lambda d: d["is_erosion"].astype(bool))
+
+
+def _corpus_comparison_chart(sub, cat_col, cat_order, cat_labels, title, filename):
+    """Grouped horizontal bars: one group per category, one bar per corpus,
+    erosion rate with a Wilson 95% interval and n. Cells under
+    MIN_CELL_CONTEXTS contexts are left blank."""
+    groups = [g for g in CORPUS_GROUP_ORDER if g in set(sub["corpus"])]
+    # Only categories where at least one corpus has a bar -- an all-blank row
+    # ("decompounded_noun") is just clutter.
+    cell_sizes = sub.groupby(["corpus", cat_col]).size()
+    cats = [c for c in cat_order
+            if any(cell_sizes.get((g, c), 0) >= MIN_CELL_CONTEXTS for g in groups)]
+    if not groups or not cats:
+        print(f"  [skip] {filename} -- no data")
+        return
+    height = 0.8 / len(groups)
+    fig, ax = plt.subplots(figsize=(11, max(4, 0.32 * len(cats) * len(groups) + 1.8)))
+    labelled, x_max = set(), 0.0
+    for gi, group in enumerate(groups):
+        for ci, cat in enumerate(cats):
+            cell = sub[(sub["corpus"] == group) & (sub[cat_col] == cat)]
+            n = len(cell)
+            if n < MIN_CELL_CONTEXTS:
+                continue
+            k = int(cell["is_erosion"].sum())
+            p = k / n
+            low, high = _wilson_interval(k, n)
+            y = ci + (gi - (len(groups) - 1) / 2) * height
+            ax.barh(y, 100 * p, height=height * 0.9, color=CORPUS_GROUP_COLORS[group],
+                    label=group if group not in labelled else None)
+            labelled.add(group)
+            ax.errorbar(100 * p, y, xerr=[[max(0.0, 100 * (p - low))], [max(0.0, 100 * (high - p))]],
+                        fmt="none", ecolor="#333333", capsize=2, linewidth=0.8)
+            ax.text(100 * high + 0.6, y, f"{100 * p:.1f}% (n={n:,})", va="center", fontsize=7)
+            x_max = max(x_max, 100 * high)
+    ax.set_yticks(range(len(cats)))
+    ax.set_yticklabels([cat_labels.get(c, c) for c in cats], fontsize=9)
+    ax.invert_yaxis()
+    x_lim = min(x_max * 1.3 + 2, 112)   # room for the labels, but never a 120% axis
+    ax.set_xlim(0, x_lim)
+    if x_lim > 100:
+        ax.xaxis.set_major_locator(mticker.FixedLocator(range(0, 101, 20)))
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    ax.set_xlabel(f"Erosion rate (%, 95% Wilson CI; bars with < {MIN_CELL_CONTEXTS} contexts omitted)")
+    ax.set_title(title, fontweight="bold", pad=12)
+    ax.legend(fontsize=9, loc="lower right")
+    fig.tight_layout()
+    _save(fig, filename)
+
+
 def fig_erosion_by_rule(df, filename_prefix=""):
     """
-    Horizontal bar chart: erosion rate per detection rule
-    (word_trigger, definite_article+fem_noun, fem_noun+adjective,
-    numeral+fem_noun, h_mutation, feminine_ei, phantom_check).
-    This is the figure that most directly shows which grammatical
-    environments are most at risk -- key for the assimilation argument.
-
-    PATCH (Phase 3): the per-`register` split is gone, same reasoning as
-    fig_erosion_by_type -- see that function's docstring.
+    Erosion rate per grammatical environment (detection rule), one bar per
+    corpus -- which environments erode, and whether the same ones erode in
+    every corpus. Rules are ordered by their Siarad rate (the main dataset),
+    highest first. "word_trigger" bundles every trigger WORD (prepositions,
+    possessives, yn, a/â...); the others are structural environments.
     """
     if "rule" not in df.columns or "is_erosion" not in df.columns:
         print(f"  [skip] {filename_prefix}erosion_by_rule -- missing columns")
         return
+    sub = _evaluable_mutation_rows(df)
+    siarad = sub[sub["corpus"] == "Siarad"].groupby("rule")["is_erosion"].agg(["mean", "size"])
+    ranked = siarad[siarad["size"] >= MIN_CELL_CONTEXTS].sort_values("mean", ascending=False).index.tolist()
+    order = ranked + sorted(set(sub["rule"]) - set(ranked))
+    _corpus_comparison_chart(sub, "rule", order, RULE_LABELS,
+                             "Mutation erosion by grammatical environment, per corpus",
+                             f"{filename_prefix}erosion_by_rule.png")
 
-    sub = df
-    sub = sub[sub["is_code_switch"].isin([False])] if "is_code_switch" in sub.columns else sub
-    sub = sub[sub["rule"] != "phantom_check"]
-    # Restrict to evaluable contexts only
-    if "status" in sub.columns:
-        sub = sub[sub["status"].isin(EVALUABLE_STATUSES)]
 
-    grouped = sub.groupby("rule").agg(
-        contexts=("is_erosion", "count"),
-        erosion_rate=("is_erosion", "mean"),
-    ).reset_index()
-    grouped = grouped[grouped["contexts"] >= 5].sort_values("erosion_rate", ascending=True)
-
-    if grouped.empty:
-        print(f"  [skip] {filename_prefix}erosion_by_rule -- insufficient data")
+def fig_erosion_by_mutation_family(df, filename_prefix=""):
+    """
+    Erosion rate per mutation family -- soft, nasal, aspirate, h-prothesis
+    -- one bar per corpus. erosion_by_type keeps the raw expected_mutation
+    labels (soft_limited, "nasal|soft_limited", ...); this one merges them:
+    soft_limited is soft, and contexts where two families are possible are
+    left out (see MUTATION_FAMILIES) and counted in the title.
+    """
+    if "expected_mutation" not in df.columns or "is_erosion" not in df.columns:
+        print(f"  [skip] {filename_prefix}erosion_by_mutation_family -- missing columns")
         return
-
-    fig, ax = plt.subplots(figsize=(9, max(3, len(grouped) * 0.65)))
-    _bar_with_counts(ax, grouped["rule"], grouped["erosion_rate"] * 100,
-                     grouped["contexts"], color="#4C72B0")
-    ax.set_title("Mutation Erosion Rate by Detection Rule\n"
-                 "(grammatical environment)", fontweight="bold", pad=12)
-    ax.set_xlabel("Erosion Rate (%)")
-    ax.set_ylabel("Detection Rule")
-    fig.tight_layout()
-    _save(fig, f"{filename_prefix}erosion_by_rule.png")
+    sub = _evaluable_mutation_rows(df)
+    sub = sub.assign(family=sub["expected_mutation"].map(_mutation_family))
+    n_two = int(sub["family"].isna().sum())
+    sub = sub.dropna(subset=["family"])
+    _corpus_comparison_chart(
+        sub, "family", FAMILY_ORDER, {},
+        f"Mutation erosion by mutation type, per corpus\n"
+        f"(soft-limited counted as soft; {n_two:,} contexts where two types are possible "
+        f"-- yn: soft or nasal, a + verb: aspirate or soft -- left out)",
+        f"{filename_prefix}erosion_by_mutation_family.png")
 
 
 def fig_erosion_by_channel(df):
@@ -1016,6 +1139,10 @@ def fig_status_distribution(df):
             pivot[s] = 0
     pivot     = pivot[BAR_STATUSES]
     pivot_pct = pivot.div(pivot.sum(axis=1), axis=0) * 100
+    # Least eroded at the top, most eroded at the bottom (user, 2026-10-02):
+    # the bars then read as a formality ladder, not an alphabetical list.
+    pivot_pct = pivot_pct.sort_values("correct_mutation", ascending=False)
+    pivot     = pivot.loc[pivot_pct.index]
 
     # PATCH: was a plain mismatch-rate percentage (mismatch count / total
     # classification-attempted count). That's not a real credibility
@@ -1080,16 +1207,19 @@ def fig_status_distribution(df):
     ax.set_xlim(0, 100)
     ax.set_ylim(-0.5, n - 0.5)
     ax.set_yticks(range(n))
-    ax.set_yticklabels(channels)
+    eroded = 100 - pivot_pct["correct_mutation"]
+    ax.set_yticklabels([f"{ch}\n{eroded[ch]:.1f}% eroded, n={int(pivot.loc[ch].sum()):,}"
+                        for ch in channels])
     ax.invert_yaxis()
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
     ax.set_xlabel("% of evaluable mutation outcomes (Correct / Erosion / Wrong type)")
-    ax.set_title("Evaluable Mutation Outcome Distribution by Channel\n"
+    ax.set_title("Evaluable Mutation Outcome Distribution by Channel, least eroded first\n"
                  "(phantom omissions excluded -- correct by construction; "
                  "\u03ba = Cohen's Kappa, spaCy vs Cysill, shown separately, right of each bar)",
                  fontweight="bold", pad=12)
-    ax.legend(handles=legend_handles, bbox_to_anchor=(1.01, 1),
-              loc="upper left", fontsize=8)
+    # Below the axis: at the top right it covered the first bar's kappa label.
+    ax.legend(handles=legend_handles, bbox_to_anchor=(0.5, -0.09),
+              loc="upper center", ncol=3, fontsize=9, frameon=False)
     fig.tight_layout()
     _save(fig, "status_distribution.png")
 
@@ -1175,57 +1305,6 @@ def fig_tagger_agreement(df):
     _save(fig, "tagger_agreement.png")
 
 
-def fig_erosion_over_batches(df, batch_log, filename_prefix=""):
-    """
-    Line chart: overall erosion rate per batch run, ordered chronologically.
-    Lets you track whether successive corpus runs converge on a stable estimate.
-
-    PATCH (Phase 3): the per-`register` split is gone, same reasoning as
-    fig_erosion_by_type -- see that function's docstring.
-    """
-    if "batch" not in df.columns or "is_erosion" not in df.columns:
-        print(f"  [skip] {filename_prefix}erosion_over_batches -- missing columns")
-        return
-
-    sub = df
-    sub = sub[sub["is_code_switch"].isin([False])] if "is_code_switch" in sub.columns else sub
-    # Restrict to evaluable contexts only
-    if "status" in sub.columns:
-        sub = sub[sub["status"].isin(EVALUABLE_STATUSES)]
-
-    n_batches = sub["batch"].nunique() if "batch" in sub.columns else 0
-    if n_batches < 2:
-        print(f"  [skip] {filename_prefix}erosion_over_batches -- need at least 2 batches "
-              f"to plot a trend (found {n_batches})")
-        return
-
-    batch_rates = sub.groupby("batch").agg(
-        contexts=("is_erosion", "count"),
-        erosion_rate=("is_erosion", "mean"),
-    ).reset_index().sort_values("batch")
-
-    fig, ax = plt.subplots(figsize=(max(6, len(batch_rates) * 0.8), 4))
-    ax.plot(batch_rates["batch"], batch_rates["erosion_rate"] * 100,
-            marker="o", linewidth=2, color="#4C72B0", markersize=6)
-    ax.fill_between(batch_rates["batch"], batch_rates["erosion_rate"] * 100,
-                    alpha=0.15, color="#4C72B0")
-
-    for _, row in batch_rates.iterrows():
-        ax.annotate(f"{row['erosion_rate']*100:.1f}%\n(n={row['contexts']})",
-                    (row["batch"], row["erosion_rate"] * 100),
-                    textcoords="offset points", xytext=(0, 10),
-                    ha="center", fontsize=8)
-
-    ax.set_xlabel("Batch (run timestamp)")
-    ax.set_ylabel("Erosion Rate (%)")
-    ax.set_title("Overall Erosion Rate Across Successive Batches\n"
-                 "(convergence check)", fontweight="bold", pad=12)
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
-    plt.xticks(rotation=30, ha="right")
-    fig.tight_layout()
-    _save(fig, f"{filename_prefix}erosion_over_batches.png")
-
-
 def fig_collision_flags(df):
     """
     Simple count bar: how many rows were flagged as known homograph
@@ -1278,7 +1357,7 @@ def _per_video_erosion_rates(df, min_contexts=5):
 
 def fig_erosion_vs_formality(df, formality_df):
     """
-    Scatter + linear regression: per-video erosion rate vs. formality
+    Scatter + logistic curve (_logistic_fit): per-video erosion rate vs. formality
     score (Heylighen-Dewaele F-score, corpus_formality.py) -- the direct
     test of the formal/informal/casual comparison this project is built
     around, now against a grounded, continuous, per-video measurement
@@ -1303,15 +1382,17 @@ def fig_erosion_vs_formality(df, formality_df):
     merged["erosion_rate_pct"] = merged["erosion_rate"] * 100
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    sns.regplot(data=merged, x="f_score", y="erosion_rate_pct", ax=ax,
-                scatter_kws={"s": merged["contexts"].clip(upper=200), "alpha": 0.6},
-                line_kws={"color": "#C44E52"})
-    r = merged["f_score"].corr(merged["erosion_rate_pct"])
+    ax.scatter(merged["f_score"], merged["erosion_rate_pct"],
+               s=merged["contexts"].clip(upper=200), alpha=0.6)
+    fit = _draw_logistic(ax, merged["f_score"], merged["erosion_rate"], merged["contexts"])
+    rho = _spearman_text(merged["f_score"], merged["erosion_rate_pct"])
+    ax.set_ylim(bottom=-2)
     ax.set_xlabel("Formality Score (Heylighen-Dewaele F, higher = more formal)")
     ax.set_ylabel("Erosion Rate (%)")
     ax.set_title(f"Mutation Erosion Rate vs. Formality Score\n"
-                 f"(per video, n={len(merged)}, r={r:.2f}; point size = context count)",
-                 fontweight="bold", pad=12)
+                 f"(per video, n={len(merged)}, Spearman ρ={rho}; point size = context count)\n"
+                 f"logistic fit, weighted by contexts: {fit or 'not fitted'}",
+                 fontweight="bold", pad=12, fontsize=10)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
     fig.tight_layout()
     _save(fig, "erosion_vs_formality.png")
@@ -1319,7 +1400,7 @@ def fig_erosion_vs_formality(df, formality_df):
 
 def fig_erosion_vs_codeswitch(df, formality_df):
     """
-    Scatter + linear regression: per-video erosion rate vs. whole-
+    Scatter + logistic curve (_logistic_fit): per-video erosion rate vs. whole-
     transcript code-switch rate -- reported as its OWN figure, separate
     from formality (see corpus_formality.py's module docstring for why):
     a real, independent contact-intensity signal, but mixing it into the
@@ -1345,15 +1426,17 @@ def fig_erosion_vs_codeswitch(df, formality_df):
     merged["codeswitch_rate_pct"] = merged["codeswitch_rate"] * 100
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    sns.regplot(data=merged, x="codeswitch_rate_pct", y="erosion_rate_pct", ax=ax,
-                scatter_kws={"s": merged["contexts"].clip(upper=200), "alpha": 0.6},
-                line_kws={"color": "#C44E52"})
-    r = merged["codeswitch_rate_pct"].corr(merged["erosion_rate_pct"])
+    ax.scatter(merged["codeswitch_rate_pct"], merged["erosion_rate_pct"],
+               s=merged["contexts"].clip(upper=200), alpha=0.6)
+    fit = _draw_logistic(ax, merged["codeswitch_rate_pct"], merged["erosion_rate"], merged["contexts"])
+    rho = _spearman_text(merged["codeswitch_rate_pct"], merged["erosion_rate_pct"])
+    ax.set_ylim(bottom=-2)
     ax.set_xlabel("Code-Switch Rate (%, whole transcript)")
     ax.set_ylabel("Erosion Rate (%)")
     ax.set_title(f"Mutation Erosion Rate vs. Code-Switch Rate\n"
-                 f"(per video, n={len(merged)}, r={r:.2f}; point size = context count)",
-                 fontweight="bold", pad=12)
+                 f"(per video, n={len(merged)}, Spearman ρ={rho}; point size = context count)\n"
+                 f"logistic fit, weighted by contexts: {fit or 'not fitted'}",
+                 fontweight="bold", pad=12, fontsize=10)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
     fig.tight_layout()
     _save(fig, "erosion_vs_codeswitch.png")
@@ -1371,7 +1454,12 @@ BRANCHES = [
     ("Numeral + singular noun", "numeral_mutations",    "erode"),
     ("rhai + plural noun",      "plural_mutations",     "resist"),
     ("Quantifier + o + plural", "quantifier_mutations", "resist"),
+    # Both controls test one rule -- a count noun after a quantity word is
+    # plural, in Welsh and in English -- so they're also pooled into one
+    # sturdier control (decision 2026-10-02). Built in load_branch_rows.
+    ("Controls combined",       None,                   "resist"),
 ]
+COMBINED_CONTROL = ("rhai + plural noun", "Quantifier + o + plural")
 
 
 def load_branch_rows():
@@ -1388,6 +1476,8 @@ def load_branch_rows():
     """
     out = {}
     for label, prefix, _ in BRANCHES:
+        if prefix is None:      # the combined control, built below
+            continue
         files = [p for p in MUT_DIR.rglob(f"{prefix}_*.csv")
                  if "_deleted" not in p.parts and not p.name.endswith("_precaption_backup.csv")]
         if prefix == "mutations":
@@ -1420,6 +1510,8 @@ def load_branch_rows():
             rows = rows[rows["status"].isin(EVALUABLE_STATUSES)]
         rows = rows.assign(is_erosion=rows["is_erosion"].map(lambda v: str(v).strip().lower() == "true"))
         out[label] = rows
+    parts = [out[l] for l in COMBINED_CONTROL if l in out and not out[l].empty]
+    out["Controls combined"] = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     return out
 
 
@@ -1466,9 +1558,87 @@ def _wilson_interval(k, n, z=1.96):
     return centre - half, centre + half
 
 
+def _logistic_fit(x, rate, contexts):
+    """Binomial logistic regression of erosion on x, every unit weighted by
+    its contexts: P(erosion) = 1 / (1 + exp(-(a + b*x))). Replaces the
+    straight regplot line (2026-10-02), which ran below 0% at the formal end
+    -- a rate can't. Fitted by IRLS in numpy (no statsmodels needed).
+
+    The 95% band is widened by the quasi-binomial dispersion: contexts from
+    one video (one speaker, one topic) aren't independent, so a plain
+    binomial band would be far too narrow.
+
+    Returns (predict(x_grid) -> (rate, low, high) in %, odds ratio per 10
+    points of x, its 95% CI), or None when there's nothing to fit (no
+    erosion at all, or every context eroded)."""
+    x = np.asarray(x, float)
+    n = np.asarray(contexts, float)
+    k = np.asarray(rate, float) * n
+    if len(x) < 3 or k.sum() == 0 or k.sum() == n.sum() or np.ptp(x) == 0:
+        return None
+    centre = x.mean()
+    X = np.column_stack([np.ones_like(x), x - centre])
+    beta = np.zeros(2)
+    y = k / n
+    try:
+        for _ in range(50):
+            p = np.clip(1 / (1 + np.exp(-X @ beta)), 1e-9, 1 - 1e-9)
+            w = n * p * (1 - p)
+            z = X @ beta + (y - p) / (p * (1 - p))
+            new = np.linalg.solve(X.T @ (w[:, None] * X), X.T @ (w * z))
+            if np.max(np.abs(new - beta)) < 1e-8:
+                beta = new
+                break
+            beta = new
+        p = np.clip(1 / (1 + np.exp(-X @ beta)), 1e-9, 1 - 1e-9)
+        w = n * p * (1 - p)
+        cov = np.linalg.inv(X.T @ (w[:, None] * X))
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(beta)):
+        return None
+    dispersion = max(1.0, float(np.sum((k - n * p) ** 2 / (n * p * (1 - p)))) / max(len(x) - 2, 1))
+    cov = cov * dispersion
+
+    def predict(grid):
+        G = np.column_stack([np.ones_like(grid), np.asarray(grid, float) - centre])
+        eta = G @ beta
+        se = np.sqrt(np.einsum("ij,jk,ik->i", G, cov, G))
+        sig = lambda v: 100 / (1 + np.exp(-v))
+        return sig(eta), sig(eta - 1.96 * se), sig(eta + 1.96 * se)
+
+    b, se_b = beta[1], math.sqrt(cov[1, 1])
+    odds10 = (math.exp(10 * b), math.exp(10 * (b - 1.96 * se_b)), math.exp(10 * (b + 1.96 * se_b)))
+    return predict, odds10
+
+
+def _draw_logistic(ax, x, rate, contexts, color="#C44E52"):
+    """Draws the _logistic_fit curve + band on ax; returns a short label
+    ("OR per 10 F-points 0.41 [0.33-0.50]") or "" when nothing was fitted."""
+    fit = _logistic_fit(x, rate, contexts)
+    if fit is None:
+        return ""
+    predict, (odds, low, high) = fit
+    grid = np.linspace(np.min(x), np.max(x), 200)
+    mid, lo, hi = predict(grid)
+    ax.plot(grid, mid, color=color, linewidth=2)
+    ax.fill_between(grid, lo, hi, color=color, alpha=0.15, linewidth=0)
+    return f"OR per 10 points {odds:.2f} [{low:.2f}-{high:.2f}]"
+
+
+def _spearman_text(x, y):
+    """Rank correlation (no straight-line assumption), or n/a when flat."""
+    s = pd.DataFrame({"x": x, "y": y})
+    if s["x"].nunique() < 2 or s["y"].nunique() < 2:
+        return "n/a (no variation)"
+    # Spearman = Pearson on ranks; done by hand because pandas' own
+    # method="spearman" needs scipy, which this laptop doesn't have.
+    return f"{s['x'].rank().corr(s['y'].rank()):.2f}"
+
+
 def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, min_contexts=5):
     """
-    Scatter + regression, one panel per branch: erosion rate per unit
+    Scatter + logistic curve, one panel per branch: erosion rate per unit
     (video, or Siarad speaker) against its F-score. Points are coloured by
     transcript type -- Siarad (human) vs Whisper -- so an offset between the
     two sources shows up as two clouds, not as a slope. A panel with fewer
@@ -1493,17 +1663,17 @@ def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, m
                     ha="center", va="center", transform=ax.transAxes, color="grey")
             continue
         pts["erosion_rate_pct"] = pts["erosion_rate"] * 100
-        sns.regplot(data=pts, x="f_score", y="erosion_rate_pct", ax=ax, scatter=False,
-                    line_kws={"color": "#C44E52"})
         kind = pts["source"].map(transcript_kind)
         for name, grp in pts.groupby(kind):
             ax.scatter(grp["f_score"], grp["erosion_rate_pct"], s=grp["contexts"].clip(upper=200),
                        alpha=0.6, label=name)
-        # A branch with no variation (quantifier: 0% everywhere) has no
-        # correlation -- computing one gave numpy "invalid value" warnings.
-        varies = pts["erosion_rate_pct"].nunique() > 1 and pts["f_score"].nunique() > 1
-        r_text = f"{pts['f_score'].corr(pts['erosion_rate_pct']):.2f}" if varies else "n/a (no variation)"
-        ax.set_title(f"{title}\n{unit}s={len(pts)}, r={r_text}", fontweight="bold")
+        # Logistic curve (see _logistic_fit); a branch with no erosion at all
+        # (quantifier: 0% everywhere) gets no curve and rho "n/a".
+        fit = _draw_logistic(ax, pts["f_score"], pts["erosion_rate"], pts["contexts"])
+        rho = _spearman_text(pts["f_score"], pts["erosion_rate_pct"])
+        ax.set_ylim(bottom=-2)
+        ax.set_title(f"{title}\n{unit}s={len(pts)}, Spearman ρ={rho}"
+                     + (f"\n{fit}" if fit else ""), fontweight="bold", fontsize=10)
         ax.set_xlabel("F-score (higher = more formal)")
         ax.set_ylabel("Erosion rate (%)")
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
@@ -1765,12 +1935,12 @@ def main():
     # corpus_formality.py and its erosion-vs-formality figure, called
     # below).
     fig_erosion_by_type(df)
+    fig_erosion_by_mutation_family(df)
     fig_erosion_by_rule(df)
     fig_erosion_by_channel(df)
     fig_codeswitch_by_channel(df)
     fig_status_distribution(df)
     fig_tagger_agreement(df)
-    fig_erosion_over_batches(df, batch_log)
     fig_collision_flags(df)
 
     print("\nComputing per-video formality scores (corpus_formality.py)...")
@@ -1795,9 +1965,12 @@ def main():
         if not rows.empty and "source" in rows.columns:
             kind = rows["source"].map(lambda s: CORPUS_LABELS.get(str(s), "YouTube (Whisper)"))
             for name, grp in rows.groupby(kind):
-                print(f"      {name:<26} {len(grp):>6,} contexts, {grp['video_url'].nunique():>4} videos, "
-                      f"erosion {grp['is_erosion'].mean():.1%}")
-        report_pipeline_versions(rows, label)
+                k, n = int(grp["is_erosion"].sum()), len(grp)
+                low, high = _wilson_interval(k, n)
+                print(f"      {name:<26} {n:>6,} contexts, {grp['video_url'].nunique():>4} videos, "
+                      f"erosion {k / n:.1%} (95% CI {max(0.0, low):.1%}-{high:.1%})")
+        if label != "Controls combined":
+            report_pipeline_versions(rows, label)
     if not formality_df.empty:
         fig_branches_vs_formality(branch_rows, formality_df, ["video_url"],
                                   "branches_vs_formality.png", "video")

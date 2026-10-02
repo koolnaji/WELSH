@@ -465,7 +465,7 @@ def source_kind(source):
     """Short platform name for a video's "source" (channel/feed URL, or the
     marker Siarad/local-MP3 runs set)."""
     s = str(source or "").lower()
-    for marker, kind in (("siarad", "siarad"), ("patagonia", "patagonia"),
+    for marker, kind in (("siarad", "siarad"), ("patagonia", "patagonia"), ("corcencc", "corcencc"),
                          ("youtube", "youtube"), ("youtu.be", "youtube"),
                          ("spreaker", "spreaker"), ("fireside", "fireside"),
                          ("anchor.fm", "anchor"), ("spotify", "anchor"), ("ypod", "ypod")):

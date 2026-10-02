@@ -382,13 +382,22 @@ def get_welsh_lemma(word, node=None):
             LEMMA_CACHE[w] = bangor_lemma
             return bangor_lemma
     # In context, Cysill's own tagging beats any context-free answer, cached
-    # or not. It also seeds the cache, so bare-string callers skip the API.
+    # or not. It no longer seeds the cache (2026-10-02): one sentence's
+    # reading of an ambiguous spelling ("fan" = place / van) became the
+    # answer for that spelling everywhere it had no tag of its own.
     tagger_lemma = (node or {}).get("tagger_lemma")
     if tagger_lemma:
-        LEMMA_CACHE.setdefault(w, tagger_lemma)
         return tagger_lemma
+    # A cached lemma is only trusted if the lexicon allows it for this
+    # spelling (when the lexicon knows the spelling at all) -- the same check
+    # simplemma's answers get below. Without it a bad answer, once cached,
+    # outranked every later run ("-o" was cached as the POS tag "prpers").
     if w in LEMMA_CACHE:
-        return LEMMA_CACHE[w]
+        cached = LEMMA_CACHE[w]
+        known = {e["lemma"].lower() for e in bangor_lexicon.lookup(w)}
+        if not known or cached is None or str(cached).lower() in known:
+            return cached
+        del LEMMA_CACHE[w]   # rejected: looked up again below, and re-cached
     lemma = None
     cysill_call_failed = False
     # PATCH: route through fetch_lemma so retry/reconnect logic applies

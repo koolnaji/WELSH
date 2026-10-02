@@ -24,7 +24,8 @@ Standalone: imports only spacy_tagging.py.
 from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted
 from plural_tables import (RHAI_FORMS, COLLECTIVE_NOUNS, MASS_NOUNS,
                            POSSESSIVE_ECHO_PRONOUNS, WELSH_FILLERS, DISCOURSE_PARTICLES,
-                           PLACE_ADVERB_NOUNS, PLACE_ADVERB_FOLLOWERS)
+                           PLACE_ADVERB_NOUNS, PLACE_ADVERB_FOLLOWERS,
+                           NOT_RHAI_NOUNS, RHAI_PRONOUN_ARTICLES)
 
 
 def normalize_word(word):
@@ -77,6 +78,12 @@ def process_plural_marking(words_list):
             continue
         if current_node.get("_clause_boundary_after"):
             continue
+        # "y rhai" / "yr hen rai" = "the ones" -- see RHAI_PRONOUN_ARTICLES
+        before = [str(words_list[k]["word"]).lower().strip(".,!?;:\"()[]")
+                  for k in range(max(0, i - 2), i)]
+        if (before and before[-1] in RHAI_PRONOUN_ARTICLES) or \
+                (len(before) == 2 and before[-1] == "hen" and before[0] in RHAI_PRONOUN_ARTICLES):
+            continue
 
         target = _find_noun_target(i, words_list)
         if target is None or target.get("confidence", 0.0) < 0.65:
@@ -87,8 +94,8 @@ def process_plural_marking(words_list):
         target_norm = normalize_word(target["word"])
         if target_norm in MASS_NOUNS:
             continue   # English "some" + mass noun is singular -- see MASS_NOUNS
-        if target_norm in DISCOURSE_PARTICLES:
-            continue   # "mae yna rai te" -- see DISCOURSE_PARTICLES
+        if target_norm in DISCOURSE_PARTICLES or target_norm in NOT_RHAI_NOUNS:
+            continue   # "mae yna rai te", "rei pawb arall" -- see plural_tables
         # "rhai" + noun + possessive pronoun is pronoun "rhai" + a possessive
         # phrase: "mae gyda nhw rai tad fi" = they've got some of my dad's
         # (davies13.cha, 2026-09-26) -- not "some dads".

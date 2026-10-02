@@ -17,12 +17,15 @@ almost never followed by a noun ("these dogs" is "y cŵn 'ma/hyn"), so the
 branch produced zero rows on every real transcript.
 """
 
-# "rai" is the soft-mutated form ("i rai pobl").
-RHAI_FORMS = {"rhai", "rai"}
+# "rai" is the soft-mutated form ("i rai pobl"); "rhei"/"rei" are the northern
+# spellings the Siarad transcribers use -- 183 Siarad lines have "rei/rhei" +
+# a word against 84 with "rhai/rai", so without them the branch read about a
+# third of the data (2026-10-02).
+RHAI_FORMS = {"rhai", "rai", "rhei", "rei"}
 
 # Grammatically singular nouns with plural meaning that are standard after
 # "rhai" ("rhai pobl" = some people) -- their singular tag is not erosion.
-COLLECTIVE_NOUNS = {"pobl", "bobl"}
+COLLECTIVE_NOUNS = {"pobl", "bobl", "pobol", "bobol"}   # pobol: southern spelling (CorCenCC)
 
 # Mass nouns are excluded from this branch (decision 2026-09-26). The
 # "English agrees" premise only holds for countable nouns: English "some"
@@ -49,7 +52,7 @@ MASS_NOUNS = {
     "gwellt", "gwallt", "gwres", "oerfel",
     "amynedd", "hyder", "parch", "cefnogaeth", "cymorth", "gofal", "egni",
     "ynni", "ymchwil", "addysg", "iechyd", "ofn", "poen", "pwysau", "cwsg",
-    "diddordeb", "ymarfer", "newid",
+    "diddordeb", "ymarfer", "newid", "metel",
     "cymraeg", "saesneg", "sbaeneg", "ffrangeg", "almaeneg", "eidaleg",
 }
 
@@ -62,6 +65,20 @@ POSSESSIVE_ECHO_PRONOUNS = {"fi", "ti", "di", "fe", "e", "hi", "ni", "chi", "nhw
 # "fan"/"man" + yma/yna/hyn/acw = "here/there" ("rai fan yna" = some over
 # there, fusser23.cha). Same list as mutation_tables.DISCOURSE_PARTICLES.
 DISCOURSE_PARTICLES = {"te", "tê", "de", "ta", "ynte", "yntê"}
+# More pronoun "rhai" + a word that isn't its noun, from the first run with the
+# northern spellings (2026-10-02): "yr hen rei gyd" (the old ones, all -- "i
+# gyd"), "rei pawb arall" (everyone else's), "rei tu mewn" (ones inside),
+# "rhai tro nesa" (some next time). Dropped whatever their number.
+NOT_RHAI_NOUNS = {"gyd", "pawb", "tu", "tro", "dro",
+                  # CorCenCC (2026-10-02): "rai popeth", "rhai lan" (put some up),
+                  # "rhai pedwar deg gwaith" (some forty times), "rai fan yn heddiw"
+                  # (some here today -- "fan hyn"), "fan 'na"
+                  "popeth", "lan", "fan", "man"}
+# "y rhai" = "the ones", always the pronoun: "y rei côr" (the choir ones), "y
+# rei cyngerdd" (the concert ones), "yr hen rei" -- the word after it is an
+# attributive noun, singular in English too ("the choir ones"). Same 2026-10-02
+# run: 4 of the 8 new Siarad/Patagonia "erosions" were this.
+RHAI_PRONOUN_ARTICLES = {"y", "yr", "'r", "r"}
 PLACE_ADVERB_NOUNS = {"fan", "man"}
 PLACE_ADVERB_FOLLOWERS = {"yma", "yna", "hyn", "acw", "ma", "na", "'ma", "'na"}
 

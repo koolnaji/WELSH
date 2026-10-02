@@ -38,11 +38,33 @@ QUANTIFIER_FORMS = {
     # and without it. Whether a borrowed quantifier behaves like native
     # "llawer o" is itself of interest.
     "lot": "lot", "lots": "lot",
+    # Partitives, added 2026-10-02 to make the "English agrees" control
+    # sturdier: "un o'r pethau" (one of the things), "rhai o'r plant" (some
+    # of the children), "dau o'r hogiau", "y rhan fwyaf o'r bobl" -- English
+    # takes the plural in exactly the same place. The "o" is required (see
+    # LINKING_WORDS), so bare "un ferch" / "tri phlentyn" never get here.
+    # "un o" + a singular is often "one FROM" ("un o'r ardal") -- like every
+    # singular in this branch it's only a candidate for hand review.
+    "un": "un",
+    "rhai": "rhai", "rai": "rhai", "rhei": "rhai", "rei": "rhai",
+    "dau": "dau", "ddau": "dau", "dwy": "dwy", "ddwy": "dwy",
+    "tri": "tri", "dri": "tri", "thri": "tri", "tair": "tair", "dair": "tair",
+    "pedwar": "pedwar", "bedwar": "pedwar", "pedair": "pedair", "bedair": "pedair",
+    "pump": "pump", "bump": "pump", "chwech": "chwech", "saith": "saith",
+    "wyth": "wyth", "naw": "naw", "deg": "deg", "ddeg": "deg",
+    "mwyaf": "mwyaf", "fwyaf": "mwyaf", "mwya": "mwyaf", "fwya": "mwyaf",
 }
 LOAN_QUANTIFIERS = {"lot"}
 
 # The linking preposition -- "llawer o'r plant" normalizes to "o" too.
 LINKING_WORDS = {"o"}
+
+# A definite article between "o" and the noun: Siarad transcribes the reduced
+# article as its own word ("lot o (y)r plant" -> "o", "yr", "plant"), which
+# used to be taken as the noun and the phrase skipped -- 117 Siarad lines
+# (2026-10-02). In Whisper/news text "o'r" is split with a synthetic 'r,
+# which was already stepped over.
+ARTICLE_FORMS = {"y", "yr", "r"}
 
 # Mass nouns, by LEMMA (so mutated and plural forms are excluded alike --
 # the exclusion is by noun, not by outcome, as in plural_tables.MASS_NOUNS).
@@ -76,7 +98,7 @@ MASS_NOUN_LEMMAS = {
 
 # Grammatically singular nouns with plural meaning, standard after a
 # quantifier ("llawer o bobl" = many people) -- same as plural_tables.
-COLLECTIVE_NOUN_LEMMAS = {"pobl"}
+COLLECTIVE_NOUN_LEMMAS = {"pobl", "pobol"}   # pobol: southern spelling (CorCenCC)
 
 # ========================= DUPLICATED, STANDALONE-CONVENTION HELPERS =====
 # Same lists as plural_tables.py (see the convention note there).

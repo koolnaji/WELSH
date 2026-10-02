@@ -66,7 +66,9 @@ def _use_source(source):
 # For the quantifier branch the "erosion" stratum is the singular CANDIDATES
 # (status erosion_unverified -- quantifier_engine never counts them on its
 # own, so the branch reads 0% by construction until they're judged): verdict
-# "ok" = a real slip, "wrong" = fine (a mass/degree reading).
+# "ok" = a real slip; "invalid" = a mass or degree reading ("llawer o
+# wahaniaeth", "faint o ddyn wyt ti"), which isn't a context for the plural
+# rule at all -- the same reason MASS_NOUN_LEMMAS keeps nouns out.
 BRANCHES = [
     ("mutation", "mutations", 25,
      ["trigger_word", "following_word", "lemma", "rule", "expected_mutation", "mutation_found",
