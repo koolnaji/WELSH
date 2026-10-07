@@ -14,8 +14,13 @@ can tilt the rate:
     utterance/segment end) must pass spacy_tagging.is_noun_target() --
     tagged NOUN, and not a form the Bangor lexicon says can't be a noun or
     is also a conjunction ("pump, wyt?" / "tair, achos..." were both
-    scored before this) -- must not be the partitive "o", and must not be
-    a code-switched word (an English noun keeps English plural morphology);
+    scored before this) -- must not be the partitive "o", must not be
+    a code-switched word (an English noun keeps English plural morphology),
+    and must not be capitalised (part of a name or title: "dau Brenhinoedd"
+    = 2 Kings) or a numbered Bible book in lower case;
+  - the numeral must not follow a chapter/verse/point/year word ("pennod
+    pedwar", "Genesis tri adnod") -- it labels, it doesn't count -- and "dwy
+    X ddim" is "dyw X ddim" (numeral_tables.NUMBER_LABELS / NEGATIVE_AFTER);
   - its singular/plural value must be known -- unknown means no row. Read
     by spacy_tagging.noun_number(): the Bangor lexicon's dictionary value
     first, spaCy's morph tag where the lexicon has none; number_source in
@@ -30,7 +35,8 @@ Standalone: imports only spacy_tagging.py, same convention as the other
 non-mutation branches.
 """
 from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted, tagged_as
-from numeral_tables import NUMERAL_FORMS, NUMBER_WORDS, PARTITIVE_WORDS, WELSH_FILLERS
+from numeral_tables import (NUMERAL_FORMS, NUMBER_WORDS, PARTITIVE_WORDS, WELSH_FILLERS,
+                            NUMBER_LABELS, NUMBERED_BOOKS, NEGATIVE_AFTER)
 
 
 def normalize_word(word):
@@ -60,6 +66,26 @@ def _find_noun_target(i, words_list):
             continue
         return candidate
     return None
+
+
+def _labels_previous_word(i, words_list):
+    """True when the numeral at i follows a chapter/verse/point/year word in
+    the same clause ("pennod pedwar", "Genesis tri") -- see NUMBER_LABELS."""
+    k = i - 1
+    while k >= 0 and words_list[k].get("synthetic"):
+        k -= 1
+    if k < 0 or words_list[k].get("_clause_boundary_after"):
+        return False
+    return normalize_word(words_list[k]["word"]) in NUMBER_LABELS
+
+
+def _is_negative_dyw(i, target, words_list):
+    """'dwy X ddim' = 'dyw X ddim' (X isn't) -- see NEGATIVE_AFTER."""
+    if normalize_word(words_list[i]["word"]) != "dwy" or target.get("_clause_boundary_after"):
+        return False
+    j = next((k for k in range(i + 1, min(i + 4, len(words_list))) if words_list[k] is target), None)
+    after = _find_noun_target(j, words_list) if j is not None else None
+    return after is not None and normalize_word(after["word"]) in NEGATIVE_AFTER
 
 
 def _build_numeral_row(current_node, target_node, numeral, status, is_erosion,
@@ -94,15 +120,28 @@ def process_numeral_agreement(words_list):
         # numbers take "o" + plural anyway ("chwe deg naw o bethau").
         if i > 0 and _is_numeral_word(words_list[i - 1]):
             continue
+        # A chapter/verse/point/year number labels, it doesn't count the next
+        # noun: "Genesis tri adnod", "y pwynt tri, cynigion" (2026-10-05).
+        if _labels_previous_word(i, words_list):
+            continue
         if not tagged_as(current_node, "NUM", ("CARD",)):
             continue
 
         target = _find_noun_target(i, words_list)
         if target is None or target.get("confidence", 0.0) < 0.65:
             continue
-        if normalize_word(target["word"]) in PARTITIVE_WORDS | NUMBER_WORDS:
+        if normalize_word(target["word"]) in PARTITIVE_WORDS | NUMBER_WORDS | NUMBERED_BOOKS:
+            continue
+        if _is_negative_dyw(i, target, words_list):
             continue
         if target.get("_code_switch"):
+            continue
+        # A capitalised target is part of a name or title, not a counted
+        # noun: "troi i dau Brenhinoedd" = turn to 2 Kings -- 3 of 20 sampled
+        # CorCenCC numeral erosions, all sermons (audit, 2026-10-05). The
+        # target is never sentence-initial, so a capital marks a name.
+        raw = str(target.get("word") or "")
+        if target.get("_name_part") or raw[:1].isupper():
             continue
         if not is_noun_target(target):
             continue

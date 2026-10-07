@@ -1,7 +1,7 @@
 # Research Journey — Contact-Induced Language Change Project
 *Merged reference document for the October final paper. Phase structure and narrative follow the more detailed account (worked with longer, in more depth); supplementary technical detail folded in where it doesn't conflict. Where the two accounts disagreed, the more detailed account's version is what's stated here.*
 
-*Last updated: 2026-08-13, against a direct check of commit history on all three repos (WELSH, SCRAPER, TATAR).*
+*Last updated: 2026-10-04. Phases 0–9 were checked against commit history on all three repos (WELSH, SCRAPER, TATAR) on 2026-08-13/17; Phases 10–14 were written from the working sessions and the data on disk. Late August to mid-September is not logged here.*
 
 ---
 
@@ -121,6 +121,8 @@ Literature grounding was assembled for all three arms in this phase — Bob Morr
 ---
 
 ## Before October — open items worth tracking
+
+*(The list as it stood in August. Since then the Tatar arm became background only (Phase 12), and the Welsh figures were rebuilt under version stamps and three audits (Phases 10–13); Phase 14 has the current state.)*
 
 - Re-run/re-validate Welsh erosion figures under the fixed corroboration logic before treating any pre-fix batch as final.
 - Resolve the `disputed`-classification question (Section 2.4 of `limitations.txt`) — decide whether to report erosion rates with and without disputed rows as a sensitivity check, and do it before the numbers are locked in.
@@ -292,12 +294,119 @@ confirmation of whichever combination is kept; the Tŷ Cŵn retry and
 
 ---
 
+## Phase 10 — Five branches, a fixed coding scheme, and version stamps (2026-09-26 → 09-28)
+
+The question narrowed from "does mutation erode?" to the contact hypothesis of Phase 6, tested inside Welsh alone: **structures English has no equivalent for should erode; structures Welsh shares with English should not.** Five detection branches now run over the same tagged word stream:
+
+| Branch | English counterpart? | Predicted |
+|---|---|---|
+| Consonant mutation | none | erode |
+| Conjugated prepositions ("arna i" vs "ar fi") | none | erode |
+| Numeral + singular noun ("tri chi") | opposite (English uses a plural) | erode |
+| rhai + plural noun | same as English | resist (control) |
+| Quantifier + o + plural ("llawer o bethau") | same as English | resist (control) |
+
+The quantifier branch was added on 09-28 because "rhai" + noun turned out to be rare in speech (a few dozen contexts in all of Siarad) — too few to carry the control side alone.
+
+- **Coding decisions written into the tables (09-26)**: fixed expressions excluded, loanwords counted once spelled in Welsh orthography, "rhai" + mass noun excluded (English "some time" is singular too). Each later audit added to this list — see `README.md`, **Coding decisions**.
+- **`pipeline_version` (09-26)**: every output row is stamped with a hash of the detection code, so rows from different rule versions can never be pooled unnoticed. After a discovery-code edit forced a pointless redo of all 69 Siarad conversations (09-28), code that can't change a row was moved into `# >>> NOT VERSIONED` regions.
+- **Cysill limit raised ×10 (09-27)**: the hourly limit used to stop a run after ~19 Siarad conversations. The user asked Techiaith; Dewi Bryn Jones raised it and recommended the method now used — POS tagging in ~2,700-character chunks, lemmas taken from the POS reply plus the Bangor lexicon, the one-word lemmatizer only as a last resort. **For the acknowledgements**: he asked to see the results.
+- **Siarad became the main dataset**: 69 human-transcribed conversations, so no speech-recognition error at all. YouTube moved to second place.
+
+---
+
+## Phase 11 — The first precision audit, and what it forced (09-29 → 09-30)
+
+`audit_sample.py` drew a seeded, stratified random sample of erosion and correct rows from Siarad, and every row was judged against the transcript and the transcribers' English gloss (ok / wrong / invalid / unsure). **Only ~65% of flagged mutation erosions were real** (49 of 75); prepositions 35/50. Correct-labelled rows held up far better (70/79, 50/50). The estimated corrected Siarad mutation rate was ~20% against 24% raw.
+
+The invalid rows had nameable causes, all fixed in code: place names built from common nouns (Pen-y-bont, Blaenau), unlisted fixed expressions ("a ballu", "o bosib"), CHAT mixed words split at "_" ("hammer_o" → a fake "o"), "o fi" meaning "o'n i" (I was), numeral + cant/mil, and a mixed-mutation bug. Decisions that followed: place names and capitalised targets excluded, and **the Siarad transcript is taken as what was said** (transcribers mark a reduced article as "(y)r" 1,289 times, so an unwritten article is a real omission).
+
+Infrastructure from the same days:
+- **Tagged caches + menu 4**: every processed folder keeps its tagged word stream, so a rule change is re-scored in minutes without Whisper or Cysill. Folders older than 09-29 have no cache and must be reprocessed.
+- **The Bangor lexicon became required**: without it, the object-mutation rule silently produced zero rows.
+- **Patagonia added** (43 Welsh-Spanish conversations from Argentina, same CHAT reader).
+- **News articles as text (`news_text.py`)**: ~500 Newyddion S4C and Y Cymro articles, split into narration, quoted speech and spokesperson statements. Narration is edited text, so whatever it "erodes" measures the detector, not the language — **a noise floor**. BBC articles were excluded (its terms prohibit scraping and dataset building).
+
+---
+
+## Phase 12 — The noise floor earns its keep (10-01)
+
+The first news run reported **9.0% "erosion" in edited narration** — impossible for professionally edited Welsh, so the detector was wrong, and wrong in ways that affected every corpus:
+- contracted forms like "â'r", "gyda'r", "mae'r" weren't split, which shifted every later Cysill tag in the sentence by one word;
+- an alignment step compared a word with its own cached lemma (always a match), silently falling back to positional alignment;
+- acronyms, names, verb + subject ("dywedodd llefarydd") read as verb + object, and several fixed expressions.
+
+Two fix batches later, narration was at **1.6%** — and a clean formality ladder appeared: narration 1.6% < statements 2.8% < quotes 3.9% < Newyddion S4C videos 17.6% < Siarad 20.7% < Patagonia 27.9%. **Worth stating in the methods section**: the noise floor found more real bugs in one run than any amount of reading the code had.
+
+Decisions made in one sitting the same day: person names excluded too (edited news leaves them unmutated: "gan Deian"), `mutation_mismatch` rows not counted, digit triggers excluded, YouTube kept at 10-minute samples, a speaker bootstrap instead of a mixed-effects model, data freeze **Oct 8**, and **Tatar became background only** — mentioned in the report as a related study, with no measured results.
+
+Also:
+- A menu-4 rerun in a window opened before the code edits re-scored everything with the *old* rules. A guard now refuses to run detection when the code on disk differs from what the program loaded.
+- Patagonia had been tagged without the lexicon and was re-tagged.
+- **The numeral prediction failed**: ~0.6–2% everywhere. Likely reason: speakers say "tri o blant" (numeral + o + plural), which the branch doesn't count.
+- The user emailed Margaret Deuchar asking for anonymised L1/L2 data for Patagonia.
+- Audit round 2: Siarad mutation flags 84% real (up from ~65%); YouTube only 54%, since Whisper writes "i" for "eu" and mishears verbs. Corrected YouTube rate ~11% against 17.6% raw.
+
+---
+
+## Phase 13 — CorCenCC and a sturdier control (10-02 → 10-03)
+
+**A sturdier control.** The user wanted the control side to be sturdy, so it was broadened rather than replaced: rhai and the quantifier branch test one rule (a count noun after a quantity word is plural, in both languages) and are now also pooled as **"Controls combined"**. The quantifier branch gained the partitives "un o'r", "rhai o'r", "dau o'r", "y rhan fwyaf o'r"; rhai gained Siarad's northern spellings "rhei/rei" (183 lines vs 84 for rhai/rai).
+
+**CorCenCC.** The spoken part of the National Corpus of Contemporary Welsh (Cardiff; 1,331 recordings, ~6× Siarad) was added through a new reader, `corpus_corcencc.py`. It took three versions:
+- v1 wrote anonymisation placeholders ("lleoliad", "enwb1") as ordinary words — **1,363 fake mutation erosions** in 349 recordings;
+- v2 fixed that, but the contracted "'n" (ro'n, do'n, y'n) was still read as "yn", producing a fake preposition-erosion spike (27% in the middle formality third);
+- v3 glues every clitic back onto its word, so it splits exactly the way Whisper text does.
+
+Speaker codes can't be linked to contributors, so learner/L1 status is recorded per recording only.
+
+**Analysis changes:**
+- **Lemma cache**: the user worried that one bad lemma would persist forever. Now a cached lemma is accepted only if the lexicon lists it for that form, and one sentence's reading is never written into the global cache.
+- **Curved fits**: logistic curves replaced straight lines, which had predicted −10% erosion at the formal end.
+- **Within-corpus slopes**: the pooled preposition curve *rose* with formality (OR 1.35), but only because Siarad is casual with little preposition erosion while CorCenCC is a little more formal with more. Fitting the slope inside each corpus separately removes that confound, and became the headline test.
+
+**Audit round 3 (10-03)**, flagged mutation erosions that held up: Siarad 22/25, CorCenCC 18/23, YouTube 18/25. CorCenCC rhai "erosions" were mostly false (2 of 17). The preposition and numeral samples exposed southern "ŷn ni / ŷn nhw" ("we/they are") and decade words ("chwech degau") — fixed; those samples are re-judged after the next rerun. Quantifier singulars, judged by hand: real slips 1/30 (Siarad), 2/30 (CorCenCC), 1/13 (YouTube).
+
+**Writing started**: a full report draft (Korean, APA citations), the .hwp 목차 plus section Ⅱ 이론적 배경, and a thank-you note to Bangor for the Cysill limit (drafted, not yet sent).
+
+---
+
+## Phase 14 — Remote check-in (10-04)
+
+With the user away from the laptop, a 20-episode Haclediad run finished after 26 hours: **25.8% mutation erosion** (56 of 217), between Siarad and Patagonia — where an unscripted chat podcast should sit on the ladder.
+
+**The confound-controlled result holds.** Inside CorCenCC alone, every 10 points up the formality scale cuts the odds of mutation erosion by about a third: OR 0.65 (0.59–0.71) per recording, 0.62 (0.58–0.67) per speaker. Prepositions show no such effect (1.11, not significant), even though they erode. **For the discussion**: both branches English lacks erode, but only mutation tracks formality — two behaviours, not one.
+
+**Error bars.** The very wide intervals on the small branches turned out to be a data limit, not a bug: a slope's precision depends on the number of *erosions*, not of contexts (Siarad numeral: 4 erosions in 572 contexts → OR 10.1, 95% CI 0.3–323). Their *rates* are precise (Siarad numeral 0.7%, 0.3–1.8%), so they are reported as rates. Slopes now need ≥10 erosions (Peduzzi et al. 1996). One apparent control result (CorCenCC controls, OR 0.19) rests on the false rhai erosions and is not to be cited.
+
+The completion email now reports all five branches first, with counts in place of percentages for branches under 20 contexts.
+
+---
+
+## Phase 15 — Making the control measurable (10-05)
+
+Back at the laptop, the user spotted the quantifier problem directly: the control branch **could never show erosion**, because every singular after a quantifier was filed as "unverified" and left out of the rate. The 0% was a property of the rule, not of the speakers.
+
+The audit samples showed where real slips hide. After amount words (llawer/digon/mwy/lot o…), about 55 hand-judged singulars contained **no** real slips — all mass or degree readings ("llawer o wahaniaeth" = much difference, "gormod o babi" = too much of a baby). After partitives, every slip the audit had found turned up: "un o'r bachgen", "un o medal fi", "dau o riant". A 30-row sample per corpus would only give a wide estimate, so the user chose a **census**: every singular candidate in every corpus (~850) is judged by hand. Claude pre-judges them, the user checks every row called a slip plus a random handful, and the analyzer counts confirmed slips as erosion. **For the methods section**: the control is now a measured rate, and the rule for counting a slip is stated.
+
+Listing the candidates also exposed non-contexts, now excluded in code singular and plural alike: anonymised place names ("un o Lleoliad" = one from [place]), "o gwmpas" (= around), and number words used as nouns. The numeral sample had the same problem: three of 20 CorCenCC numeral "erosions" were the Bible book "dau Brenhinoedd" (2 Kings) read out in sermons.
+
+**An audit-tool bug.** When a sample was redrawn, old verdicts were matched to rows by position and one word. For prepositions that word is often just "i" or "o", so a verdict for "erbyn i hi orffen" landed on "glywais i hi" (= I heard her). Verdicts now follow the row itself (video, timestamp, word). The one misplaced verdict found was corrected by hand.
+
+**Audit round 4**, flagged erosions that held up: mutation Siarad 22/25, CorCenCC 20/24, YouTube 18/23; prepositions Siarad 19/20, CorCenCC 11/19, YouTube 2/8. **For the limitations section**: the detector is precise on human transcripts of northern speech (Siarad), weaker on southern CorCenCC prepositions (bod forms such as "ŷn ni" look like "yn" + pronoun), and poor on prepositions in Whisper transcripts.
+
+**Where things stand:** before the Oct 8 freeze: fresh window → 4 → y → 6 → d (census) → 6 → c → 6 → b; Claude judges the census and the redrawn numeral sample; then 5. Then the speaker bootstrap, the final figures and the report (due 10-30); after that, send the results to Techiaith.
+
+---
+
 ## Suggested Paper Structure Mapping
 
-- **Methods — Data Collection**: Phases 0, 3, 5 (corpus sources, multilingual scraper, YouTube/audio pipeline)
-- **Methods — Mutation/Erosion Detection**: Phases 0–1, 4 (three-layer corroboration, corroboration-integrity fixes)
+- **Methods — Data Collection**: Phases 0, 3, 5 (corpus sources, multilingual scraper, YouTube/audio pipeline), 10–13 (Siarad, Patagonia, CorCenCC, news text baseline)
+- **Methods — Erosion Detection**: Phases 0–1, 4 (three-layer corroboration, corroboration-integrity fixes), 10 (five branches, coding decisions, version stamps), 13 (Controls combined)
+- **Methods — Validation**: Phases 11–13 (audit rounds, the noise floor), 14 (why small branches get rates, not slopes), 15 (quantifier census, audit round 4)
 - **Methods — Language Identification**: Phase 3 (weighted-vote panel, abstain-first design)
-- **Theory / Framing**: Phase 6 (unifying contact-pressure hypothesis, literature grounding)
-- **Limitations**: Phase 3 (Cysill lockout), Phase 4 (denominator/cache issues, pre/post-fix comparability), Phase 5 (Whisper hallucination, diagnostic saga), Phase 7 (Tatar ASR risk), Phase 9 (PO-token dependency, resumed-download 403s, client-mismatch/low-view-video CDN asymmetry, unpinned-nightly reproducibility risk)
-- **Cross-linguistic Discussion**: Phase 7 (Welsh vs. Tatar structural/scale comparison), Phase 6 (loanword branch rationale)
-- **Appendix / Reproducibility**: `SITE_OVERRIDES` table, consensus thresholds, model versions, `limitations.txt`
+- **Theory / Framing**: Phase 6 (unifying contact-pressure hypothesis, literature grounding), Phase 10 (the five-branch test)
+- **Results**: Phases 12–14 (formality ladder, failed numeral prediction, within-corpus slopes, mutation vs prepositions)
+- **Limitations**: Phase 3 (Cysill lockout), Phase 4 (denominator/cache issues, pre/post-fix comparability), Phase 5 (Whisper hallucination, diagnostic saga), Phase 9 (PO-token dependency, resumed-download 403s, client-mismatch/low-view-video CDN asymmetry, unpinned-nightly reproducibility risk), Phase 12 (YouTube ASR error), Phase 13 (CorCenCC learner status per recording only), Phase 14 (too few erosions for slopes on the small branches)
+- **Background (no measured results)**: Phase 6–7 (Tatar arm — background only since 2026-10-01)
+- **Appendix / Reproducibility**: `SITE_OVERRIDES` table, consensus thresholds, model versions, `limitations.txt`, `pipeline_version` of the frozen data

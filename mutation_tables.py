@@ -54,7 +54,10 @@ TRIGGERS = {
     "gan": "soft", "i": "soft", "o": "soft", "hyd": "soft",
     "tua": "aspirate", "thua": "aspirate",
     "neu": "soft", "pan": "soft", "ail": "soft",
-    "ni": "soft|aspirate", "nid": "soft|aspirate",
+    # "nid" removed 2026-10-06: it stands before vowels and non-verbs ("nid
+    # oes", "nid pawb") and mutates nothing -- "nid pawb" was scored as a
+    # mixed-mutation erosion in the edited news narration.
+    "ni": "soft|aspirate",
     "na": "soft|aspirate", "oni": "soft|aspirate",
     "beth": "soft", "pa": "soft", "pwy": "soft", "sut": "soft",
     "rhy": "soft", "lled": "soft", "pur": "soft_limited",
@@ -147,8 +150,12 @@ NASAL_NUMERAL_TRIGGERS             = {
     "pump", "saith", "wyth", "naw", "deng",
     "deuddeg", "pymtheg", "deunaw", "ugain", "cant",
 }
-NASAL_NUMERAL_VALID_TARGETS        = {"blynedd", "blwydd", "diwrnod"}
-MIXED_MUTATION_TRIGGERS            = {"ni", "nid", "na", "oni"}
+# "diwrnod" removed 2026-10-06 (user decision): edited news never nasalises
+# it ("achos saith diwrnod", "wyth diwrnod ar ôl", "taith naw diwrnod" -- 6 of
+# 6 in the narration), so "saith niwrnod" is optional in the written
+# standard, not a rule whose absence is erosion. "pum mlynedd" stays.
+NASAL_NUMERAL_VALID_TARGETS        = {"blynedd", "blwydd"}
+MIXED_MUTATION_TRIGGERS            = {"ni", "na", "oni"}
 # PATCH (Bucket 2): preposed adjectives -- when one of these precedes its
 # noun (the inverse of normal Welsh noun-adjective order), the noun takes
 # soft mutation. Kept as a closed lexicon (not just any ADJ) because the
@@ -190,6 +197,12 @@ PHANTOM_CONTEXT_TAGS = {
     "VB+NM": "soft", "NM+VBF": "soft", "PLACE": "soft", "PERSON": "soft",
 }
 GENDER_BEARING_PREFIXES  = ("N", "PRON", "CARD", "ORD")
+# Southern spellings of verb-nouns that the lexicon only knows as something
+# else: "cal" = cael (to get), also a noun in the dictionary. After
+# progressive "yn" a verb-noun never mutates, but "yn cal" was scored as an
+# eroded predicative noun -- 148 CorCenCC rows (2026-10-02).
+VERBNOUN_DIALECT_SPELLINGS = {"cal", "ca'l"}
+
 KNOWN_HOMOGRAPH_COLLISIONS = {
     "chi": "Pronoun 'chi' (you) collides with aspirate-mutated 'ci' (dog -> chi).",
 }
@@ -392,6 +405,26 @@ NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu", "br
                   "bynnag", "gymaint",
                   "grŵp", "grwp", "grwpiau", "grŵpiau", "gitâr", "gitar", "gitarau",
                   "garej", "garejys", "gang", "gangiau", "gêr", "bellach"}
+# Colloquial forms that can't show a trigger's mutation, found by reading the
+# edited news narration as ground truth and checking CorCenCC (2026-10-06):
+#  - "ne" = neu (or), read as nasal-mutated "de" -- 80 CorCenCC "erosions";
+#  - the w-less forms of (g)wneud ("beth naeth", "a neith", "na newch", "nes
+#    i"), said the same with or without a trigger and read as nasal-mutated
+#    d-words -- 71;
+#  - "nôl" (back / to fetch), read as nasal-mutated "dôl" -- 34;
+#  - "dio" = dydy o (isn't), read as soft-mutated "tio" -- 21;
+#  - "tua" (about), which the edited news leaves unmutated ("gyda tua 71%",
+#    "hyd at tua 60 milltir") -- every spelling, so the rate can't tilt.
+NEVER_MUTATING |= {"ne", "naeth", "nath", "neith", "newch", "naethon", "naethoch",
+                   "naethom", "nathon", "nethon", "nethoch", "nathoch", "nawn", "nei",
+                   "neud", "nes", "nest", "nôl", "nol", "dio", "tua", "thua", "dua"}
+# Second pass over the edited narration, all 1,584 documents (2026-10-07):
+#  - "beth" as a TARGET is always right: the soft form of "peth" ("o beth",
+#    "dau beth", "neu beth") or the question word ("am beth i'w wneud") --
+#    71 CorCenCC and 9 news "erosions" read it as an unmutated word;
+#  - "gerllaw" (nearby) and "mai" (that) are fixed forms ("neu gerllaw",
+#    "gan mai").
+NEVER_MUTATING |= {"beth", "gerllaw", "mai"}
 
 # Feminine-looking nouns whose following adjective doesn't tell us anything:
 # "blynedd" after a numeral ("y pum mlynedd diwethaf" -- usage is split) and
@@ -400,6 +433,57 @@ NEVER_MUTATING = {"braf", "mor", "gartre", "gartref", "adre", "adref", "tu", "br
 FEM_ADJ_TRIGGER_EXCLUDED = {"blynedd", "mlynedd", "flynedd",
                             "llun", "lun", "mawrth", "fawrth", "mercher", "fercher",
                             "iau", "gwener", "wener", "sadwrn", "sul"}
+# Not feminine nouns, though a tagger said so (CorCenCC, 2026-10-06):
+# "rhywbeth" (masculine) in its colloquial spellings ("rh'wbeth da",
+# "wbath bach" -- ~47 rows), "pentre(f)" (masculine, "pentre bach"), "lan"
+# (= up, "dod lan da fi"), "sos" ("sos coch").
+FEM_ADJ_TRIGGER_EXCLUDED |= {"rhywbeth", "rywbeth", "rhwbeth", "rwbeth", "rh'wbeth",
+                             "r'wbeth", "wbath", "rwbath", "rhwbath", "rh'wbath", "r'wbath",
+                             "pentre", "pentra", "lan", "sos", "sôs"}
+
+# Words after a feminine noun that aren't its adjective: they start the next
+# phrase ("i'r eglwys bore dydd Sul", "y neuadd pob cyfle") or are adverbs
+# ("y noson cynt", "yn yr ysgol bob blwyddyn") -- 98 CorCenCC rows; "neu" is
+# the conjunction (2026-10-06).
+FEM_ADJ_TARGET_EXCLUDED = {"bore", "cynt", "pob", "bob", "neu"}
+# ...and "tra" (while: "o'i geg tra'r oedd yn siarad"), news 2026-10-07.
+FEM_ADJ_TARGET_EXCLUDED |= {"tra"}
+
+# Words before "beth" that make it the noun "peth" (thing), soft-mutated,
+# not "what": "mae'n beth da", "dau beth pwysig", "unrhyw beth", "mae yna
+# beth" -- the adjective after it doesn't mutate (peth is masculine). 141 of
+# 272 "beth" erosions in CorCenCC (2026-10-06). Radical numerals are covered
+# by CARDINAL_WORDS.
+PETH_NOUN_BEFORE = {"yn", "rhyw", "ryw", "unrhyw", "fath", "math", "un", "yna", "pob", "bob",
+                    "ddau", "ddwy", "dri", "dair", "bedwar", "bedair", "bum", "bump"}
+
+# After "da", these pronouns show it is "(gy)da" (with: "sy da fi", "dim clem
+# da fi") or "(y)dan / (y)dach" (are: "beth da ni'n neud", "sut da chi"), not
+# the adjective "da" -- 397 CorCenCC "erosions", all southern (2026-10-06).
+# "i", "o", "e", "hi" are left out: "yn da i" (good FOR), "enghraifft da o"
+# (example OF) are the adjective.
+DA_NOT_ADJECTIVE_BEFORE = {"fi", "ti", "ni", "chi", "nhw"}
+
+# Spellings whose lemma (from the lexicon or a tagger) is wrong for mutation
+# purposes (news narration as ground truth, 2026-10-06):
+#  - soft-mutated forms that are also rare words in their own right, so the
+#    correct "i gau" (to close), "i bob" (to every), "am gar" (about a car),
+#    "mae'n gylch" were read as unmutated "gau" (false), "bob", "gar" (shin),
+#    "gylch" -- 107 CorCenCC and 21 news-narration "erosions";
+#  - colloquial forms of "dylai" (should) that the lexicon only knows as
+#    soft-mutated "tyle" (hill): they are their own radical ("a dyle" is
+#    "and should", unaffected by the aspirate after "a").
+LEMMA_OVERRIDES = {
+    "gau": "cau", "bob": "pob", "gar": "car", "gylch": "cylch", "gŵn": "cŵn",
+    "darfu": "tarfu", "dipio": "tipio", "dalent": "talent", "daliadau": "taliadau",
+    "gludo": "cludo",
+    "dyle": "dyle", "dylse": "dylse", "dylsen": "dylsen", "dylset": "dylset",
+    "dylsech": "dylsech",
+}
+# Second narration pass (2026-10-07): "a'r goron" (crown; lemma came back
+# "gori"), "rhy drwm" / "yn drwm" (heavy, read as "drwm" drum), "rhy grwn"
+# (round), "gan beri" (causing) -- all correct soft forms.
+LEMMA_OVERRIDES.update({"goron": "coron", "drwm": "trwm", "grwn": "crwn", "beri": "peri"})
 
 # Language names without the article are treated as masculine: "Cymraeg da",
 # "Saesneg gwael" (only "y Gymraeg" is feminine) -- "Cymraeg mwyaf", "Saesneg
@@ -522,6 +606,17 @@ FIXED_EXPRESSIONS = {
     "yn":   {"bosib", "posib", "bosibl", "posibl"},
 }
 FIXED_EXPRESSIONS["ar"] |= {"gau", "cau"}
+# "pe na bai" (if it weren't): the subjunctive of "bod" after "na" is
+# standard unmutated, as after "pe" above -- news narration, 2026-10-06.
+FIXED_EXPRESSIONS["na"] = {"bai", "fai", "baent", "faent", "bawn", "fawn", "baem", "faem",
+                           "baech", "faech", "bait", "fait"}
+# "(o) dan glo" (locked up; "glo" = soft of "clo", read as "glo" coal) -- 21
+# of the 321 narration "erosions", 4 CorCenCC; "maes y gad" (battlefield,
+# already soft "cad"); "fel a ganlyn" (as follows). News, 2026-10-07.
+FIXED_EXPRESSIONS["dan"] = {"glo", "clo"}
+FIXED_EXPRESSIONS["y"] = {"gad", "cad"}
+FIXED_EXPRESSIONS["a"] |= {"ganlyn", "canlyn"}
+FIXED_EXPRESSIONS["â"] = {"ganlyn", "canlyn"}
 
 # Common nouns that head place names ("cwm Ffynnon Lloer", "dyffryn Ogwen",
 # "pen y Bryn"), radical and mutated spellings. Before a capitalised name

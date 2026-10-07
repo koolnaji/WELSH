@@ -73,7 +73,14 @@ NOT_RHAI_NOUNS = {"gyd", "pawb", "tu", "tro", "dro",
                   # CorCenCC (2026-10-02): "rai popeth", "rhai lan" (put some up),
                   # "rhai pedwar deg gwaith" (some forty times), "rai fan yn heddiw"
                   # (some here today -- "fan hyn"), "fan 'na"
-                  "popeth", "lan", "fan", "man"}
+                  "popeth", "lan", "fan", "man",
+                  # reader v2 run (2026-10-02): "rhei fath o" = rhyw fath o (some
+                  # kind of -- an idiom, singular in English too), the modal
+                  # nouns "rhaid" / "eisiau" / "isio" (need / want), and numerals
+                  # ("rhai pedwar deg gwaith" = some forty times)
+                  "fath", "math", "rhaid", "eisiau", "isio", "angen",
+                  "un", "dau", "dwy", "tri", "tair", "pedwar", "pedair", "pump", "pum",
+                  "chwech", "chwe", "saith", "wyth", "naw", "deg", "cant", "mil"}
 # "y rhai" = "the ones", always the pronoun: "y rei côr" (the choir ones), "y
 # rei cyngerdd" (the concert ones), "yr hen rei" -- the word after it is an
 # attributive noun, singular in English too ("the choir ones"). Same 2026-10-02

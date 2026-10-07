@@ -54,6 +54,14 @@ CYSILL_CALL_FAILED = object()
 # not hours.
 MAX_RESPECTED_RETRY_AFTER = 300
 
+# Lost connection (wifi drop, laptop asleep): wait for it to come back
+# instead of failing the chunk. Three news runs stopped this way in two
+# days (2026-10-06/07): every request failed, the circuit breaker turned
+# Cysill off, and the run stopped. Checked every NETWORK_POLL_SECONDS for
+# up to NETWORK_WAIT_SECONDS; after that, the old behaviour.
+NETWORK_POLL_SECONDS = 30
+NETWORK_WAIT_SECONDS = 6 * 3600
+
 http_session = requests.Session()
 
 # PATCH: circuit breaker state for Cysill API
@@ -133,6 +141,32 @@ def extract_gender_from_pos(pos_tag):
     return None
 
 
+def _wait_for_network(endpoint, params):
+    """Retries the request every NETWORK_POLL_SECONDS until the network is
+    back (the response, if OK) or NETWORK_WAIT_SECONDS pass (None). A
+    non-OK answer means the network is back but the request failed: None,
+    so the usual failure counting applies."""
+    global http_session
+    tqdm.write(f" 📡 No network -- waiting for it to come back (checking every "
+               f"{NETWORK_POLL_SECONDS}s, up to {NETWORK_WAIT_SECONDS // 3600} h). "
+               f"Nothing is lost; Ctrl+C stops the run.")
+    started = time.monotonic()
+    while time.monotonic() - started < NETWORK_WAIT_SECONDS:
+        time.sleep(NETWORK_POLL_SECONDS)
+        http_session = requests.Session()
+        try:
+            resp = http_session.get(endpoint, params=params, timeout=15)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            continue
+        except Exception:
+            return None
+        minutes = (time.monotonic() - started) / 60
+        tqdm.write(f" ✅ Network back after {minutes:.0f} min -- carrying on.")
+        return resp if resp.ok else None
+    tqdm.write(f" 🔴 Still no network after {NETWORK_WAIT_SECONDS // 3600} h.")
+    return None
+
+
 def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
     """
     HTTP GET with retry + session reconnection + circuit breaker.
@@ -150,7 +184,9 @@ def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
     if _cysill_disabled_for_run:
         return None
 
+    connection_lost = False   # the last attempt failed for want of a network
     for attempt in range(1, max_retries + 1):
+        connection_lost = False
         try:
             resp = http_session.get(endpoint, params=params, timeout=15)
 
@@ -204,7 +240,8 @@ def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
             _cysill_consecutive_failures = 0
             return resp
 
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            connection_lost = True
             tqdm.write(f" ⚠️ Connection lost -- resetting session (attempt {attempt}/{max_retries})")
             http_session = requests.Session()
             # PATCH: jitter prevents all retries firing at the same moment
@@ -212,6 +249,12 @@ def _cysill_get(endpoint, params, max_retries=3, base_delay=1.5):
         except Exception as e:
             tqdm.write(f" ⚠️ Request error (attempt {attempt}/{max_retries}): {e}")
             time.sleep(base_delay * attempt + random.uniform(0, 0.5))
+
+    if connection_lost:
+        resp = _wait_for_network(endpoint, params)
+        if resp is not None:
+            _cysill_consecutive_failures = 0
+            return resp
 
     # All retries exhausted
     _cysill_consecutive_failures += 1

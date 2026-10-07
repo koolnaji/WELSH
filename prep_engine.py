@@ -109,7 +109,44 @@ PARTITIVE_HEADS = {"lot", "llawer", "lawer", "rhan", "fwya", "mwya", "dipyn", "g
 # Siarad run were this -- "yeah o fi wedi wneud", "pryd o fi yn mynd", "bob
 # ffordd o chdi yn mynd" -- where the word before happened to be tagged NOUN.
 VERBAL_AFTER_PRONOUN = {"yn", "wedi", "ddim", "dim", "heb", "isio", "eisiau", "erioed",
-                        "byth", "just", "am"}
+                        "byth", "just", "am",
+                        # southern / CorCenCC spellings (2026-10-02): 'di = wedi,
+                        # 'm = ddim, moyn / ishe = want
+                        "di", "'m", "m", "moyn", "ishe", "isie"}
+
+# Pronouns whose past-of-bod short form is "o'n / o't / o'ch" + pronoun
+# (I / you / we / you / they were) and gets written without the apostrophe.
+# Not the 3rd singular: "he/she was" is o'dd e / o'dd hi, so "o fe", "o hi"
+# stay "of him / of her".
+O_PAST_BOD_PRONOUNS = {"i", "fi", "ti", "chdi", "ni", "chi", "nhw"}
+
+# Pronouns after which "yn" may be southern "ŷn" (are) -- see the check in
+# process_prep_mutations.
+YN_BOD_PRONOUNS = {"ni", "chi", "nhw"}
+
+
+def _yn_can_mean_in(words_list, i):
+    """True when the word before "yn" is a verb or noun that "in" can belong
+    to ("credu yn nhw", "ffydd yn ni"); False at the start of a clause or
+    after anything else ("nag yn ni", "rhywbeth newydd yn ni yn hala")."""
+    k = i - 1
+    while k >= 0 and words_list[k].get("synthetic"):
+        k -= 1
+    if k < 0 or words_list[k].get("_clause_boundary_after"):
+        return False
+    prev = words_list[k]
+    if prev.get("_lang") not in (None, "cym", "mixed", "und") or prev.get("_code_switch"):
+        return False
+    return _is_verb(prev) or tagged_as(prev, "NOUN", ("N",))
+
+
+def _after_partitive_head(words_list, i):
+    """True when the word before "o" is a quantity word (PARTITIVE_HEADS):
+    "lot o nhw", "rhei o nhw yn dda" are "of them" whatever follows."""
+    k = i - 1
+    while k >= 0 and words_list[k].get("synthetic"):
+        k -= 1
+    return k >= 0 and normalize_word(words_list[k]["word"]) in PARTITIVE_HEADS
 
 
 def _o_can_mean_of(words_list, i):
@@ -229,12 +266,37 @@ def process_preposition_erosion(words_list):
         person = _person_for_pronoun(target_norm)
         if person is None:
             continue  # next word isn't a recognized independent pronoun -- not this phenomenon
-        if norm == "o" and target_norm in ("fi", "chdi"):
+        # Every personal pronoun since 2026-10-02 (was "fi"/"chdi" only):
+        # CorCenCC's southern transcribers write o'n ni / o't ti / o'ch chi /
+        # o'n nhw (we / you / they were) as "o ni", "o ti", "o chi", "o nhw"
+        # -- "ond o ni yma ychydig bach yn ôl" (but we were here a while ago)
+        # was an eroded "ohonon ni". After a partitive head ("lot o nhw",
+        # "rhei o nhw yn dda") it stays "of them" even before "yn".
+        if norm == "o" and target_norm in O_PAST_BOD_PRONOUNS:
             after = i + lookahead + 1
             verbal_next = (after < len(words_list) and not target.get("_clause_boundary_after")
                            and normalize_word(words_list[after]["word"]) in VERBAL_AFTER_PRONOUN)
-            if verbal_next or not _o_can_mean_of(words_list, i):
-                continue  # o'n i / o'ch chdi, see _o_can_mean_of and VERBAL_AFTER_PRONOUN
+            can_mean_of = _o_can_mean_of(words_list, i)
+            if not can_mean_of or (verbal_next and not _after_partitive_head(words_list, i)):
+                continue  # o'n i / o'ch chdi / o'n nhw, see _o_can_mean_of and VERBAL_AFTER_PRONOUN
+        # Southern present of bod -- ŷn ni / ŷch chi / ŷn nhw (we / you / they
+        # are) -- is transcribed "yn ni", "yn nhw": "yn ni wedi clywed" (we've
+        # heard), "nag yn ni" (aren't we), "yn ni isie setlo". 7 of the 20
+        # sampled CorCenCC prep erosions (audit, 2026-10-02). "yn" is "in"
+        # only after a verb or noun it belongs to ("credu yn nhw", "ffydd yn
+        # ni"), and not before the rest of a verb phrase.
+        if norm == "yn" and target_norm in YN_BOD_PRONOUNS:
+            after = i + lookahead + 1
+            verbal_next = (after < len(words_list) and not target.get("_clause_boundary_after")
+                           and normalize_word(words_list[after]["word"]) in VERBAL_AFTER_PRONOUN)
+            if verbal_next or not _yn_can_mean_in(words_list, i):
+                continue
+        # "mi" before a verb is the affirmative particle, not "me": "O mi
+        # ddylia'n nhw..." (Oh, they should have...) -- CorCenCC audit.
+        after = i + lookahead + 1
+        if target_norm == "mi" and after < len(words_list) and \
+                not target.get("_clause_boundary_after") and _is_verb(words_list[after]):
+            continue
         # "i", "o", "ni", "fi" are also pronouns/particles/interjections, so the
         # word after the preposition must actually be tagged as a pronoun --
         # applied to correct AND eroded cases alike, so it can't tilt the rate.

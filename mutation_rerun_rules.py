@@ -127,7 +127,7 @@ JOIN_KEY_COLUMNS = ["video_title", "timestamp", "trigger_word", "following_word"
 import io
 from collections import Counter
 
-from corpus_io import RUNS_DIR
+from corpus_io import RUNS_DIR, data_folders
 import output_merge as om
 
 # --branch name -> output file key (corpus_io._video_slug / output_merge.DATA_FILES)
@@ -192,13 +192,17 @@ def regenerate_folder(folder):
     parts = []
     for path in caches:
         rows, data = rows_from_tagged_cache(path)
-        frames = {k: f for k, f in zip(OUTPUT_KEYS, map(_text_frame, rows)) if f is not None}
+        if rows is None:        # CorCenCC tagging from an older reader (v1/v2), see
+            continue            # corpus_corcencc.strip_bracket_notes
+        frames ={k: f for k, f in zip(OUTPUT_KEYS, map(_text_frame, rows)) if f is not None}
         _attach_speakers(frames, data)
         window = data.get("window")
         if not window:
             spans = om._segment_spans(frames.get("segments"))
             window = [min(a for a, _ in spans), max(b for _, b in spans)] if spans else [0, 0]
         parts.append((data.get("tagged_at") or "", frames, om._union([window]), data))
+    if not parts:
+        return None
     parts.sort(key=lambda p: p[0], reverse=True)          # newest run first
 
     _, current, coverage, newest = parts[0]
@@ -384,10 +388,8 @@ def _mutations_dir_for(mutations_csv_path):
     # layout, or the layout before that), same pattern as
     # mutation_captions.py/mutation_manual_editing.py's find_segments_csv.
     """
-    slug  = mutations_csv_path.parent.name
-    stamp = mutations_csv_path.parent.parent.name
-    candidate = TRANS_DIR / stamp / slug
-    if candidate.exists():
+    candidate = mutations_csv_path.parent   # one folder per document
+    if any(candidate.glob("pos_*.csv")):
         return candidate
 
     for prefix in ("mutations_original_", "mutations_corroborated_", "mutations_"):
@@ -620,10 +622,9 @@ def _video_folders(video):
     # fixes it -- and re-scoring it while that runs could collide with the
     # reader moving the same folder to _deleted (2026-10-02).
     from corpus_corcencc import READER_MARKER
-    folders = sorted({p.parent for p in RUNS_DIR.glob("*/*/segments_*.csv")
-                      if "_deleted" not in p.parts
-                      and not (p.parent.name.startswith("CorCenCC_")
-                               and not (p.parent / READER_MARKER).exists())})
+    folders = sorted(f for f in data_folders(RUNS_DIR)    # any depth (source layout)
+                     if not (f.name.startswith("CorCenCC_")
+                             and not (f / READER_MARKER).exists()))
     if video and video != "all":
         folders = [f for f in folders if video in f.name or video in f.parent.name]
     return folders

@@ -337,9 +337,8 @@ def find_segments_csv(mutations_csv_path):
     if folder_name is None:
         return None
 
-    slug  = mutations_csv_path.parent.name
-    stamp = mutations_csv_path.parent.parent.name
-    candidate = TRANS_DIR / stamp / slug / f"segments_{folder_name}.csv"
+    # every file of a document sits in one folder (any layout since 2026-09)
+    candidate = Path(mutations_csv_path).parent / f"segments_{folder_name}.csv"
     if candidate.exists():
         return candidate
 

@@ -48,7 +48,45 @@ PARTITIVE_WORDS = {"o", "o'r", "or"}
 # so there's no contrast. 5 of 50 correct rows in the Siarad audit
 # (2026-09-29). Radical and mutated spellings.
 NUMBER_WORDS = {"cant", "gant", "chant", "nghant", "mil", "fil", "miliwn", "filiwn",
-                "biliwn"}
+                "biliwn",
+                # decades: "y chwech degau" = the sixties (chwedegau), not six
+                # counted "tens" -- 5 of 20 sampled CorCenCC numeral erosions
+                # (audit, 2026-10-02)
+                "degau", "ddegau",
+                # the plural number words: "ugain miloedd o bobl" is a muddled
+                # "ugain mil", a number, not a counted noun (audit, 2026-10-05)
+                "miloedd", "filoedd", "cannoedd", "gannoedd", "channoedd"}
+
+# A numeral that LABELS something rather than counting the next noun: a
+# chapter, verse, point or year number -- "Genesis tri adnod un deg pump"
+# (Genesis 3:15), "y pwynt tri, cynigion cryno", "cyfnod allweddol dau plant"
+# (Key Stage 2 children), "blwyddyn saith". The word BEFORE the numeral is
+# one of these, so the numeral is a name tag and the noun after it isn't
+# counted (CorCenCC audit, 2026-10-05). Bible books are included because a
+# numeral after one is a chapter ("Actau un deg naw o adnod...").
+BIBLE_BOOKS = {
+    "genesis", "exodus", "lefiticus", "numeri", "deuteronomium", "josua", "barnwyr",
+    "ruth", "samuel", "brenhinoedd", "cronicl", "esra", "nehemeia", "esther",
+    "salm", "salmau", "diarhebion", "pregethwr", "eseia", "jeremeia", "galarnad",
+    "eseciel", "daniel", "hosea", "joel", "amos", "obadeia", "jona", "micha", "nahum",
+    "habacuc", "seffaneia", "haggai", "sechareia", "malachi", "mathew", "luc", "ioan",
+    "actau", "rhufeiniaid", "corinthiaid", "galatiaid", "effesiaid", "philipiaid",
+    "colosiaid", "thesaloniaid", "timotheus", "titus", "philemon", "hebreaid", "iago",
+    "pedr", "jwdas", "datguddiad",
+}
+NUMBER_LABELS = BIBLE_BOOKS | {
+    "pennod", "bennod", "adnod", "pwynt", "bwynt", "rhif", "tudalen", "dudalen",
+    "blwyddyn", "flwyddyn", "allweddol", "cam", "gam", "lefel", "tabl", "dabl",
+    "ystafell", "stafell", "sector",
+}
+# The books that come numbered ("dau Brenhinoedd" = 2 Kings): never a counted
+# noun after a numeral. The capital-letter gate missed a lower-case "troi i
+# dau brenhinoedd dauddeg" (CorCenCC audit, 2026-10-05).
+NUMBERED_BOOKS = {"samuel", "brenhinoedd", "cronicl", "corinthiaid", "thesaloniaid",
+                  "timotheus", "pedr", "ioan"}
+# "dwy X ddim" is "dyw X ddim" (X isn't) spelled with the numeral: "felly dwy
+# pethau ddim yn edrych yn rhy ddrwg" (CorCenCC audit, 2026-10-05).
+NEGATIVE_AFTER = {"ddim", "m"}     # "'m" arrives as "m" once the apostrophe is stripped
 
 # Hesitation sounds only -- same convention as prep_tables/plural_tables.
 WELSH_FILLERS = {"ym", "er", "ah"}

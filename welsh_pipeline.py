@@ -44,11 +44,13 @@ from corpus_io import (
     load_local_processed, save_local_processed,
     append_output_csv, cleanup_incomplete_video_dirs, cleanup_empty_session_dir,
     pipeline_version, set_session_label, keep_awake, stale_code_warning,
+    publish_document, legacy_session_folders, migrate_to_source_layout,
 )
 from corpus_ops import (
     discover_new_videos, prompt_channel_selection, download_audio,
     analyze, analyze_phrase, save_analysis_outputs, generate_research_summary,
     send_notification_email, build_email_body, channel_display_name,
+    run_branch_stats, branch_subject_summary,
     TRANSCRIBE_PRESETS, DEFAULT_TRANSCRIBE_PRESET,
     MIN_EPISODE_SECONDS, _probe_duration_seconds,
 )
@@ -179,6 +181,20 @@ def manage_queue():
 
 def main(preset=None, sample_minutes=None, skip_minutes=5.0):
     ensure_dirs()
+    # The laptop and its screen stay on as long as this program is open --
+    # every menu action, not just the long runs (corpus_io.keep_awake).
+    keep_awake(program=True)
+    print("☕ Keeping the laptop awake (screen on) while this window is open. "
+          "Closing the lid still sleeps it.")
+    # One-off move to the by-source layout (corpus_io "SOURCE LAYOUT").
+    legacy = legacy_session_folders()
+    if legacy:
+        print(f"\n📁 runs/ still has {len(legacy)} folder(s) in the old by-date layout.")
+        migrate_to_source_layout(apply=False)
+        print("   Make sure no other pipeline window is running first.")
+        if input("   Move them now? (y/n) [y]: ").strip().lower() in ("", "y", "yes"):
+            migrate_to_source_layout(apply=True)
+        print()
     # Which data folder and Windows account this run uses -- a cmd window
     # running as another account (C:\Users\등록관리자, 2026-09-30) doesn't see
     # the setx variables (Cysill key!) set under the account that owns the data.
@@ -449,6 +465,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             except Exception as e:
                                 tqdm.write(f"  ⚠️ Merge with earlier output failed ({e}) -- this "
                                            f"run's output is saved on its own; earlier folders untouched.")
+                            vpaths = publish_document(vpaths, meta)   # -> runs/local-mp3/<file>/
                         if save_results:
                             stat = p.stat()
                             local_processed[str(p.resolve())] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -699,6 +716,8 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                             except Exception as e:
                                 tqdm.write(f"  Corroboration pass failed: {e}")
 
+                        # last: runs/youtube|podcasts/<channel>/<video>/
+                        vpaths = publish_document(vpaths, video)
                         processed.add(video["id"])
                         save_processed(processed)
                         clear_failure(video["id"], failed_state)
@@ -760,8 +779,14 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # early-exit paths (e.g. no mutation CSVs found yet, or nothing
                 # left after deletion) -- catch SystemExit here so that just
                 # returns to this menu instead of killing the whole pipeline.
+                # Reloaded from disk every time: it was imported once at startup,
+                # so a window left open across an analyzer edit kept drawing
+                # the OLD figures -- the stale-code guard only watches the
+                # detection files (2026-10-02: within_corpus_slopes never ran).
+                import importlib
                 try:
-                    corpus_analyzer.main()
+                    importlib.reload(corpus_analyzer.corpus_formality)
+                    importlib.reload(corpus_analyzer).main()
                 except SystemExit:
                     pass
                 save_lemma_cache()
@@ -852,18 +877,29 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                 # audit_sample.py, round 2 (decided 2026-10-01): Siarad and the
                 # YouTube videos, each in analysis/audit2/<source>/. Other
                 # sources: python audit_sample.py --source ...
+                import importlib
                 import audit_sample
+                audit_sample = importlib.reload(audit_sample)   # see choice "6"
                 print("\n  a = Draw / refresh the audit samples (Siarad + YouTube)   b = Score the verdicts\n"
-                      "  c = Redraw samples whose data changed (their old verdicts are dropped)")
+                      "  c = Redraw samples whose data changed (their old verdicts are dropped)\n"
+                      "  d = Quantifier census: list EVERY singular after a quantifier, all sources\n"
+                      "      (keeps verdicts already given; run it again to pull in Claude's)\n"
+                      "  e = Prune: drop sampled rows that are no longer in the data, keep the rest\n"
+                      "      (after a fix that only removes contexts -- instead of c)")
                 sub = input("Choice [b]: ").strip().lower() or "b"
+                if sub == "d":
+                    audit_sample.census()
+                    continue
                 # CorCenCC joins once it has been processed (menu 3 -> c)
                 audit_sources = ["siarad", "youtube"] + \
-                    (["corcencc"] if any((BASE_DIR / "runs").glob("*/CorCenCC_*")) else [])
+                    (["corcencc"] if (BASE_DIR / "runs" / "corcencc").is_dir() else [])
                 for audit_source in audit_sources:
                     if sub in ("a", "c"):
                         audit_sample.draw(audit_source, force=(sub == "c"))
                     elif sub == "b":
                         audit_sample.score(audit_source)
+                    elif sub == "e":
+                        audit_sample.prune(audit_source)
                     else:
                         print("Unknown choice.")
                         break
@@ -890,10 +926,18 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
             if notify_on_completion:
                 videos_succeeded = videos_attempted - len(failed_videos)
                 elapsed = time.time() - run_start_time
-                subject = (f"Welsh pipeline: {videos_succeeded}/{videos_attempted} videos, "
-                           f"{len(all_mutation_rows)} mutation rows ({stamp})")
+                # All five branches, read back from this run's CSVs (2026-10-04).
+                # A failure here must never stop the email.
+                try:
+                    branch_stats = run_branch_stats(stamp)
+                except Exception as e:
+                    print(f"  ⚠️  Five-branch summary for the email failed ({e}) -- sending mutation only.")
+                    branch_stats = None
+                subject = f"Welsh pipeline: {videos_succeeded}/{videos_attempted} videos"
                 if failed_videos:
-                    subject += f" -- {len(failed_videos)} failed"
+                    subject += f" ({len(failed_videos)} failed)"
+                subject += (f" -- {branch_subject_summary(branch_stats)} ({stamp})" if branch_stats
+                            else f", {len(all_mutation_rows)} mutation rows ({stamp})")
                 body = build_email_body(
                     run_type=run_type,
                     stamp=stamp,
@@ -904,6 +948,7 @@ def main(preset=None, sample_minutes=None, skip_minutes=5.0):
                     mutation_rows=all_mutation_rows,
                     summary=summary,
                     base_dir=BASE_DIR,
+                    branch_stats=branch_stats,
                 )
                 send_notification_email(subject=subject, body=body, html=True)
 

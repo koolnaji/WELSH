@@ -21,12 +21,17 @@ and eroded cases alike so none can tilt the rate:
     is singular in English too), and so is any noun the lexicon never
     lists in the plural -- there was no singular/plural choice to make.
     Both exclusions are by noun, so they remove singular and plural
-    outcomes alike.
+    outcomes alike;
+  - so are "o gwmpas" (= around) and number words used as nouns
+    (NON_COUNT_TARGET_LEMMAS), and names: a capitalised or name-part target
+    ("un o Sir Fôn" = one FROM Anglesey), unless it is a people or
+    nationality (CAPITALISED_COUNT_LEMMAS: "rhai o'r Cymry").
 
 Rows: plural -> correct; a collective noun ("llawer o bobl") -> correct;
 singular -> erosion_unverified, a candidate for manual review only (see
-the comment at that branch: in speech these were all mass or degree
-readings, singular in English too). Every row records the quantifier and whether
+the comment at that branch). Every candidate is judged by hand in the
+quantifier census (audit_sample.py, menu 6 -> d, decided 2026-10-05);
+corpus_analyzer.py counts the ones judged real slips as erosion. Every row records the quantifier and whether
 it is the English loan "lot" (is_loan_quantifier), so results can be
 reported with and without it.
 
@@ -40,6 +45,7 @@ import bangor_lexicon
 from spacy_tagging import is_noun_target, noun_number, noun_phrase_interrupted
 from quantifier_tables import (QUANTIFIER_FORMS, LOAN_QUANTIFIERS, LINKING_WORDS,
                                ARTICLE_FORMS, MASS_NOUN_LEMMAS, COLLECTIVE_NOUN_LEMMAS,
+                               NON_COUNT_TARGET_LEMMAS, CAPITALISED_COUNT_LEMMAS,
                                WELSH_FILLERS, DISCOURSE_PARTICLES)
 
 
@@ -122,8 +128,11 @@ def process_quantifier_plurals(words_list):
             continue
 
         lemmas = bangor_lexicon.noun_lemmas(target_norm)
-        if not lemmas or lemmas & MASS_NOUN_LEMMAS:
-            continue   # unknown to the lexicon, or a mass noun -- see module docstring
+        if not lemmas or lemmas & (MASS_NOUN_LEMMAS | NON_COUNT_TARGET_LEMMAS):
+            continue   # unknown to the lexicon, a mass noun, "o gwmpas", a number -- see module docstring
+        raw = str(target.get("word") or "")
+        if target.get("_name_part") or (raw[:1].isupper() and not lemmas & CAPITALISED_COUNT_LEMMAS):
+            continue   # part of a name -- see CAPITALISED_COUNT_LEMMAS
         lemma = sorted(lemmas)[0]
         number, number_source = noun_number(target)
         if number_source != "lexicon":

@@ -66,6 +66,7 @@ import sys
 import pandas as pd
 
 from corpus_io import MUT_DIR, OUT_DIR
+import run_progress
 from mutation_tables import WELSH_FILLERS
 
 
@@ -229,7 +230,7 @@ def build_video_formality_table():
         return pd.DataFrame()
 
     rows = []
-    for video_dir in video_dirs:
+    for video_dir in run_progress.files(video_dirs, "Formality per video", unit="folders"):
         row = compute_video_formality(video_dir)
         if row is not None:
             rows.append(row)
@@ -303,7 +304,8 @@ def compute_speaker_formality(video_dir):
 
 def build_speaker_formality_table():
     rows = []
-    for video_dir in _discover_video_dirs():
+    for video_dir in run_progress.files(_discover_video_dirs(), "Formality per speaker",
+                                        unit="folders"):
         rows.extend(compute_speaker_formality(video_dir))
     if not rows:
         return pd.DataFrame()

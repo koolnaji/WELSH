@@ -26,14 +26,16 @@ Input, as checked against the v1.0.0 download (2026-10-02):
     the speaker changes; sentences without one continue the last speaker;
   - transcription marks, all dropped: [saib] (pause), [aneglur]
     (unclear), [-] (cut off), "+" (interruption), "< pesychu >" (events,
-    with everything between the angle brackets), and [=] ... [/=] (a
-    repeated stretch -- the words inside are dropped, the way Siarad's
-    retraced material is);
+    with everything between the angle brackets), "[ sŵn papur yn rhwygo ]"
+    (transcriber's notes, the brackets as tokens of their own -- 11,738 of
+    them in the spoken part), and [=] ... [/=] (a repeated stretch -- the
+    words inside are dropped, the way Siarad's retraced material is);
   - enriched POS "Gwest" (gair estron, foreign word) -> English; everything
     else is left to the spelling heuristic, as for untagged Siarad words;
-  - clitics are their own tokens ("ti 'n siarad", "'di", "'r"): written
-    out as yn / wedi / yr (Siarad's spelling) when CyTag tags them as the
-    particle / article, otherwise glued back on ("ro" + "'n" = ro'n);
+  - clitics are their own tokens ("ti 'n siarad", "a 'i", "ma 'na"): glued
+    back onto the word before, the way Welsh spells them ("ti'n", "a'i"),
+    for expand_whisper_tokens() to split as it does Whisper text -- or, for
+    an elided free word, written out from CyTag's lemma ('na -> yna);
   - anonymisation placeholders (basic POS "Anon": lleoliad, enwb1, cyfenw2)
     are kept as capitalised name parts, which no branch measures;
   - the first word of every sentence is capitalised: lower-cased unless
@@ -57,8 +59,14 @@ unique so every detection row maps back to exactly one speaker.
 Output, per recording, in runs/<stamp>/CorCenCC_<file>/: the same CSVs a
 Siarad conversation produces (speakers_*.csv and utterances_*.csv included).
 
-Not in _DETECTION_SOURCES (like news_text.py): after a change here that
-alters the word stream, bump READER_MARKER and every recording is redone.
+After a change here that alters the word stream, bump READER_MARKER and
+every recording is redone. One exception, the bracketed notes (2026-10-05):
+the v3 reader kept their words as speech, and rather than re-tag all 1,331
+recordings through Cysill, a rerun (mutation_rerun_rules.py, menu 4) drops
+them from the saved tagging -- strip_bracket_notes(), called by
+corpus_ops.rows_from_tagged_cache(). The notes keep their place on the word
+clock, so a fresh read and a cleaned rerun give the same timestamps. This
+file is in corpus_io._DETECTION_SOURCES since then.
 """
 import csv
 import re
@@ -72,8 +80,10 @@ from corpus_io import (
     RUNS_DIR, ensure_dirs, run_stamp, _video_slug, append_output_csv,
     cleanup_incomplete_video_dirs, cleanup_empty_session_dir, pipeline_version,
     is_current_version, set_session_label, session_dir, has_lexicon_features,
+    document_folders, publish_document,
 )
 from corpus_ops import analyze_segments
+import run_progress  # unversioned
 from corpus_siarad import OUTPUT_KEYS, DETECTION_KEYS, _row_start, _saved_run_quality
 from output_merge import merge_with_previous
 from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
@@ -95,12 +105,37 @@ REPEAT_OPEN, REPEAT_CLOSE = "[=]", "[/=]"
 # plant" is not "i plant").
 TRANSPARENT_MARKS = {"[saib]"}
 GAP_MARKS = {"+"}
+# A transcriber's note, "[ sŵn papur yn rhwygo ]", "[ Sain ceiniogau ]",
+# "[ dyn yn siarad a'r ddwy siaradwyr eto ]": the brackets are tokens of
+# their own (basic POS "Atd"), so v3 dropped them as punctuation and read the
+# words inside as speech -- "y ddwy siaradwyr" came up as a numeral erosion
+# (audit, 2026-10-05). A note runs to its "]" (or a stray ">", or the
+# sentence end). Its words stay in the stream FLAGGED, so they still take
+# their 0.4 s on the word clock -- see strip_bracket_notes().
+NOTE_OPEN, NOTE_CLOSE = "[", "]"
 # Split-off clitics, written out only when CyTag tags them as the particle /
 # preposition / article / perfect marker. Otherwise they are glued back onto
 # the word before: CorCenCC splits "ro'n i" (I was) into ro + 'n + i with 'n
 # tagged as a pronoun ending (Rha), and writing it out as "yn" produced a
 # fake "yn i" / "yn nhw" -- conjugated-preposition "erosions" (2026-10-02).
-CLITICS = {"'n": ("yn", {"U", "Ar"}), "'r": ("yr", {"YFB"}), "'di": ("wedi", {"U"})}
+# Reader v3 (2026-10-02): CorCenCC splits every apostrophe form off its word
+# ("ro" + "'n" + "i", "a" + "'i", "ma" + "'na") -- 48,040 such tokens in the
+# spoken part. v2 wrote "'n" out as a free "yn", which turned "do'n nhw"
+# (they weren't) into "yn nhw": 1,353 of 3,382 conjugated-preposition
+# "erosions" (CyTag itself tags that 'n as the preposition, so its tags can't
+# be the test). Stripping the apostrophe also made "'na" (= yna, there) the
+# negative "na" and "'i" (= ei, his/her) the preposition "i". Now the word is
+# put back the way Welsh spells it -- the clitic glued onto the word before
+# ("ro'n", "do'n", "a'i", "i'w", "ma'r") -- and mutation_engine's
+# expand_whisper_tokens() splits it exactly as it does Whisper and news text
+# ("o'n i" -> oeddwn; "X'n" -> X + "yn" marked as a contraction, which the
+# preposition branch never takes as "in"; "X'r/'i/'w" -> X + clitic).
+# A clitic that is really a separate word with its first syllable dropped is
+# written out from CyTag's lemma instead:
+CLITIC_FULL_FORMS = {"yna": "yna", "yma": "yma", "hynny": "hynny", "hwnnw": "hynny",
+                     "wedi": "wedi", "eto": "eto", "dim": "ddim"}
+# Fallback when a clitic opens the sentence (nothing to glue it to).
+CLITIC_FIRST_WORD = {"'n": "yn", "'r": "yr", "'i": "ei", "'w": "ei", "'u": "eu", "'m": "fy"}
 FOREIGN_POS = "Gwest"
 # CyTag basic POS of speaker codes AND of the anonymisation placeholders:
 # lleoliad (place), enwb / enwg (female / male name), cyfenw (surname)...
@@ -113,7 +148,7 @@ ANON_POS = "Anon"
 WORD_SECONDS = 0.4
 # Written into a recording's folder by this reader; bump the name whenever a
 # change here alters the word stream (see _already_done).
-READER_MARKER = "corcencc_reader_v2.txt"
+READER_MARKER = "corcencc_reader_v3.txt"   # v3: 'n before a pronoun (2026-10-02)
 
 
 # ========================= METADATA =========================
@@ -176,7 +211,7 @@ def load_metadata(folder):
 # ========================= TRANSCRIPT =========================
 def iter_recordings(corpus_data):
     """Yields (recording id, [token rows]) for every spoken recording, in
-    file order. Each token row: (token, sentence, basic POS, enriched POS)."""
+    file order. Each token row: (token, sentence, basic POS, enriched POS, lemma)."""
     current, rows, seen = None, [], set()
     with open(corpus_data, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -199,33 +234,42 @@ def iter_recordings(corpus_data):
                     current, rows = None, []
                     continue
                 current, rows = rid, []
-            rows.append((parts[1], parts[2], parts[5], parts[6]))
+            rows.append((parts[1], parts[2], parts[5], parts[6], parts[4]))
     if current is not None:
         yield current, rows
 
 
 def build_sentences(rows):
-    """[(speaker, sentence no., [(word, lang, is_proper_noun, name_part)])]
+    """[(speaker, sentence no., [(word, lang, is_proper_noun, name_part, note)])]
     with the transcription marks removed (see the module docstring and the
-    constants above)."""
+    constants above). note = True for the words of a bracketed transcriber's
+    note: not speech, but kept so the word clock stays as v3 laid it out."""
     sentences, speaker = [], None
     by_sentence = {}
     order = []
-    for token, sent, basic, enriched in rows:
+    for token, sent, basic, enriched, lemma in rows:
         if sent not in by_sentence:
             by_sentence[sent] = []
             order.append(sent)
-        by_sentence[sent].append((token, basic, enriched))
+        by_sentence[sent].append((token, basic, enriched, lemma))
 
     def gap(words):
         if words and not words[-1][0].endswith(","):
             words[-1] = (words[-1][0] + ",",) + words[-1][1:]
 
     for sent in order:
-        words, in_event, in_repeat = [], False, False
-        for position, (token, basic, enriched) in enumerate(by_sentence[sent]):
+        words, in_event, in_repeat, in_note = [], False, False, False
+        for position, (token, basic, enriched, lemma) in enumerate(by_sentence[sent]):
             if basic == ANON_POS and SPEAKER_RE.match(token) and position == 0:
                 speaker = token
+                continue
+            if token == NOTE_OPEN:
+                if not in_note:
+                    gap(words)
+                in_note = True
+                continue
+            if token == NOTE_CLOSE:
+                in_note = False
                 continue
             if token == "<":
                 in_event = True
@@ -233,6 +277,7 @@ def build_sentences(rows):
                 continue
             if token == ">":
                 in_event = False
+                in_note = False       # "[ * anon >": a note closed with the wrong bracket
                 continue
             if token == REPEAT_OPEN:
                 in_repeat = True
@@ -251,54 +296,174 @@ def build_sentences(rows):
             if token in SENTENCE_END or token in DROP_MARKS or basic == "Atd":
                 continue
             if basic == ANON_POS:      # placeholder: lleoliad, enwb1, cyfenw2...
-                words.append((token.capitalize(), None, True, True))
+                words.append((token.capitalize(), None, True, True, in_note))
                 continue
             # enriched POS may list alternatives ("Gwest | Ep | Epb")
             alternatives = {a.strip() for a in enriched.split("|")}
             proper = any(a.startswith("Ep") for a in alternatives)
             lang = "eng" if alternatives == {FOREIGN_POS} else None
-            clitic = CLITICS.get(token.lower())
-            if clitic:
-                full, as_word = clitic
-                if {b.strip() for b in basic.split("|")} & as_word or not words:
+            if token.startswith("'") and len(token) > 1:
+                lemmas = {l.strip().lower() for l in lemma.split("|")}
+                full = next((CLITIC_FULL_FORMS[l] for l in lemmas if l in CLITIC_FULL_FORMS), None)
+                if full:                              # 'na -> yna, 'm (not) -> ddim
                     token = full
-                else:              # "ro" + "'n" -> "ro'n"
-                    prev = words[-1]
-                    words[-1] = (prev[0].rstrip(",") + token,) + prev[1:]
+                elif words and not words[-1][0].endswith(","):
+                    prev = words[-1]                  # "ro" + "'n" -> "ro'n"
+                    words[-1] = (prev[0] + token,) + prev[1:]
                     continue
-            words.append((token, lang, proper, False))
+                else:
+                    token = CLITIC_FIRST_WORD.get(token.lower(), token.lstrip("'"))
+            words.append((token, lang, proper, False, in_note))
         if words:
-            first, lang, proper, name_part = words[0]
+            # (exactly as v3 did it, the first word even when it opens a note)
+            first, lang, proper, name_part, note = words[0]
             if not proper and first[:1].isupper() and not first.isupper():
-                words[0] = (first[:1].lower() + first[1:], lang, proper, name_part)
+                words[0] = (first[:1].lower() + first[1:], lang, proper, name_part, note)
             sentences.append((speaker or "S?", sent, words))
     return sentences
 
 
-def build_segments(sentences):
-    """Segment/word objects shaped like faster-whisper's (see corpus_siarad),
-    one segment per sentence, plus {word start -> speaker}."""
-    segments, seg_speakers, start_to_speaker = [], [], {}
+def _clocked(sentences):
+    """The word clock: (speaker, [(word tuple, start s, end s)], sentence end s)
+    per sentence, every word -- notes included -- taking WORD_SECONDS, and a
+    WORD_SECONDS gap between sentences. Shared by build_segments() and the
+    note index, so both see the very same times (same float steps as v3)."""
     clock = 0.0
     for speaker, _sent, words in sentences:
-        start = round(clock, 3)
-        word_objs = []
-        for i, (text, lang, _proper, name_part) in enumerate(words):
+        timed = []
+        for w in words:
             w_start = round(clock, 3)
             clock += WORD_SECONDS
-            if i == len(words) - 1 and not text.endswith(","):
+            timed.append((w, w_start, round(clock - 0.001, 3)))
+        yield speaker, timed, round(clock, 3)
+        clock += WORD_SECONDS   # a gap between sentences
+
+
+def build_segments(sentences):
+    """Segment/word objects shaped like faster-whisper's (see corpus_siarad),
+    one segment per sentence with any speech in it, plus {word start ->
+    speaker}. Note words are left out but keep their time on the clock."""
+    segments, seg_speakers, start_to_speaker = [], [], {}
+    for speaker, timed, end in _clocked(sentences):
+        spoken = [t for t in timed if not t[0][4]]
+        if not spoken:
+            continue
+        word_objs = []
+        for i, ((text, lang, _proper, name_part, _note), w_start, w_end) in enumerate(spoken):
+            if i == len(spoken) - 1 and not text.endswith(","):
                 text += "."
             word_objs.append(SimpleNamespace(
-                word=text, start=w_start, end=round(clock - 0.001, 3), lang=lang,
+                word=text, start=w_start, end=w_end, lang=lang,
                 name_part=name_part, probability=1.0))
             start_to_speaker[w_start] = speaker
-        text = " ".join(w[0] for w in words)
-        segments.append(SimpleNamespace(start=start, end=round(clock, 3), text=text,
+        text = " ".join(w[0] for w, _s, _e in spoken)
+        segments.append(SimpleNamespace(start=spoken[0][1], end=end, text=text,
                                         words=word_objs, no_speech_prob=0.0, avg_logprob=0.0,
                                         speaker=speaker))
         seg_speakers.append(speaker)
-        clock += WORD_SECONDS   # a gap between sentences
     return segments, seg_speakers, start_to_speaker
+
+
+# ========================= NOTES IN v3 OUTPUT =========================
+_NOTE_INDEX = None
+
+
+def _note_index():
+    """{recording id: (sentence starts as v3 laid them out, {start of every
+    note word}, {v3 sentence start: (start, text) once its notes are out})},
+    read once per run from corpus_data.txt under BASE_DIR/corcencc."""
+    global _NOTE_INDEX
+    if _NOTE_INDEX is None:
+        from corpus_io import BASE_DIR
+        corpus_data = next((p for p in (BASE_DIR / CORPUS).rglob("corpus_data.txt")
+                            if "__MACOSX" not in p.parts), None)
+        if corpus_data is None:
+            raise RuntimeError(f"no corpus_data.txt under {BASE_DIR / CORPUS} -- needed to "
+                               f"drop CorCenCC's bracketed notes")
+        print(f"  Reading CorCenCC's bracketed notes from {corpus_data.name} (once)...")
+        index = {}
+        for rid, rows in iter_recordings(corpus_data):
+            starts, notes, rewritten, fresh = [], set(), {}, []
+            for _speaker, timed, _end in _clocked(build_sentences(rows)):
+                starts.append(timed[0][1])
+                spoken = [(w, s) for w, s, _e in timed if not w[4]]
+                if spoken:
+                    fresh.append(spoken[0][1])   # segment starts of a read without notes
+                if len(spoken) < len(timed):
+                    notes.update(s for w, s, _e in timed if w[4])
+                    if spoken:
+                        rewritten[timed[0][1]] = (spoken[0][1], " ".join(w[0] for w, _s in spoken))
+            index[rid] = (starts, notes, rewritten, fresh)
+        _NOTE_INDEX = index
+    return _NOTE_INDEX
+
+
+def strip_bracket_notes(data):
+    """Drops the bracketed notes' words from a v3 recording's saved tagging
+    (corpus_io.load_tagged_cache() output, changed in place and returned) --
+    the same words a fresh read leaves out: words go by their clock time,
+    the word before each note becomes a clause boundary (a fresh read puts a
+    comma there), segments that were only a note go, the rest get the
+    fresh read's start and text, and the word counts shrink to match.
+    Tagging from a read that already left the notes out has no word at a
+    note's time, so it comes back as it was. Returns None when the saved
+    segments don't sit where the v3 clock puts them: tagging from an older
+    reader (v1/v2), kept in the same folder by output_merge -- the v3 run
+    beside it covers the whole recording, so the rerun skips it (it used to
+    stop the whole folder, 2026-10-05)."""
+    rid = str((data.get("video_meta") or {}).get("url") or "").split(":", 1)[-1]
+    entry = _note_index().get(rid)
+    if entry is None:
+        raise RuntimeError(f"{rid} not found in corpus_data.txt")
+    starts, notes, rewritten, fresh = entry
+    words = data["words"]
+
+    def at(w):
+        return round(float(w["start"]), 3) if w.get("start") is not None else None
+
+    saved = [round(float(s[2]), 3) for s in data["segments"]]
+    if saved != starts:
+        # read with the notes already left out, or an older reader's tagging
+        return data if saved == fresh else None
+    if not notes:
+        return data
+
+    from mutation_engine import is_english_code_switch
+    kept, kept_before, dropped = [], [], []
+    for w in words:
+        kept_before.append(len(kept))
+        if at(w) in notes:
+            dropped.append(w)
+            if kept:                 # nothing pairs across a note
+                kept[-1]["_clause_boundary_after"] = True
+                real = next((x for x in reversed(kept) if not x.get("synthetic")), None)
+                if real is not None:
+                    real["_clause_boundary_after"] = True
+            continue
+        kept.append(w)
+    kept_before.append(len(kept))
+    if not dropped:
+        return data
+
+    segments, renumber = [], {}
+    for old, s in enumerate(data["segments"]):
+        a, b = kept_before[s[0]], kept_before[s[1]]
+        if a == b and s[0] < s[1]:
+            continue                 # the whole sentence was a note
+        s = list(s)
+        start, text = rewritten.get(round(float(s[2]), 3), (s[2], s[4]))
+        s[0], s[1], s[2], s[4] = a, b, start, text
+        renumber[old] = len(segments)
+        segments.append(s)
+    for w in kept:
+        if w.get("_seg_id") in renumber:
+            w["_seg_id"] = renumber[w["_seg_id"]]
+
+    data["words"], data["segments"] = kept, segments
+    data["video_word_count"] = (data.get("video_word_count") or len(words)) - len(dropped)
+    data["video_codeswitch_word_count"] = (data.get("video_codeswitch_word_count") or 0) - sum(
+        1 for w in dropped if is_english_code_switch(w["word"], None))
+    return data
 
 
 # ========================= PROCESSING =========================
@@ -318,6 +483,7 @@ def process_recording(rid, rows, stamp, meta_info):
         results = analyze_segments(
             segments, meta, video_duration_seconds=duration, language="cy",
             language_probability=1.0, checkpoint_key=meta["url"],
+            step=run_progress.step,  # unversioned
             tagged_cache_path=vpaths["tagged"])
         if TECHIAITH_API_KEY and is_cysill_disabled():
             print(f"  ⏸ {rid}: Cysill hit its hourly limit during this recording -- not saved.")
@@ -345,7 +511,7 @@ def process_recording(rid, rows, stamp, meta_info):
         out_dir = vpaths["segments"].parent
         speaker_rows = []
         for code in dict.fromkeys(seg_speakers):
-            spoken = [w for spk, _s, ws in sentences if spk == code for w in ws]
+            spoken = [w for spk, _s, ws in sentences if spk == code for w in ws if not w[4]]
             speaker_rows.append({
                 "conversation": rid, "speaker": code, "age": None, "sex": None, "role": None,
                 "notes": None, "word_count": len(spoken),
@@ -357,9 +523,9 @@ def process_recording(rid, rows, stamp, meta_info):
         pd.DataFrame(speaker_rows).to_csv(out_dir / f"speakers_{folder_name}.csv",
                                           index=False, encoding="utf-8-sig", quoting=1)
         pd.DataFrame([{"conversation": rid, "speaker": spk, "sentence": sent,
-                       "main_tier": " ".join(w[0] for w in ws),
-                       "clean_text": " ".join(w[0] for w in ws), "gls": None, "eng": None}
-                      for spk, sent, ws in sentences]
+                       "main_tier": " ".join(w[0] for w in ws if not w[4]),
+                       "clean_text": " ".join(w[0] for w in ws if not w[4]), "gls": None, "eng": None}
+                      for spk, sent, ws in sentences if any(not w[4] for w in ws)]
                      ).to_csv(out_dir / f"utterances_{folder_name}.csv",
                               index=False, encoding="utf-8-sig", quoting=1)
 
@@ -373,6 +539,7 @@ def process_recording(rid, rows, stamp, meta_info):
         except Exception as e:
             print(f"  ⚠️ Merge with earlier output failed ({e}) -- this run's output is "
                   f"saved on its own; earlier folders untouched.")
+        vpaths = publish_document(vpaths, meta)   # -> runs/corcencc/<recording>/
     except Exception as e:
         print(f"  💥 {rid}: {e}")
         cleanup_incomplete_video_dirs(vpaths, video_label=rid)
@@ -382,10 +549,12 @@ def process_recording(rid, rows, stamp, meta_info):
 def _already_done(rid):
     """Same test as corpus_siarad._already_done: output on the current
     pipeline version, with the lexicon, and Cysill-tagged when a key is set
-    -- plus READER_MARKER, since this file isn't in the version hash: output
-    from an older reader is redone even after "Update all results" has
-    re-stamped it with the current version."""
-    for segments_csv in RUNS_DIR.glob(f"*/CorCenCC_{rid}/segments_*.csv"):
+    -- plus READER_MARKER: output from an older reader is redone even after
+    "Update all results" has re-stamped it with the current version (v3
+    output counts as done; its bracketed notes go in every rerun)."""
+    run_progress.tick()  # unversioned
+    for segments_csv in (s for d in document_folders(f"CorCenCC_{rid}")
+                         for s in d.glob("segments_*.csv")):
         if not (segments_csv.parent / READER_MARKER).exists():
             continue
         pos_csv = next(segments_csv.parent.glob("pos_*.csv"), None)
@@ -424,7 +593,10 @@ def main(argv):
     print(f"  {len(metadata)} spoken recordings; learner status: "
           + ", ".join(f"{k} {v}" for k, v in learner_counts.items()))
 
+    run_progress.checking(0 if redo else len(metadata))  # unversioned
+    document_folders("", refresh=True)   # index runs/ once for _already_done
     done = set() if redo else {rid for rid in metadata if _already_done(rid)}
+    run_progress.checked()  # unversioned
     if done:
         print(f"Skipping {len(done)} recording(s) already done on this pipeline version "
               f"with Cysill (add --redo to process them again).")
@@ -447,23 +619,28 @@ def main(argv):
 
     stamp = run_stamp()
     set_session_label(stamp, label=f"{CORPUS}-{todo}")
-    print(f"Processing {todo} CorCenCC recording(s) into runs/{session_dir(stamp).name}/")
+    print(f"Processing {todo} CorCenCC recording(s) into runs/corcencc/ "
+          f"(staged in runs/_sessions/{session_dir(stamp).name}/ while each is worked on)")
     processed = 0
+    run_progress.start_run(todo, "recordings")  # unversioned
     try:
         for rid, rows in iter_recordings(corpus_data):
             if rid in done:
                 continue
             if processed >= todo:
                 break
+            run_progress.item(rid)  # unversioned
             if not process_recording(rid, rows, stamp, metadata.get(rid, {})):
                 print(f"Stopped: Cysill's hourly limit was reached after {processed} "
                       f"recording(s) -- run the same command again in about an hour; "
                       f"finished ones are skipped.")
                 break
             processed += 1
+            run_progress.item_done()  # unversioned
             if processed % 25 == 0:
                 save_lemma_cache()   # 1,331 recordings: don't lose hours of lookups to a crash
     finally:
+        run_progress.end_run()  # unversioned
         save_lemma_cache()
         cleanup_empty_session_dir(stamp)
     return 0

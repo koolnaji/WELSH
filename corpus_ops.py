@@ -61,6 +61,7 @@ from corpus_io import (
     cleanup_incomplete_video_dirs, pipeline_version, session_dir,
     save_tagged_cache, load_tagged_cache,
 )
+from corpus_io import published_folders  # unversioned
 from types import SimpleNamespace
 # PATCH: single source of truth (see mutation_tables.py for rationale) --
 # was three separate inline copies of this same 4-status list in this
@@ -75,6 +76,9 @@ import quantifier_engine
 import run_progress  # unversioned
 
 
+# >>> NOT VERSIONED -- the run-report email (2026-10-04): formatting only,
+# never what a row says, so changing the email doesn't mark every processed
+# file as stale. Keep detection code OUT of this region.
 # ========================= EMAIL NOTIFICATION =========================
 def send_notification_email(subject, body, html=False):
     """
@@ -134,9 +138,186 @@ def _fmt_hms(seconds):
     return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
 
+# Short names for the subject line and the per-video table.
+BRANCH_SHORT = {
+    "Mutation":                "Mut",
+    "Conjugated prepositions": "Prep",
+    "Numeral + singular noun": "Num",
+    "rhai + plural noun":      "rhai",
+    "Quantifier + o + plural": "Quant",
+    "Controls combined":       "Controls",
+}
+
+
+def run_branch_stats(stamp):
+    """
+    All five branches for ONE run, read back from the CSVs it just wrote in
+    runs/<stamp>_<label>/ -- the same files, the same rate and the same
+    branch list as corpus_analyzer.py's "All branches" (rate = erosion /
+    evaluable contexts; evaluable = correct, erosion or wrong mutation
+    type; mutation folders read corroborated, else original). The email
+    used to report the mutation branch only (2026-10-04).
+
+    Returns {"branches": [{label, prediction, eroded, contexts, low, high,
+    unverified}], "videos": [{title, duration, counts: {label: (eroded,
+    contexts)}}], "min_contexts": n}, or None when the run folder is gone.
+    """
+    # Lazy: corpus_analyzer pulls in matplotlib; welsh_pipeline has already
+    # imported it by the time an email is built.
+    from corpus_analyzer import BRANCHES, COMBINED_CONTROL, MIN_CELL_CONTEXTS, _wilson_interval
+    run_dir = session_dir(stamp)
+    if not run_dir.exists():
+        found = sorted(run_dir.parent.glob(f"{stamp}*"))
+        if not found:
+            return None
+        run_dir = found[0]
+    # the run's documents: moved to their source folders when finished
+    # (published.txt lists them), plus any still staged here
+    folders = sorted(p for p in run_dir.iterdir() if p.is_dir()) + published_folders(stamp)
+
+    evaluable, unverified, videos = {}, {}, {}
+    for label, prefix, _prediction in BRANCHES:
+        if prefix is None:      # the combined control, built below
+            continue
+        frames, n_unverified = [], 0
+        for folder in folders:
+            files = [f for f in sorted(folder.glob(f"{prefix}_*.csv"))
+                     if not f.name.endswith("_precaption_backup.csv")]
+            if prefix == "mutations":
+                files = ([f for f in files if f.name.startswith("mutations_corroborated_")]
+                         or [f for f in files if f.name.startswith("mutations_original_")] or files)
+            for f in files:
+                try:
+                    d = pd.read_csv(f, encoding="utf-8-sig")
+                except Exception:
+                    continue
+                if d.empty or "status" not in d.columns or "is_erosion" not in d.columns:
+                    continue
+                title = str(d["video_title"].iloc[0]) if "video_title" in d.columns else folder.name
+                if title not in videos:
+                    dur = d["video_duration_seconds"].iloc[0] if "video_duration_seconds" in d.columns else None
+                    videos[title] = {"title": title, "duration": dur if pd.notna(dur) else None,
+                                     "counts": {}}
+                n_unverified += int((d["status"] == "erosion_unverified").sum())
+                ev = d[d["status"].isin(EVALUABLE_STATUSES)]
+                frames.append(pd.DataFrame({
+                    "title": title,
+                    "eroded": ev["is_erosion"].map(lambda v: str(v).strip().lower() == "true")}))
+        evaluable[label] = pd.concat(frames, ignore_index=True) if frames else \
+            pd.DataFrame({"title": pd.Series(dtype=str), "eroded": pd.Series(dtype=bool)})
+        unverified[label] = n_unverified
+    evaluable["Controls combined"] = pd.concat([evaluable[l] for l in COMBINED_CONTROL], ignore_index=True)
+    unverified["Controls combined"] = sum(unverified[l] for l in COMBINED_CONTROL)
+
+    branches = []
+    for label, _prefix, prediction in BRANCHES:
+        ev = evaluable[label]
+        k, n = int(ev["eroded"].sum()), len(ev)
+        low, high = _wilson_interval(k, n)
+        # clamp: at k=0 rounding can leave the bound a hair below 0 ("-0%")
+        low, high = (max(0.0, low), min(1.0, high)) if n else (low, high)
+        branches.append({"label": label, "prediction": prediction, "eroded": k, "contexts": n,
+                         "low": low, "high": high, "unverified": unverified[label]})
+        if label == "Controls combined":
+            continue
+        for title, g in ev.groupby("title"):
+            videos[title]["counts"][label] = (int(g["eroded"].sum()), len(g))
+    return {"branches": branches, "videos": list(videos.values()), "min_contexts": MIN_CELL_CONTEXTS}
+
+
+def _branch_rate_text(b, min_contexts):
+    """'25.8%' when there are enough contexts, '2/12' when there aren't,
+    '-' when there are none -- a percentage of 12 contexts reads as more
+    than it is."""
+    if not b["contexts"]:
+        return "-"
+    if b["contexts"] < min_contexts:
+        return f'{b["eroded"]}/{b["contexts"]}'
+    return f'{b["eroded"] / b["contexts"]:.1%}'
+
+
+def branch_subject_summary(stats):
+    """'Mut 25.8% | Prep 4.0% | Num 0/3 | rhai - | Quant 0/12' for the
+    email subject (plain ASCII; the combined control is left to the body)."""
+    if not stats:
+        return ""
+    return " | ".join(f'{BRANCH_SHORT.get(b["label"], b["label"])} '
+                      f'{_branch_rate_text(b, stats["min_contexts"])}'
+                      for b in stats["branches"] if b["label"] != "Controls combined")
+
+
+def _five_branch_html(stats):
+    """The five-branch table that opens the email, plus a per-video table."""
+    from html import escape
+    min_n = stats["min_contexts"]
+    th = ('<th style="text-align:{a};padding:4px 8px;border-bottom:2px solid #333;'
+          'font-size:12px;color:#333;">{t}</th>')
+    td = '<td style="text-align:{a};padding:4px 8px;{s}">{t}</td>'
+
+    head = "".join(th.format(a=a, t=t) for a, t in
+                   [("left", "Branch"), ("left", "Predicted"), ("right", "Eroded / contexts"),
+                    ("right", "Rate"), ("right", "95% interval")])
+    body = []
+    for b in stats["branches"]:
+        k, n = b["eroded"], b["contexts"]
+        combined = b["label"] == "Controls combined"
+        border = "border-top:1px solid #999;" if combined else "border-bottom:1px solid #eee;"
+        if not n:
+            rate, ci, colour = "no contexts", "", "#999"
+        elif n < min_n:
+            rate, ci, colour = f"too few (n&lt;{min_n})", f'{b["low"]:.0%}–{b["high"]:.0%}', "#999"
+        else:
+            rate, ci, colour = f"{k / n:.1%}", f'{b["low"]:.1%}–{b["high"]:.1%}', "#111"
+        predicted = "erode" if b["prediction"] == "erode" else "resist (control)"
+        body.append("<tr>" + "".join([
+            td.format(a="left", s=border + "font-weight:600;", t=escape(b["label"])),
+            td.format(a="left", s=border + "color:#555;", t=predicted),
+            td.format(a="right", s=border, t=f"{k:,} / {n:,}"),
+            td.format(a="right", s=border + f"font-weight:700;color:{colour};", t=rate),
+            td.format(a="right", s=border + "color:#555;", t=ci),
+        ]) + "</tr>")
+    table = (f'<table style="border-collapse:collapse;font-size:13px;width:100%;">'
+             f'<tr>{head}</tr>{"".join(body)}</table>')
+
+    notes = [f"Rate = eroded ÷ (correct + eroded), this run only; corpus_analyzer.py gives the "
+             f"whole corpus. The 95% interval is wide when a branch has few contexts — that is "
+             f"too little data, not a bad result. Branches under {min_n} contexts show counts only."]
+    quant = next((b for b in stats["branches"] if b["label"] == "Quantifier + o + plural"), None)
+    if quant and quant["unverified"]:
+        notes.append(f'Quantifier: {quant["unverified"]} singular noun(s) held for hand checking '
+                     f'(quantifier census, menu 6 → d) — counted only once judged a real slip.')
+    notes_html = "".join(f'<div style="margin-top:6px;color:#666;font-size:12px;">{t}</div>'
+                         for t in notes)
+
+    labels = [b["label"] for b in stats["branches"] if b["label"] != "Controls combined"]
+    vhead = th.format(a="left", t="Video") + "".join(
+        th.format(a="right", t=BRANCH_SHORT.get(l, l)) for l in labels)
+    vrows = []
+    for v in stats["videos"]:
+        title = v["title"] if len(v["title"]) <= 38 else v["title"][:37] + "…"
+        dur = f' <span style="color:#999;">{_fmt_hms(v["duration"])}</span>' if v["duration"] else ""
+        cells = []
+        for l in labels:
+            k, n = v["counts"].get(l, (0, 0))
+            cells.append(td.format(a="right", s="border-bottom:1px solid #eee;" + ("color:#bbb;" if not n else ""),
+                                   t=f"{k}/{n}" if n else "·"))
+        vrows.append("<tr>" + td.format(a="left", s="border-bottom:1px solid #eee;",
+                                         t=escape(title) + dur) + "".join(cells) + "</tr>")
+    per_video = ""
+    if vrows:
+        per_video = (f'<h3 style="margin:18px 0 6px;font-size:14px;color:#1a1a1a;'
+                     f'border-bottom:1px solid #ddd;padding-bottom:4px;">By video '
+                     f'<span style="font-weight:400;color:#777;font-size:12px;">(eroded/contexts)</span></h3>'
+                     f'<table style="border-collapse:collapse;font-size:12px;width:100%;">'
+                     f'<tr>{vhead}</tr>{"".join(vrows)}</table>')
+
+    return (f'<h3 style="margin:14px 0 6px;font-size:15px;color:#1a1a1a;">Five branches</h3>'
+            f'{table}{notes_html}{per_video}')
+
+
 def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
                       videos_succeeded, failed_videos, mutation_rows,
-                      summary, base_dir):
+                      summary, base_dir, branch_stats=None):
     """
     Builds an organized HTML run-report email, replacing the old 3-line
     plain-text body. Sections mirror generate_research_summary()'s console
@@ -149,6 +330,9 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
 
     `summary` is the dict returned by generate_research_summary() (or None
     if there was no mutation data this run -- e.g. every video failed).
+    `branch_stats` is run_branch_stats(stamp): when given, the email opens
+    with all five branches and a per-video table of all five, and the
+    mutation sections below become "Mutation branch: detail".
     """
     def row(label, value):
         return (f'<tr><td style="padding:2px 14px 2px 0;color:#555;">{label}</td>'
@@ -161,11 +345,13 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
 
     parts = [
         '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;'
-        'max-width:560px;color:#222;">',
+        'max-width:640px;color:#222;">',
         '<h2 style="margin:0 0 4px;font-size:17px;">Welsh pipeline run finished</h2>',
         f'<div style="color:#777;font-size:12px;margin-bottom:10px;">'
         f'{run_type} &middot; run stamp {stamp}</div>',
     ]
+    if branch_stats:
+        parts.append(_five_branch_html(branch_stats))
 
     parts.append(section("Run", "".join([
         row("Type", run_type),
@@ -186,6 +372,9 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
     ])) + fail_html)
 
     if summary:
+        if branch_stats:
+            parts.append('<h3 style="margin:26px 0 0;font-size:15px;color:#1a1a1a;">'
+                         'Mutation branch: detail</h3>')
         parts.append(section("Mutation data collected this run", "".join([
             row("Total contexts", summary["total_analyzed_contexts"]),
             row("Total words (this run's videos)", summary["total_words"]),
@@ -284,7 +473,8 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
             # succeeded/failed title lists above; this is the first place
             # you can see at a glance whether one video is behaving very
             # differently from the rest of the batch.
-            if "video_title" in df.columns:
+            # (Replaced by the five-branch "By video" table when that's shown.)
+            if "video_title" in df.columns and not branch_stats:
                 video_rows = []
                 for title, vdf in df.groupby("video_title", sort=False):
                     dur = vdf["video_duration_seconds"].iloc[0] \
@@ -327,6 +517,7 @@ def build_email_body(run_type, stamp, elapsed_seconds, videos_attempted,
 
     parts.append('</div>')
     return "".join(parts)
+# <<< NOT VERSIONED
 
 
 # ========================= SUMMARY =========================
@@ -1706,6 +1897,14 @@ def rows_from_tagged_cache(path):
     detection (Whisper, filters, contraction splitting, Cysill, spaCy,
     lexicon tags) is redone. Used by mutation_rerun_rules.py."""
     data = load_tagged_cache(path)
+    # CorCenCC read by the v3 reader still has the transcribers' bracketed
+    # notes in it as speech ("[ sŵn papur yn rhwygo ]") -- dropped here, so a
+    # rerun matches a fresh read without re-tagging (2026-10-05).
+    if (data.get("video_meta") or {}).get("source") == "corcencc":
+        from corpus_corcencc import strip_bracket_notes   # it imports this module
+        data = strip_bracket_notes(data)
+        if data is None:             # an older reader's tagging -- skipped
+            return None, None
     seg_boundaries = [(s[0], s[1], SimpleNamespace(start=s[2], end=s[3], text=s[4]))
                       for s in data["segments"]]
     rows = rows_from_enriched(data["words"], seg_boundaries, data["video_meta"], data,

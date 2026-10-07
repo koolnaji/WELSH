@@ -62,7 +62,7 @@ import re
 import pandas as pd
 from tqdm import tqdm
 
-from corpus_io import RUNS_DIR, _replace_with_retry
+from corpus_io import RUNS_DIR, _replace_with_retry, data_folders, _segments_stamp
 
 # vpaths key -> file-name prefix, as corpus_io._video_slug() names them
 DATA_FILES = {
@@ -267,13 +267,16 @@ def find_previous_folders(key, exclude=None):
     runs/_deleted/ and `exclude` (the folder being written now)."""
     exclude = Path(exclude).resolve() if exclude else None
     found = set()
-    for segments_csv in RUNS_DIR.glob("*/*/segments_*.csv"):
-        folder = segments_csv.parent
-        if "_deleted" in folder.parts or folder in found or folder.resolve() == exclude:
+    # any depth: home folders (runs/<source>/.../<doc>/) and staged ones
+    # (runs/_sessions/<stamp>/<doc>/) -- corpus_io "SOURCE LAYOUT"
+    for folder in data_folders(RUNS_DIR):
+        if folder in found or folder.resolve() == exclude:
             continue
         if _folder_key(folder) == key:
             found.add(folder)
-    return sorted(found, key=lambda f: (f.parent.name, f.stat().st_mtime), reverse=True)
+    # newest run first: the stamp in the file names (folder names no
+    # longer carry one)
+    return sorted(found, key=lambda f: (_segments_stamp(f), f.stat().st_mtime), reverse=True)
 
 
 def copy_previous_captions(video_url, dest_dir):

@@ -56,8 +56,10 @@ from corpus_io import (
     BASE_DIR, CODE_DIR, RUNS_DIR, ensure_dirs, run_stamp, _video_slug, append_output_csv,
     cleanup_incomplete_video_dirs, cleanup_empty_session_dir, pipeline_version,
     is_current_version, set_session_label, session_dir, keep_awake,
+    document_folders, publish_document,
 )
 from corpus_ops import analyze_segments
+import run_progress
 from output_merge import merge_with_previous, _retire
 from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 from mutation_engine import (
@@ -203,9 +205,15 @@ def _meta(path, kind):
 
 
 def _already_done(path, kind):
-    """Same rule as corpus_siarad._already_done: output on the CURRENT
-    version, and (when a key is set) with Cysill tags."""
-    for pos_csv in RUNS_DIR.glob(f"*/News_{kind}_{_doc_id(path)}/pos_*.csv"):
+    """Like corpus_siarad._already_done: output with Cysill tags (when a key
+    is set) -- on the CURRENT version, or on any version when the folder
+    keeps its tagged words (tagged_*.json.gz): "Update all results" (4 -> y)
+    re-runs detection from those without Cysill, so re-tagging such a
+    document after a detection-only change wastes hours (2026-10-06: a
+    3 -> n restarted after a code change would have re-tagged ~1,000
+    finished documents). After a change to TAGGING, use --redo."""
+    for pos_csv in (p for d in document_folders(f"News_{kind}_{_doc_id(path)}")
+                    for p in d.glob("pos_*.csv")):
         if not (pos_csv.parent / SPLIT_MARKER).exists():
             continue    # made by an older news_text (see SPLIT_MARKER)
         try:
@@ -218,8 +226,9 @@ def _already_done(path, kind):
         cysill_share = (pos["cysill_pos"] != "").mean() if "cysill_pos" in pos.columns else 0.0
         # Many news chunks are resolved locally (lexicon/English), so a lower
         # Cysill share than Siarad's is normal; 0 means Cysill never answered.
-        if is_current_version(pos["pipeline_version"].iloc[0]) and \
-                (not TECHIAITH_API_KEY or cysill_share > 0):
+        reusable = is_current_version(pos["pipeline_version"].iloc[0]) or \
+            any(pos_csv.parent.glob("tagged_*.json.gz"))
+        if reusable and (not TECHIAITH_API_KEY or cysill_share > 0):
             return True
     return False
 
@@ -230,8 +239,8 @@ def retire_stale(path, kind):
     were all spokesperson statements has no "quote" document, and its old
     mixed quote folder (news-927) would otherwise stay and be counted."""
     n = 0
-    for folder in RUNS_DIR.glob(f"*/News_{kind}_{_doc_id(path)}"):
-        if folder.is_dir() and "_deleted" not in folder.parts:
+    for folder in document_folders(f"News_{kind}_{_doc_id(path)}"):
+        if folder.is_dir():
             _retire(folder, folder, f"no {kind} text in the article any more")
             n += 1
     return n
@@ -251,7 +260,7 @@ def process_document(path, kind, sentences, stamp):
         results = analyze_segments(
             segments, meta, video_duration_seconds=duration, language="cy",
             language_probability=1.0, checkpoint_key=meta["url"],
-            step=lambda label: None,   # one summary line per document instead
+            step=run_progress.step,   # names the phase on the per-document bar
             tagged_cache_path=vpaths["tagged"])
         if TECHIAITH_API_KEY and is_cysill_disabled():
             print(f"  ⏸ {path.name} ({kind}): Cysill hit its limit -- not saved.")
@@ -276,6 +285,7 @@ def process_document(path, kind, sentences, stamp):
             merge_with_previous(vpaths, meta["url"], [0.0, 1e9])
         except Exception as e:
             print(f"  ⚠️ Merge with earlier output failed ({e}) -- saved on its own.")
+        vpaths = publish_document(vpaths, meta)   # -> runs/news/<kind>/<article>/
     except Exception as e:
         print(f"  💥 {path.name} ({kind}): {e}")
         cleanup_incomplete_video_dirs(vpaths, video_label=path.name)
@@ -308,7 +318,8 @@ def main(argv):
              if skipped_other else ""))
 
     jobs, retired = [], 0
-    for path in files:
+    document_folders("", refresh=True)   # index runs/ once for _already_done
+    for path in run_progress.files(files, "Checking what's done", unit="articles"):
         article = read_article(path)
         for kind in KINDS:
             if not article[kind]:
@@ -337,15 +348,20 @@ def main(argv):
     stamp = run_stamp()
     set_session_label(stamp, label=f"news-{len(jobs)}")
     print(f"Processing {len(jobs)} document(s) (narration and quotes counted separately) "
-          f"into runs/{session_dir(stamp).name}/")
+          f"into runs/news/ (staged in runs/_sessions/{session_dir(stamp).name}/ "
+          f"while each is worked on)")
     keep_awake()
+    run_progress.start_run(len(jobs), "documents")
     try:
         for n, (path, kind, sentences) in enumerate(jobs):
+            run_progress.item(f"{_doc_id(path)} {kind}")
             if not process_document(path, kind, sentences, stamp):
                 print(f"Stopped: Cysill's limit was reached. {len(jobs) - n} document(s) left -- "
                       f"run this again later; finished ones are skipped.")
                 break
+            run_progress.item_done()
     finally:
+        run_progress.end_run()
         keep_awake(False)
         save_lemma_cache()
         cleanup_empty_session_dir(stamp)

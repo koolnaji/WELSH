@@ -140,11 +140,12 @@ from mutation_tables import (
     WELSH_CONTRACTION_SPLITS, SUPPLETIVE_COMPARATIVE_SUPERLATIVE_RADICALS,
     OEDD_CONTRACTIONS, OEDD_PERSON_ENDINGS, CLIPPED_BOD_FORMS, FIXED_EXPRESSIONS,
     CAPITALISED_COMMON_WORDS, PLACE_NAME_HEADS, LANGUAGE_NOUNS, PREPOSED_ONLY_ADJECTIVES,
-    FEM_ADJ_TRIGGER_EXCLUDED,
+    FEM_ADJ_TRIGGER_EXCLUDED, FEM_ADJ_TARGET_EXCLUDED, PETH_NOUN_BEFORE,
+    DA_NOT_ADJECTIVE_BEFORE, LEMMA_OVERRIDES,
     SOFT_PREPOSITION_TRIGGERS, ECHO_PRONOUNS, DISCOURSE_PARTICLES, NEVER_MUTATING,
     POSSESSIVE_TRIGGERS, FIRST_PERSON_VERB_FORMS, SUBJECT_PRONOUNS,
     CARDINAL_WORDS, YN_ELIDED_ARTICLE_NOUNS, FUSED_PREPOSITION_FORMS,
-    _LEGAL_BASE_MARK_PAIRS,
+    _LEGAL_BASE_MARK_PAIRS, VERBNOUN_DIALECT_SPELLINGS,
 )
 
 
@@ -343,6 +344,17 @@ def get_welsh_lemma(word, node=None):
     w = normalize_word(word)
     if not w:
         return None
+    # Spellings whose dictionary/tagger lemma is wrong for mutation purposes
+    # ("gau" = soft-mutated "cau", not the adjective "gau") -- see
+    # LEMMA_OVERRIDES. First, so no other source can outrank it.
+    if w in LEMMA_OVERRIDES:
+        return LEMMA_OVERRIDES[w]
+    # Hyphenated compounds of "cyd-" (co-) and "cyn-" (former) only start
+    # with g- when soft-mutated: "un o gyd-berchnogion", "yn gyd-gynhyrchiad",
+    # "a gyd-sefydlodd" came back with a g- lemma and scored as erosion (news,
+    # 2026-10-07). The c- form is lemma enough for the initial.
+    if "-" in w and w.split("-", 1)[0] in ("gyd", "gyn"):
+        return "c" + w[1:]
     suppletive_radical = _resolve_suppletive_comparative_radical(w)
     if suppletive_radical:
         return suppletive_radical
@@ -1734,6 +1746,18 @@ def radical_candidates_for_target(target_node, t2, expected):
             add(spacy_tok.get("lemma"), verify=True)
     for candidate in reverse_mutation_candidates(t2.get("raw_word"), expected):
         add(candidate)   # derived directly from this pipeline's own mutation tables -- always trustworthy
+    # g dropped before l/r: "yn raddau" (graddau), "yn lanach" (glanach), "yn
+    # las". The tables above only restore g before a vowel, so these were
+    # read as soft rh-/ll- words and scored "wrong mutation type" after
+    # predicative "yn", which leaves rh/ll alone -- 13 news rows (2026-10-07).
+    # Only a g-form the lexicon lists as a radical counts, so "yn raglen"
+    # (rhaglen) or "yn lwyd" (llwyd; "glwyd" is only soft "clwyd") stay
+    # wrong-type.
+    if raw_word[:1] in ("l", "r") and initial_cluster(raw_word) in ("l", "r") and \
+            any(m in expected for m in ("soft", "soft_limited")) and \
+            any(not (e.get("morph") or {}).get("Mutation")
+                for e in bangor_lexicon.lookup("g" + raw_word)):
+        add("g" + raw_word)
     add(t2.get("raw_word"))
     return candidates
 
@@ -1937,9 +1961,15 @@ def is_selectively_invariant(radical, expected_mutations):
     if not radical or not expected_mutations:
         return False
     radical_char = normalize_word(radical)[0] if normalize_word(radical) else ""
+    # The map also lists digraphs (ll, rh, ch), which the first letter alone
+    # never matched: "a rhoddwyd" (AND was given -- rh takes no aspirate) was
+    # scored as erosion in the news narration and 28 times in CorCenCC
+    # (2026-10-06). Checked as well as the first letter, not instead of it.
+    radical_cluster = initial_cluster(radical)
     for mut_type in expected_mutations:
-        if mut_type in SELECTIVE_INVARIANT_MAP and \
-                radical_char in SELECTIVE_INVARIANT_MAP[mut_type]:
+        if mut_type in SELECTIVE_INVARIANT_MAP and (
+                radical_char in SELECTIVE_INVARIANT_MAP[mut_type]
+                or radical_cluster in SELECTIVE_INVARIANT_MAP[mut_type]):
             return True
     return False
 
@@ -2000,6 +2030,24 @@ def _evaluate_mutation_outcome(target_node, expected):
         node=target_node,
     )
     if t2.get("skip_reason"):
+        return {"skip": True, "t2": t2}
+
+    # A mutation this trigger can't cause belongs to a word that was said but
+    # dropped or reduced in the transcript, so the context isn't this
+    # trigger's (CorCenCC + news narration, 2026-10-06):
+    #  - nh-/ngh-/mh-/ng- is only ever nasal, which comes from "fy"/"yn":
+    #    "i nhad", "i ngwaith", "y ngradd" (fy dropped or said 'y) -- ~100
+    #    "wrong type" rows in CorCenCC, Siarad and Patagonia;
+    #  - ch-/th-/ph- for c/t/p is only ever aspirate, which after a soft
+    #    trigger comes from a reduced "ei" (her): "i chael", "i thad" -- 33.
+    raw_form = t2["raw_word"]
+    lemma_form = normalize_word(t2.get("lemma") or "")
+    if "nasal" not in expected and raw_form != "nhw" and \
+            initial_cluster(raw_form) in ("nh", "ngh", "mh", "ng"):
+        return {"skip": True, "t2": t2}
+    if "aspirate" not in expected and lemma_form and \
+            initial_cluster(lemma_form) in ASPIRATE_MUTATION and \
+            initial_cluster(raw_form) == ASPIRATE_MUTATION[initial_cluster(lemma_form)]:
         return {"skip": True, "t2": t2}
 
     surface_mut    = t2["surface_mutation"]
@@ -2363,6 +2411,9 @@ def _evaluate_feminine_ei_h_mutation(current_node, target_node, trigger_word, ra
     base_form = normalize_word(lemma) if lemma else (raw[1:] if raw.startswith("h") else raw)
     if not base_form or base_form[0] not in WELSH_VOWELS:
         return None
+    # w before a/e/i/o is a consonant -- no h (see _evaluate_h_mutation).
+    if base_form[0] == "w" and base_form[1:2] in ("a", "e", "i", "o"):
+        return None
 
     h_applied  = raw.startswith("h") and not (lemma or "").startswith("h")
     spacy_tok  = target_node.get("spacy_token")
@@ -2449,6 +2500,11 @@ def _evaluate_h_mutation(current_node, target_node, trigger_word):
         return None
     base_form = normalize_word(lemma) if lemma else (raw[1:] if raw.startswith("h") else raw)
     if not base_form or base_form[0] not in WELSH_VOWELS:
+        return None
+    # "w" before a, e, i, o is a consonant ("wardiau", "wedi", "wats"), which
+    # takes no h: "eu wardiau priodol" was scored as erosion in the news
+    # narration (2026-10-06). Vocalic "wy-" ("eu hwyneb") still counts.
+    if base_form[0] == "w" and base_form[1:2] in ("a", "e", "i", "o"):
         return None
 
     h_applied  = raw.startswith("h") and not (lemma or "").startswith("h")
@@ -2542,6 +2598,26 @@ def _is_inflected_verb(node):
     return first.startswith("VBF") or verbform in ("Fin", "FinRel") or _is_finite_verb(node)
 
 
+# Common commands, for when neither the lexicon nor spaCy marks the mood.
+IMPERATIVE_FORMS = {"paid", "peidiwch", "dere", "dewch", "tyrd", "cofia", "cofiwch",
+                    "gwranda", "gwrandewch", "drycha", "edrychwch", "aros", "arhoswch"}
+
+
+def _is_imperative(node):
+    """A command form: every verb reading in the lexicon is Mood=Imp, or
+    spaCy says Mood=Imp, or IMPERATIVE_FORMS. The negative particle never
+    stands before a command (the negative imperative is "paid â"), so "na"
+    there is the answer "no": "Na, paid", "na, dere", "na cofia" were
+    scored as mixed-mutation erosions in CorCenCC (2026-10-02)."""
+    norm = normalize_word(node.get("word"))
+    if norm in IMPERATIVE_FORMS:
+        return True
+    if ((node.get("spacy_token") or {}).get("morph") or {}).get("Mood") == "Imp":
+        return True
+    verbs = [e for e in bangor_lexicon.lookup(norm) if e["pos"] == "VERB"]
+    return bool(verbs) and all(e["morph"].get("Mood") == "Imp" for e in verbs)
+
+
 def _prev_real_index(words_list, idx):
     """Index of the nearest earlier word that isn't a synthetic token or a
     hesitation, or None at an utterance/clause boundary."""
@@ -2603,6 +2679,14 @@ def _is_object_candidate(node):
     every negative sentence."""
     norm = normalize_word(node["word"])
     if norm in DISCOURSE_PARTICLES or norm in NEVER_MUTATING or norm in ("dim", "ddim"):
+        return False
+    # Personal pronouns are never object-mutated ("welais i chi" = I saw
+    # you). The lexicon also lists "chi" as aspirate-mutated "ci" (dog), a
+    # noun, so "chi" passed and was scored as an eroded "gi": all 18 rows the
+    # collision_flags chart showed, every one tagged PRON by both taggers
+    # (2026-10-02). Indefinite pronouns (pawb, popeth, rhywun) do mutate
+    # ("welais i bawb") and are not in SUBJECT_PRONOUNS.
+    if norm in SUBJECT_PRONOUNS:
         return False
     readings = bangor_lexicon.lookup(norm)
     if readings:
@@ -2673,8 +2757,9 @@ def _is_unmeasured_name(node, target_norm):
     etc. (CAPITALISED_COMMON_WORDS) are capitalised but mutate normally.
     Acronyms ("y DU" = the UK, "y BBC") are read as letters and never
     mutate: 52 "y du" rows were scored as erosion in the news narration
-    (2026-10-01) -- the word-trigger path already skipped them."""
-    raw = node.get("word") or ""
+    (2026-10-01) -- the word-trigger path already skipped them. Opening
+    quote marks are ignored ("neu ‘Bet Fach’", news narration 2026-10-06)."""
+    raw = (node.get("word") or "").lstrip("'\"‘’“”")
     if len(raw) >= 2 and raw.isupper():
         return True
     cysill = (node.get("cysill_pos") or "").upper()
@@ -2693,6 +2778,68 @@ def _is_unmeasured_name(node, target_norm):
     if target_norm in CAPITALISED_COMMON_WORDS:
         return False
     return get_welsh_lemma(target_norm, node) not in CAPITALISED_COMMON_WORDS
+
+
+def _ei_target_shape(node):
+    """Which "ei" a target's own mutation shows: aspirate (ch/th/ph for c/t/p)
+    or h- before a vowel only follow "her", a soft mutation only "his". None
+    for a radical, or a word whose lemma is unknown -- then only an echo
+    pronoun after it can tell (_process_word_trigger)."""
+    raw = normalize_word(node.get("word"))
+    lemma = normalize_word(get_welsh_lemma(raw, node) or "")
+    if not raw or not lemma or raw == lemma:
+        return None
+    lemma_cluster, raw_cluster = initial_cluster(lemma), initial_cluster(raw)
+    if lemma_cluster in ASPIRATE_MUTATION and raw_cluster == ASPIRATE_MUTATION[lemma_cluster]:
+        return "her"
+    if lemma[0] in WELSH_VOWELS and raw[0] == "h" and raw[1:2] == lemma[:1]:
+        return "her"
+    soft = SOFT_MUTATION.get(lemma_cluster)
+    if soft and raw_cluster == soft:
+        return "his"
+    if soft == "" and raw[:2] == lemma[1:3]:      # g dropped: gwraig -> wraig
+        return "his"
+    return None
+
+
+def _is_plain_noun(node):
+    """A common noun and nothing else -- by the lexicon where it knows the
+    word (a noun reading, no verb/adposition reading, so verb-nouns like
+    "datgelu" don't count), else by both taggers. Names don't count."""
+    lex = node.get("lex_pos")
+    if lex:
+        return "NOUN" in lex and not ({"VERB", "AUX", "ADP", "ADJ", "DET", "NUM"} & set(lex))
+    spacy_pos = (node.get("spacy_token") or {}).get("pos")
+    return spacy_pos == "NOUN" and (node.get("cysill_pos") or "").split("+")[0].startswith("N")
+
+
+# Words that make an "o" before them the preposition: the possessive
+# clitics of "o'i" / "o'u" / "o'w" (however the split spells them), and the
+# compound prepositions "o dan", "o flaen", "o fewn", "o gwmpas".
+_O_PREPOSITION_NEXT = {"i", "'i", "’i", "ei", "u", "'u", "’u", "eu", "w", "'w", "’w",
+                       "dan", "tan", "flaen", "fewn", "gwmpas", "amgylch"}
+
+
+def _starts_noun_phrase(node):
+    """True when this word opens a noun phrase: an article (the clitic "'r"
+    included), a capitalised word, a number, or a noun/determiner by spaCy."""
+    if node is None:
+        return False
+    norm = normalize_word(node.get("word"))
+    if norm in DEFINITE_ARTICLE_FORMS or norm.isdigit():
+        return True
+    if str(node.get("word") or "")[:1].isupper():
+        return True
+    return (node.get("spacy_token") or {}).get("pos") in ("NOUN", "PROPN", "NUM", "DET")
+
+
+def _da_not_adjective(words_list, idx):
+    """True when words_list[idx] ("da") is followed by fi/ti/ni/chi/nhw: the
+    colloquial "(gy)da fi" / "(y)dan ni", not the adjective -- see
+    DA_NOT_ADJECTIVE_BEFORE."""
+    if idx + 1 >= len(words_list) or words_list[idx].get("_clause_boundary_after"):
+        return False
+    return normalize_word(words_list[idx + 1]["word"]) in DA_NOT_ADJECTIVE_BEFORE
 
 
 def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_current):
@@ -2738,6 +2885,21 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         if prev not in BOD_SURFACE_FORMS and prev not in BOD_SUBJECT_EXEMPT_TRIGGERS \
                 and prev not in ("does", "toes", "sdim", "sy", "sydd"):
             return None, lookahead
+    # "beth" after yn/'n, a numeral or a determiner is the noun "peth" (thing),
+    # not "what", and peth doesn't mutate its adjective -- see PETH_NOUN_BEFORE.
+    if norm_current == "beth":
+        k = _prev_real_index(words_list, i)
+        if k is not None:
+            prev_raw = str(words_list[k]["word"]).strip()
+            prev = normalize_word(prev_raw)
+            if prev == "na" and prev_raw[:1] in ("'", "’", "‘"):
+                prev = "yna"                 # "mae 'na beth"
+            if prev in PETH_NOUN_BEFORE or prev in CARDINAL_WORDS:
+                return None, lookahead
+    # "da" + fi/ti/ni/chi/nhw is "(gy)da" or "(y)dan / (y)dach", not the
+    # adjective: "sy da fi", "sut da chi", "beth da ni'n" (DA_NOT_ADJECTIVE_BEFORE).
+    if target_norm == "da" and _da_not_adjective(words_list, i + lookahead):
+        return None, lookahead
     # "o" + verb-noun is nearly always the pronoun "he" with the aspect "yn"
     # dropped ("oedd o mynd" = he was going), not the preposition: "o mynd",
     # "o medru", "o gweithio" were scored (stammers3/6.cha). Skipped mutated
@@ -2774,15 +2936,32 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         return None, lookahead
     # "ei" is soft (his) or aspirate/h (her), and spaCy's gender for "ei" is
     # a guess ("ei gŵr" -- her husband, correctly unmutated -- was scored as
-    # "his" + erosion). Only the echo pronoun after the noun settles it
-    # ("ei gŵr hi", "ei dad o"); without one, the context isn't scored.
+    # "his" + erosion). The echo pronoun after the noun settles it ("ei gŵr
+    # hi", "ei dad o"), and so does the noun's own mutation where it shows
+    # one (2026-10-06); without either, the context isn't scored.
     if norm_current == "ei":
         after = i + lookahead + 1
         echo = normalize_word(words_list[after]["word"]) \
             if after < len(words_list) and not target_found.get("_clause_boundary_after") else ""
-        if echo == "hi":
+        # "o" after the noun is the preposition at least as often as the echo
+        # "him": "wedi ei chyhuddo o ddifrod" (accused OF), "ei rhoi o'r
+        # neilltu" -- 8 of the 12 "ei" erosions in the news narration
+        # (2026-10-06). It's only the echo when no noun phrase follows it.
+        # Nor when a possessive or "dan" follows it: "wedi ei gwahardd o'i
+        # gwaith" (from her work), "a gafodd ei geni o dan" (2026-10-07).
+        if echo == "o" and after + 1 < len(words_list) and \
+                not words_list[after].get("_clause_boundary_after") and \
+                (_starts_noun_phrase(words_list[after + 1]) or
+                 normalize_word(words_list[after + 1]["word"]) in _O_PREPOSITION_NEXT):
+            echo = ""
+        # The target's own mutation settles it where it can: aspirate or h-
+        # only follows "her", soft only "his" (_ei_target_shape). An echo
+        # "hi" still wins over a soft form ("ei dad hi": her father, with a
+        # soft mutation where the aspirate belongs -- a real erosion).
+        shape = _ei_target_shape(target_found)
+        if shape == "her" or echo == "hi":
             t1 = {**t1, "fem_ei": True, "expected_mutation": ["fem_ei_pending"]}
-        elif echo in ("e", "o", "fe", "fo"):
+        elif shape == "his" or echo in ("e", "o", "fe", "fo"):
             t1 = {**t1, "fem_ei": False, "expected_mutation": ["soft"]}
         else:
             return None, lookahead
@@ -2823,6 +3002,13 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
     # "cyn" is mostly "before" ("cyn mynd", "cyn cinio"), which doesn't
     # mutate; only equative "cyn" + adjective ("cyn gynted") does.
     if norm_current == "cyn" and target_pos != "ADJ" and not target_cysill.startswith("ADJ"):
+        return None, lookahead
+    # Where the lexicon knows the word, it must have an adjective reading:
+    # spaCy tagged "cyn treulio" / "cyn colli" ADJ (news, 2026-10-07). Same
+    # for "tra", which is "very" only before an adjective -- "tra cafodd
+    # chwech arall" is "while".
+    if norm_current in ("cyn", "tra") and target_lex and \
+            not any(e["pos"] == "ADJ" for e in target_lex):
         return None, lookahead
     # "ym"/"yng" are the preposition "in" only before an m-/ng- word ("ym
     # Mangor", "yng Nghymru"); anywhere else "ym" is the hesitation "um".
@@ -2931,7 +3117,8 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         target_verbform   = (target_spacy.get("morph") or {}).get("VerbForm")
         target_cysill_pos = (target_found.get("cysill_pos") or "").split("+")[0].strip().upper()
         target_is_verb = (target_spacy_pos == "VERB" or target_verbform == "Vnoun"
-                          or target_cysill_pos.startswith("VB"))
+                          or target_cysill_pos.startswith("VB")
+                          or normalize_word(target_found.get("word")) in VERBNOUN_DIALECT_SPELLINGS)
         if target_is_verb:
             return None, lookahead
 
@@ -3024,6 +3211,8 @@ def _process_word_trigger(i, words_list, current_node, norm_current, t1, conf_cu
         # non-verbal phrase ("nid digalonni", "na derbyn", "na mynd" were 7 of
         # 120 flagged erosions in the news narration, 2026-10-01).
         if _is_verb_target(target_found) and _is_inflected_verb(target_found):
+            if _is_imperative(target_found):
+                return None, lookahead    # "Na, paid" = No, don't -- see _is_imperative
             return _evaluate_mixed_mutation(current_node, target_found, norm_current), lookahead
         if norm_current != "na" or i == 0 or words_list[i - 1].get("_clause_boundary_after"):
             return None, lookahead
@@ -3301,6 +3490,21 @@ def process_comprehensive_mutations(words_list):
             continue
 
         norm_current  = normalize_word(current_node["word"])
+        # "'na" is "yna" (there) with its first syllable dropped -- "mae 'na
+        # bryder", "fod 'na risg" -- not the negative/comparative "na", which
+        # expected an aspirate and scored the correct soft mutation as a wrong
+        # type (news, 2026-10-06). CorCenCC's reader already writes it "yna".
+        # (Left quote "‘na" too: 'fod ‘na risg', 2026-10-07.)
+        if norm_current == "na" and str(current_node.get("word") or "").strip()[:1] in ("'", "’", "‘"):
+            norm_current = "yna"
+        # "'n" fused to "a"/"â"/"gyda"/"efo" is "ein" (our), not "yn": "a'n
+        # glowyr", "gyda'n gwasanaethau", "a'n traethau" -- read as the nasal
+        # "yn" and scored as erosion (news narration, 2026-10-07). "i'n" stays
+        # "yn": in speech it's mostly "dw i'n".
+        if norm_current == "yn" and current_node.get("_from_contraction") and i > 0 and \
+                words_list[i - 1].get("_contraction_stem") and \
+                normalize_word(words_list[i - 1]["word"]) in ("a", "â", "gyda", "efo", "hefo"):
+            norm_current = "ein"
         cysill_pos    = current_node.get("cysill_pos") or ""
         conf_current  = current_node.get("confidence", 0.0)
         spacy_tok     = current_node.get("spacy_token")
@@ -3444,10 +3648,29 @@ def process_comprehensive_mutations(words_list):
             after_article = k_prev is not None and \
                 normalize_word(words_list[k_prev]["word"]) in DEFINITE_ARTICLE_FORMS
             # (A sentence-initial capital isn't a name, hence k_prev.)
-            not_this_pair = (norm_current in LANGUAGE_NOUNS and not after_article) \
+            # Nor a word that starts the next phrase or is an adverb ("bore",
+            # "pob", "cynt" -- FEM_ADJ_TARGET_EXCLUDED), nor "da" meaning
+            # "(gy)da"/"(y)dan" before a pronoun ("dim clem da fi", 2026-10-06).
+            next_norm_1c = normalize_word(next_node["word"])
+            # Nor when the feminine noun is the second of two nouns -- "pwyllgor
+            # apêl lleol", "arolygon barn diweddar", "canolfan hamdden gerllaw",
+            # "cofnodion meddygol preifat": the adjective can belong to either
+            # noun and here belongs to the first, so the pair says nothing (about
+            # 60 of the 321 narration "erosions", 2026-10-07). Nor a word the
+            # lexicon knows only as a verb ("annog gyrru peryglus", "mudo
+            # rhyngwladol", "daeth mwy").
+            cur_lex = current_node.get("lex_pos")
+            second_noun = k_prev is not None and k_prev == i - 1 and \
+                not words_list[k_prev].get("_clause_boundary_after") and \
+                _is_plain_noun(words_list[k_prev])
+            not_a_noun = bool(cur_lex) and not ({"NOUN", "PROPN"} & set(cur_lex))
+            not_this_pair = second_noun or not_a_noun \
+                or (norm_current in LANGUAGE_NOUNS and not after_article) \
                 or norm_current in FEM_ADJ_TRIGGER_EXCLUDED \
                 or (k_prev is not None and _is_unmeasured_name(current_node, norm_current)) \
-                or normalize_word(next_node["word"]) in PREPOSED_ONLY_ADJECTIVES
+                or next_norm_1c in PREPOSED_ONLY_ADJECTIVES \
+                or next_norm_1c in FEM_ADJ_TARGET_EXCLUDED \
+                or (next_norm_1c == "da" and _da_not_adjective(words_list, i + 1))
             if (nsp == "ADJ" or ncp.startswith("ADJ")) and not (next_lex and "ADJ" not in next_lex) \
                     and not not_this_pair:
                 row = _process_gender_trigger(

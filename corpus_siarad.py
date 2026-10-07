@@ -68,10 +68,11 @@ from corpus_io import (
     RUNS_DIR, ensure_dirs, run_stamp, _video_slug, append_output_csv,
     cleanup_incomplete_video_dirs, cleanup_empty_session_dir, pipeline_version,
     is_current_version,
-    set_session_label, session_dir,
+    set_session_label, session_dir, document_folders, publish_document,
 )
 from corpus_ops import analyze_segments
 from corpus_io import has_lexicon_features  # unversioned
+import run_progress  # unversioned
 from output_merge import merge_with_previous
 from cysill_client import TECHIAITH_API_KEY, cysill_status_line, is_cysill_disabled
 from mutation_engine import (
@@ -336,6 +337,7 @@ def process_file(path, stamp, corpus="siarad"):
         results = analyze_segments(
             segments, meta, video_duration_seconds=duration, language="cy",
             language_probability=1.0, checkpoint_key=meta["url"],
+            step=run_progress.step,  # unversioned
             tagged_cache_path=vpaths["tagged"])
         # Cysill's hourly limit tripped somewhere in this file (tagging OR the
         # lemma lookups during detection): its rows would be tagged differently
@@ -400,6 +402,7 @@ def process_file(path, stamp, corpus="siarad"):
         except Exception as e:
             print(f"  ⚠️ Merge with earlier output failed ({e}) -- this run's output is "
                   f"saved on its own; earlier folders untouched.")
+        vpaths = publish_document(vpaths, meta)   # -> runs/<corpus>/<conversation>/
     except Exception as e:
         print(f"  💥 {path.name}: {e}")
         cleanup_incomplete_video_dirs(vpaths, video_label=path.name)
@@ -427,7 +430,9 @@ def _already_done(path, corpus="siarad"):
     everything still on an older version (no --redo needed, which would
     restart from file 1 each time the hourly limit stops a run). A
     conversation saved without Cysill (fusser15-18, 2026-09-27) isn't done."""
-    for segments_csv in RUNS_DIR.glob(f"*/{corpus.capitalize()}_{path.stem}/segments_*.csv"):
+    run_progress.tick()  # unversioned
+    for segments_csv in (s for d in document_folders(f"{corpus.capitalize()}_{path.stem}")
+                         for s in d.glob("segments_*.csv")):
         pos_csv = next(segments_csv.parent.glob("pos_*.csv"), None)
         if pos_csv is None:
             continue
@@ -473,7 +478,10 @@ def main(argv):
         print(f"No .cha files found at {target}")
         return 1
     if not redo:
-        done = [f for f in files if _already_done(f, corpus)]
+        run_progress.checking(len(files))  # unversioned
+        document_folders("", refresh=True)   # index runs/ once for _already_done
+        done =[f for f in files if _already_done(f, corpus)]
+        run_progress.checked()  # unversioned
         if done:
             print(f"Skipping {len(done)} conversation(s) already done on this pipeline "
                   f"version with Cysill (add --redo to process them again).")
@@ -498,15 +506,20 @@ def main(argv):
 
     stamp = run_stamp()
     set_session_label(stamp, label=f"{corpus}-{len(files)}")
-    print(f"Processing {len(files)} {corpus.capitalize()} file(s) into runs/{session_dir(stamp).name}/")
+    print(f"Processing {len(files)} {corpus.capitalize()} file(s) into runs/{corpus}/ "
+          f"(staged in runs/_sessions/{session_dir(stamp).name}/ while each is worked on)")
+    run_progress.start_run(len(files), "conversations")  # unversioned
     try:
         for n, f in enumerate(files):
+            run_progress.item(f.stem)  # unversioned
             if not process_file(f, stamp, corpus):
                 print(f"Stopped: Cysill's hourly limit was reached. {len(files) - n} "
                       f"conversation(s) not processed -- run the same command again "
                       f"in about an hour; finished ones are skipped.")
                 break
+            run_progress.item_done()  # unversioned
     finally:
+        run_progress.end_run()  # unversioned
         save_lemma_cache()
         cleanup_empty_session_dir(stamp)
     return 0

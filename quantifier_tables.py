@@ -100,6 +100,27 @@ MASS_NOUN_LEMMAS = {
 # quantifier ("llawer o bobl" = many people) -- same as plural_tables.
 COLLECTIVE_NOUN_LEMMAS = {"pobl", "pobol"}   # pobol: southern spelling (CorCenCC)
 
+# Not a quantity phrase at all, so skipped singular and plural alike (found
+# listing the CorCenCC partitive candidates, 2026-10-05): "o gwmpas" is the
+# preposition "around" ("rhai o gwmpas" = some around), and a number word
+# used as a noun ("un o'r chwech" = one of the six) has no plural to choose.
+NON_COUNT_TARGET_LEMMAS = {
+    "cwmpas",
+    "un", "dau", "dwy", "tri", "tair", "pedwar", "pedair", "pump", "pum",
+    "chwech", "chwe", "saith", "wyth", "naw", "deg", "deuddeg", "pymtheg",
+    "ugain", "cant", "mil",
+}
+
+# A capitalised target is part of a name ("un o Sir Fôn" = one FROM
+# Anglesey; CorCenCC's anonymised "un o Lleoliad" = one from [place]) and is
+# skipped whatever its number -- except these peoples and nationalities,
+# common nouns that are capitalised and take the plural like any other
+# ("rhai o'r Cymry"). By lemma.
+CAPITALISED_COUNT_LEMMAS = {
+    "cymro", "cymraes", "sais", "saesnes", "gwyddel", "albanwr", "americanwr",
+    "almaenwr", "ffrancwr", "eidalwr", "sbaenwr", "ewropead", "iddew", "cristion",
+}
+
 # ========================= DUPLICATED, STANDALONE-CONVENTION HELPERS =====
 # Same lists as plural_tables.py (see the convention note there).
 WELSH_FILLERS = {"ym", "er", "ah"}

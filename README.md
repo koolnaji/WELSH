@@ -26,12 +26,14 @@ hit both sides equally and their rates compare directly.
 
 **Why two "English agrees" branches.** "rhai" + noun is rare in speech (a
 handful of contexts across 60 Siarad conversations), so on its own it
-can't carry the resist-erosion prediction. That is accepted for now --
-more contexts are expected as YouTube data is added -- and
-`quantifier_*` (added 2026-09-28) gives that side a second, far more
-frequent structure. The English loan quantifier "lot o" is counted but
-flagged (`is_loan_quantifier`), so results can be reported with and
-without it.
+can't carry the resist-erosion prediction, so `quantifier_*` (added
+2026-09-28) gives that side a second, far more frequent structure. Both
+test one rule -- a count noun after a quantity word is plural, in Welsh
+and in English -- so since 2026-10-02 the analyzer also pools them as
+**"Controls combined"**, and the quantifier branch now includes the
+partitives "un o'r", "rhai o'r", "dau o'r", "y rhan fwyaf o'r". The
+English loan quantifier "lot o" is counted but flagged
+(`is_loan_quantifier`), so results can be reported with and without it.
 
 **Data sources.** The Bangor Siarad corpus (`corpus_siarad.py`) is the
 main dataset: 40 hours of informal conversation between 153 Welsh-English
@@ -41,8 +43,14 @@ age/sex, and human code-switch tags. Because the transcripts are human-
 made, Siarad findings carry no speech-recognition error. Every Siarad
 detection row carries a `speaker` column that joins to that conversation's
 `speakers_*.csv`, so erosion can be modelled against speaker age as well as
-formality. YouTube/podcast audio (transcribed by Whisper) is the second
-source.
+formality. The other sources, from most to least formal:
+
+| Source | What it is | Transcript |
+|---|---|---|
+| News articles (`news_text.py`) | ~500 Newyddion S4C / Y Cymro articles, split into narration, quoted speech and spokesperson statements. Narration is edited text, so its "erosion" rate is the **detector's noise floor**. BBC articles are excluded. | Text, no ASR |
+| YouTube / podcasts | Newyddion S4C news and interviews, Hansh (youth TV), Haclediad (casual podcast); 10-minute samples | Whisper |
+| CorCenCC spoken (`corpus_corcencc.py`) | 1,331 recordings from the National Corpus of Contemporary Welsh (Knight et al. 2020, CC-BY-SA): conversations, meetings, broadcasts, with genre and learner/L1 status per recording | Human |
+| Patagonia (`corpus_siarad.py`) | Bangor's 43 Welsh-Spanish conversations from Argentina, speakers aged 8-96, heritage speakers and learners included | Human |
 
 `corpus_formality.py` replaces a hand-assigned formal/informal/casual
 channel label with a grounded, continuous formality score computed from
@@ -51,21 +59,78 @@ the transcript itself (POS-class balance, filler rate, lexical diversity)
 formality" is an actual regression against a measured variable, not a
 comparison between three researcher-picked buckets.
 
-## Current status (2026-09-28)
+## Current status (2026-10-04)
 
-- **Siarad:** a full run of all 69 conversations on the current pipeline
-  version is in progress. Earlier Siarad output was produced by older
-  detection rules and is superseded automatically -- analysis only uses
-  each conversation's latest run.
-- **YouTube:** everything processed so far predates the current detection
-  rules and will be reprocessed. Until then, don't mix it into results.
-- **Validation still to do:** a manual precision audit (a random sample of
-  erosion and correct rows per branch, checked against the transcript),
-  and a mixed-effects model with speaker as a random effect -- rows cluster
-  by speaker, so raw pooled percentages overstate certainty.
-- **Every output row carries `pipeline_version`** (a hash of the detection
-  code), so rows from different rule versions can never be silently pooled;
-  `corpus_analyzer.py` reports which versions it read.
+Data freeze **2026-10-08**; report due 2026-10-30. The numbers below come
+from the 2026-10-02/03 analyzer runs and will be replaced after the freeze.
+
+**Mutation erosion by corpus -- a formality ladder:** news narration 1.6%
+(noise floor) < news statements 2.8% < news quotes 3.9% < Newyddion S4C
+17.6% < CorCenCC 19.4% < Siarad 20.7% < Haclediad 25.8% (one run, raw) <
+Patagonia 27.8% < Hansh 35.0%.
+
+**By formality third** (least / middle / most formal): mutation 21.5 /
+17.8 / 4.5%; prepositions 10.2 / 11.0 / 4.2%; numeral 0.9 / 2.0 / 0.7%;
+controls combined (rhai + quantifier) 1.4 / 0.7 / 0%.
+
+**Formality effect inside one corpus** (`within_corpus_slopes.csv`; odds
+ratio of erosion per 10 F-points, below 1 = less erosion when more formal):
+mutation in CorCenCC 0.65 (95% CI 0.59-0.71) per recording and 0.62
+(0.58-0.67) per speaker; YouTube 0.27; Siarad and Patagonia not
+significant (each spans only ~12-24 F-points). Prepositions in CorCenCC:
+1.11, not significant.
+
+What this supports so far:
+
+- Structures Welsh shares with English (rhai, quantifier + o) barely erode
+  (~0-1%); structures English lacks (mutation, conjugated prepositions)
+  do (~6-28%).
+- Numeral + singular noun does **not** erode (~1%) -- that prediction
+  fails. A likely reason: speakers use "tri o blant" (numeral + o +
+  plural), which the branch doesn't count.
+- Mutation erosion tracks formality, also within one corpus and per
+  speaker, so it isn't just a difference between corpora. Preposition
+  erosion doesn't track formality (region may matter more: northern Siarad
+  ~6%, mostly southern CorCenCC ~11%).
+- Numeral, rhai and quantifier have too few erosions for a formality slope
+  -- their rates are precise, their slopes can't be estimated.
+
+**Validation.** Three rounds of precision audit (`audit_sample.py`, see
+**The pieces**). Round 3 (2026-10-03), flagged mutation erosions that held
+up: Siarad 22/25, CorCenCC 18/23, YouTube 18/25 (the YouTube losses are
+Whisper errors; round 2 put the YouTube rate at ~11% corrected vs 17.6%
+raw). CorCenCC rhai "erosions" were mostly false (2/17), and the
+preposition/numeral samples exposed southern "ŷn ni" and decade words
+("degau") -- all fixed 2026-10-03, to be re-sampled. Quantifier singulars
+are never counted automatically; by hand, real slips were 1/30 (Siarad),
+2/30 (CorCenCC), 1/13 (YouTube).
+
+**Statistics.** Rates with Wilson 95% intervals. Formality curves are
+logistic (binomial, weighted by contexts, band widened by quasi-binomial
+dispersion because contexts from one video aren't independent), reported
+as an odds ratio per 10 F-points, and fitted only with at least 10
+erosions (`MIN_FIT_EVENTS`). Planned instead of a mixed-effects model: a
+speaker bootstrap (resampling speakers) for per-speaker intervals.
+
+**Audit round 4 (2026-10-05)**, flagged erosions that held up:
+mutation Siarad 22/25, CorCenCC 20/24, YouTube 18/23; prepositions Siarad
+19/20, CorCenCC 11/19 (southern bod forms read as prepositions), YouTube
+2/8 (speech-recognition errors); numeral CorCenCC 15/20 (4 of the 5 false
+ones -- Bible "dau Brenhinoedd", "ugain miloedd", a song title -- are now
+excluded in code), Siarad 3/4.
+
+**Before the freeze (Oct 8):** fresh window -> **4 -> y** (quantifier and
+numeral fixes of 2026-10-05) -> **6 -> d** (quantifier census) -> **6 -> c**
+-> **6 -> b**; judge the census and the redrawn numeral sample; then **5**.
+Copy `lemma_cache.json` with the frozen data.
+
+**Every output row carries `pipeline_version`** (a hash of the detection
+code), so rows from different rule versions can never be silently pooled;
+`corpus_analyzer.py` reports which versions it read. Code that can't change
+a row -- source discovery and the completion email in `corpus_ops.py` --
+sits between `# >>> NOT VERSIONED` / `# <<< NOT VERSIONED` markers (or on a
+line ending `# unversioned`) and is left out of the hash, so editing it
+doesn't mark the corpus as stale.
 
 ## What this actually does, in one paragraph
 
@@ -339,7 +404,7 @@ reintroduce this behavior without warning.
 | `WELSH_LEMMATIZER` | No | API key for the Cysill (techiaith.cymru) POS/lemmatizer service. Without it, the pipeline falls back to spaCy + local heuristics only -- it still works, just with one fewer independent tagger cross-checking every word. A missing key used to be completely silent; startup now prints a `Cysill:` status line, and every video prints a `Tagger coverage:` line with how many words spaCy, Cysill and the lexicon each covered. |
 | `BANGOR_LEXICON_PATH` | No | Full path to `lecsicon_cc0.txt` (see **Setup** step 5). Only needed if the file is not in the pipeline folder. It is tried first; then the loader looks next to `bangor_lexicon.py`, then in a `bangor_lexicon/` subfolder there, then in `./bangor_lexicon/`. If it points at a file that doesn't exist, startup prints a warning and uses the first copy it finds in those places. |
 | `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER` | No | Authenticates yt-dlp's caption listing/download requests the same way a logged-in browser tab would. Audio downloads deliberately run without cookies and use them only as a fallback for videos that require sign-in (age gate, bot check, members-only) -- sending the cookie file on downloads produced persistent `HTTP Error 403` that went away without it (see `limitations.txt` Section 1.4). Note that yt-dlp writes cookies back into this file after every call, so point it at a copy used only by this pipeline, never your only export of a logged-in session. Channel discovery never uses cookies. YouTube rate-limits anonymous requests to its caption/timedtext endpoint hard (`HTTP Error 429: Too Many Requests`), and the resulting block has been reported to last on the order of hours -- authenticating avoids tripping it in the first place, rather than just retrying through it. `YTDLP_COOKIES_FILE` points at a `cookies.txt` (Netscape format, e.g. exported via a "Get cookies.txt LOCALLY" browser extension -- portable between machines, and the more reliable option on Windows, see below); `YTDLP_COOKIES_FROM_BROWSER` names a browser (`chrome`, `firefox`, ...) to read cookies live from instead, machine-local only. If both are set, the file wins. Leave both blank to run fully anonymous, exactly as before this existed. **Windows + Chrome-family browsers:** newer Chrome versions' "app-bound encryption" is known to break yt-dlp's live cookie decryption on Windows (see [yt-dlp#15401](https://github.com/yt-dlp/yt-dlp/issues/15401)) -- if `YTDLP_COOKIES_FROM_BROWSER=chrome` fails to decrypt, either try `firefox` instead or switch to `YTDLP_COOKIES_FILE`. |
-| `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (run stats, per-video results, erosion breakdown) after menu 2 (Process the queue) or More tools -> d (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
+| `GMAIL_SENDER` / `GMAIL_APP_PASSWORD` / `NOTIFY_RECIPIENT` | No | Enables an HTML completion-email summary (all five branches first, then run stats, per-video results and the mutation breakdown -- see `corpus_ops.py` under **The pieces**) after menu 2 (Process the queue) or More tools -> d (Analyze local MP3 files, when saved) finish. Needs a Gmail account with 2-Step Verification and an App Password (Google Account -> Security -> 2-Step Verification -> App passwords) -- not your normal Gmail password. `NOTIFY_RECIPIENT` defaults to `GMAIL_SENDER` (i.e. emails yourself) if unset. Leave all three blank to disable notifications entirely; the pipeline runs exactly the same either way, it just skips the email at the end. |
 
 Never commit real values for any of these -- keep them in your actual
 environment/shell profile/`.env`, not in source files.
@@ -387,7 +452,14 @@ the existing ones.
   processed/failed logs, audio download, and the `analyze()`/
   `analyze_phrase()` functions that run Whisper plus *every* detection
   branch (mutation, prep, numeral, plural, quantifier) over one video or phrase end to end,
-  plus the completion email. Also owns `TRANSCRIBE_PRESETS` (see
+  plus the completion email. The email (since 2026-10-04) opens with all
+  five branches -- eroded/contexts, rate and 95% interval per branch, plus
+  the combined control -- and a per-video table with one column per
+  branch; the subject line reads e.g. `Mut 25.8% | Prep 2/18 | Num 0/3 |
+  rhai - | Quant 0/3` (a branch under 20 contexts shows counts, not a
+  percentage). `run_branch_stats()` reads them back from the run's own
+  CSVs, the same way `corpus_analyzer.py` does; the older mutation
+  breakdowns follow under "Mutation branch: detail". Also owns `TRANSCRIBE_PRESETS` (see
   **Transcription presets** above) and `sample_audio_window()` (see
   **Sampling long videos** above).
 - `spacy_tagging.py` -- loads the Welsh spaCy model, turns its output
@@ -516,15 +588,24 @@ erosion):**
   list is the part most likely to need additions after the precision
   audit.
 
-**Coding decisions (apply to every branch).** Fixed on 2026-09-26 and
-written into the tables/engines, so every run applies them the same way:
+**Coding decisions (apply to every branch).** First fixed on 2026-09-26,
+extended after each precision audit, and written into the tables/engines,
+so every run applies them the same way:
 
 | Question | Decision |
 |---|---|
-| Proper nouns after a trigger ("i Bangor") | **Kept** -- mutation applies to names too |
-| Fixed expressions ("wrth gwrs", "i gyd", "ei gilydd") | **Excluded** -- frozen forms, not live mutation (`FIXED_EXPRESSIONS`) |
+| Place names after a trigger ("i Bangor") | **Excluded** (2026-09-29) -- fluent speakers often leave them unmutated so they stay recognisable |
+| Person names, and any capitalised target | **Excluded** (2026-10-01) -- edited news leaves names unmutated ("gan Deian"), so name mutation is optional even in the standard. Months, days, languages etc. stay in (`CAPITALISED_COMMON_WORDS`) |
+| Fixed expressions ("wrth gwrs", "i gyd", "ei gilydd", "a ballu") | **Excluded** -- frozen forms, not live mutation (`FIXED_EXPRESSIONS`) |
 | English loanwords | **Counted as Welsh once spelled with Welsh orthography**; English-spelled words are code-switches and never scored |
+| Digits as triggers ("100 diwrnod") | **Excluded** -- the spoken numeral is unknown |
+| `mutation_mismatch` rows | **Not counted** (outside `EVALUABLE_STATUSES`) |
 | "rhai" + mass noun ("rhai amser") | **Excluded** -- English "some time" is singular too, so it isn't an "English agrees" context (`MASS_NOUNS`) |
+| "y rhai" = "the ones", "rhai" + pawb/gyd/tro... | **Excluded** -- pronoun or adverbial "rhai", not a quantity word before a noun (`NOT_RHAI_NOUNS`) |
+| Numeral + cant/mil/miliwn/degau | **Excluded** -- a bigger number, singular in English too (`NUMBER_WORDS`) |
+| Singular after a quantifier + "o" | **Judged by hand, every one** (the quantifier census, 2026-10-05) -- most are mass or degree readings ("llawer o wahaniaeth", "gormod o babi") or "one FROM" ("un o'r ardal"); only a candidate judged a real slip ("un o'r bachgen") counts as erosion |
+| Names and titles after a numeral or quantifier ("dau Brenhinoedd" = 2 Kings, "un o Sir Fôn") | **Excluded** (2026-10-05) -- not a counted noun; nationalities ("rhai o'r Cymry") stay in |
+| What a Siarad / CorCenCC transcript says | **Taken as what was said** -- transcribers mark reduced articles ("(y)r"), so an unwritten article is a real omission |
 
 Two principles run through every exclusion:
 
@@ -570,7 +651,27 @@ Two principles run through every exclusion:
   bare `@s` marks the utterance's other language (English, in a Welsh
   utterance); untagged words are judged by spelling; retracings,
   fragments and `xxx` are dropped; `[?]` words are kept but never scored
-  (see **Coding decisions**).
+  (see **Coding decisions**). The same script reads the Patagonia CHAT
+  files (menu 3 -> p).
+- `corpus_corcencc.py` -- the spoken part of CorCenCC (menu 3 -> c; cite
+  Knight et al. 2020, doi:10.17035/d.2020.0119878310). Reads
+  `corpus_data.txt` and retags the human transcript with Cysill like every
+  other source; CorCenCC's own CyTag tags are only used to spot speaker
+  codes, foreign words, proper nouns and elided words. Anonymisation
+  placeholders (lleoliad, enwb1...) become capitalised name parts, which no
+  branch measures; clitics ("ti 'n", "a 'i") are glued back on ("ti'n") so
+  they split the way Whisper text does; transcription marks ([aneglur],
+  [-], "+", <events>) break the word stream like a comma. Speaker codes
+  can't be linked to contributors, so learner/L1 status, genre and
+  "scripted" are recorded per recording. Not versioned: after a change
+  that alters the word stream, bump `READER_MARKER` and every recording is
+  redone.
+- `news_text.py` -- the news articles as text (menu 3 -> n): each article
+  becomes narration, quoted speech and spokesperson statements, three
+  separate documents (sources `news-narration`, `news-quote`,
+  `news-statement`). Narration is edited, so whatever it "erodes" is
+  detector error -- the noise floor every other rate is read against.
+  Newyddion S4C and Y Cymro only; BBC articles are skipped.
 
 **Cross-branch analysis:**
 
@@ -580,7 +681,28 @@ Two principles run through every exclusion:
   erosion-vs-formality-score regression (see below), and all five branches
   side by side against formality, per video and (Siarad) per speaker
   (`branches_vs_formality.png`, `branches_by_formality_band.png`,
-  `speaker_branches_*.png`).
+  `speaker_branches_*.png`). Since 2026-10-02 the curves are logistic, not
+  straight lines (a straight line predicted -10% erosion at the formal
+  end), and `within_corpus_slopes.png/.csv` (+ `speaker_` version) fits
+  the formality slope inside each corpus separately, so the corpus can't
+  stand in for formality -- the confound-controlled headline. A slope
+  needs at least 10 erosions (`MIN_FIT_EVENTS`); below that it is printed
+  as "not fitted" instead of drawn as a meaningless 0.002-3000 interval.
+  Rates use Wilson 95% intervals, and "Controls combined" pools rhai and
+  the quantifier branch.
+- `audit_sample.py` -- the precision audit (menu 6). Draws a seeded
+  (`SEED = 20261001`), stratified random sample of erosion and correct
+  rows per branch and source into `analysis/audit2/<source>/`, with the
+  sentence around each row. Each row gets a verdict -- ok / wrong /
+  invalid / unsure -- in the audit file or in a
+  `claude_verdicts_<branch>.csv` sidecar (merged on the next draw). Scoring
+  gives each label's precision and an audit-corrected erosion rate
+  (bootstrap interval). Redrawing keeps every verdict whose row is
+  unchanged. Round 1 (2026-09-29, older code) is in `analysis/audit/`.
+  `census()` (menu 6 -> d) lists every quantifier singular candidate for
+  the quantifier census; `corpus_analyzer.py` counts the ones judged
+  `slip` as erosion and prints how many are still unjudged, so the
+  quantifier rate is measured rather than 0% by construction.
 - `corpus_formality.py` -- computes a grounded, continuous, per-video
   formality score retroactively from transcript data already collected
   (no re-transcription needed): the Heylighen & Dewaele (1999) F-score
@@ -610,15 +732,18 @@ and the pipeline version.
 
 The usual paths:
 - **New YouTube data:** 1 (find) -> 2 (process) -> 5 (numbers).
-- **Siarad / Patagonia:** 3 -> 5.
-- **After changing detection code:** 4 (update results) -> 5.
+- **Siarad / Patagonia / CorCenCC / news:** 3 -> 5.
+- **After changing detection code:** open a **fresh** window (the menu
+  refuses to run detection when the code on disk differs from what it
+  loaded), then 4 (update results) -> 5 -> 6 -> c (redraw the audit
+  samples whose rows changed).
 
 1. **Find new YouTube videos** -- scans `CURATED_CHANNELS` (in `corpus_io.py`) for anything new, adds it to `video_queue.json`. Doesn't download or transcribe. The batch is filled round-robin across sources (one item from each in turn), so no single channel fills it. Items under `MIN_EPISODE_SECONDS` (3 min: Shorts, trailers, promos, news stings) are skipped here when the source publishes a duration, and after download when it doesn't.
 2. **Process the queue** -- transcribes, then runs all five detection branches (mutation, prep, numeral, plural, quantifier) and caption-corroborates the mutation findings. Failed videos retry up to 3x (`failed_videos.json`). Sends a completion email if configured. The Whisper model size is asked once per session.
-3. **Process transcripts (Siarad / Patagonia / news)** -- `s`/`p`: `corpus_siarad.py` on `<data folder>/siarad` or `/patagonia` (or a path you type). `n`: `news_text.py` on the scraped Welsh news articles (found automatically: `NEWS_CORPUS_DIR`, else `Desktop\news_corpus` -- the scraper's fixed output folder -- plus older `Desktop\NEWS\news_corpus` / data-folder copies, in both `raw/cy/` and legacy `cy/raw/` layouts; Newyddion S4C and Y Cymro only, BBC skipped) -- each article becomes two text documents, narration (source `news-narration`) and quoted speech (`news-quote`), the no-ASR formal baseline and detector noise floor. Anything already done on the current version is skipped, so after a Cysill limit stop just choose it again.
-4. **Update all results after a code change** -- `mutation_rerun_rules.py` on every processed folder, all five branches, from the saved tagging: no re-transcription, no Cysill calls, manual reviews kept. Apply now or preview only. (Per-branch / per-folder / per-trigger filters: `python mutation_rerun_rules.py --help`.)
-5. **Show the numbers** -- the corpus analyzer: every branch's rate per corpus, figures, the erosion-vs-formality regression. Also `python corpus_analyzer.py`.
-6. **Precision audit** -- `audit_sample.py`: draw/refresh the Siarad audit sample, or score the verdicts.
+3. **Process transcripts (Siarad / Patagonia / CorCenCC / news)** -- `s`/`p`: `corpus_siarad.py` on `<data folder>/siarad` or `/patagonia` (or a path you type). `c`: `corpus_corcencc.py` on the unzipped CorCenCC download in `<data folder>/corcencc` (~1,300 recordings; an overnight run). `n`: `news_text.py` on the scraped Welsh news articles (found automatically: `NEWS_CORPUS_DIR`, else `Desktop\news_corpus` -- the scraper's fixed output folder -- plus older `Desktop\NEWS\news_corpus` / data-folder copies, in both `raw/cy/` and legacy `cy/raw/` layouts; Newyddion S4C and Y Cymro only, BBC skipped) -- each article becomes two text documents, narration (source `news-narration`) and quoted speech (`news-quote`), the no-ASR formal baseline and detector noise floor. Anything already done on the current version is skipped, so after a Cysill limit stop just choose it again.
+4. **Update all results after a code change** -- `mutation_rerun_rules.py` on every processed folder, all five branches, from the saved tagging: no re-transcription, no Cysill calls, manual reviews kept. `y` applies now, `p` previews only, `n` cancels. (Per-branch / per-folder / per-trigger filters: `python mutation_rerun_rules.py --help`.)
+5. **Show the numbers** -- the corpus analyzer: every branch's rate per corpus, figures, the erosion-vs-formality curves and the within-corpus slopes. Reloads the analyzer code each time, so an edit to `corpus_analyzer.py` doesn't need a restart. Also `python corpus_analyzer.py`.
+6. **Precision audit** -- `audit_sample.py` for Siarad, YouTube and (once processed) CorCenCC: `a` draw/refresh the samples, `b` score the verdicts, `c` redraw only the samples whose rows changed (their old verdicts are dropped), `d` the quantifier census -- every singular after a quantifier, all sources, in `analysis/quantifier_census/census_quantifier.csv` (verdicts `slip` / `no` / `unsure`; run it again to pull in verdicts from `claude_verdicts_census.csv`). Verdicts follow their row (video, timestamp, word), not their position in the sample, so a redraw can't move a verdict onto a different row.
 7. **More tools**
    - **a** Manage the queue -- show (with per-channel counts), remove by number, add a URL, clear.
    - **b** Review flagged erosions by hand -- `mutation_manual_editing.py` (`--help` for its filters).
@@ -678,9 +803,13 @@ WELSH_ANALYSIS_DIR/
 ├── analysis/                               menu 5's output: merged_mutations.csv,
 │                                              utterance_export.csv, video_formality.csv and
 │                                              speaker_formality.csv (corpus_formality.py),
+│                                              within_corpus_slopes.csv (+ speaker_ version)
 │                                              and asr_divergence.csv
-│   └── figures/                              chart images, including erosion_vs_formality.png
-│                                              and erosion_vs_codeswitch.png
+│   ├── figures/                              chart images, including erosion_vs_formality.png,
+│   │                                          within_corpus_slopes.png and erosion_vs_codeswitch.png
+│   ├── audit/                                precision audit round 1 (2026-09-29, older code)
+│   └── audit2/<source>/                      menu 6's samples and verdicts (siarad, youtube, corcencc)
+├── siarad/, patagonia/, corcencc/          the transcript corpora menu 3 reads
 ├── phrase_tests/                           More tools -> c's ad-hoc "test a Welsh phrase"
 │                                              output -- deliberately kept outside runs/ so it
 │                                              never gets swept into the real corpus by

@@ -75,6 +75,11 @@ BASE_DIR      = Path(os.environ.get("WELSH_ANALYSIS_DIR", "").strip()
                      or str(_default_data_dir())).expanduser()
 configure_youtube_access(BASE_DIR)
 
+# SUPERSEDED 2026-10-07 for finished documents: they now live by source,
+# runs/<source>/[<channel>/]<document>/ -- see "SOURCE LAYOUT" below. The
+# description here still holds for a run's staging folder
+# (runs/_sessions/<stamp>_<label>/...).
+#
 # PATCH: restructured from five separate top-level folders (audio/,
 # transcriptions/, mutations/, captions/, summaries/) into one runs/
 # tree, requested explicitly: everything for one video (transcript,
@@ -492,9 +497,238 @@ def set_session_label(stamp, items=None, label=None):
 
 
 def session_dir(stamp):
-    """runs/<stamp>_<label>/ -- or runs/<stamp>/ if no label was set."""
+    """runs/_sessions/<stamp>_<label>/ -- or .../<stamp>/ if no label was set.
+    Since 2026-10-07 only a STAGING area: documents are written here, then
+    publish_document() moves each finished one to its home (see "SOURCE
+    LAYOUT" below). What stays: the run's summary files, published.txt
+    (where its documents went), and any document that failed half-way."""
     label = _session_labels.get(stamp)
-    return RUNS_DIR / (f"{stamp}_{label}" if label else stamp)
+    return SESSIONS_DIR / (f"{stamp}_{label}" if label else stamp)
+
+
+# ========================= SOURCE LAYOUT =========================
+# Since 2026-10-07 (the user's call: run timestamps no longer meant
+# anything once output_merge kept one folder per document) every finished
+# document lives at
+#     runs/siarad/<conversation>/            runs/patagonia/<conversation>/
+#     runs/corcencc/<recording>/             runs/news/<narration|quote|statement>/<article>/
+#     runs/youtube/<channel name>/<video>/   runs/podcasts/<show>/<episode>/
+#     runs/local-mp3/<file>/
+# File NAMES keep their stamp: the analyzers pick a document's latest run
+# by it. New runs still write to runs/_sessions/<stamp>_<label>/<slug>/ and
+# move to the home folder once merged (publish_document) -- so the merge,
+# the failed-run cleanup and the email summary work exactly as before.
+# Everything that finds output searches runs/ recursively (data_folders),
+# skipping runs/_deleted/. migrate_to_source_layout() moved the old
+# runs/<stamp>_<label>/<slug>/ folders once.
+SESSIONS_DIR = RUNS_DIR / "_sessions"
+PUBLISHED_LOG = "published.txt"
+_WINDOWS_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _folder_safe(name):
+    name = _WINDOWS_BAD.sub("", str(name)).strip().rstrip(".")
+    return name[:60] or "unknown"
+
+
+def _norm_url(u):
+    u = str(u or "").strip().lower().rstrip("/")
+    return u[:-len("/videos")] if u.endswith("/videos") else u
+
+
+def source_folder(source):
+    """runs/-relative home folder of a "source" (module comment above)."""
+    s = str(source or "").strip()
+    low = s.lower()
+    if low in ("siarad", "patagonia", "corcencc"):
+        return Path(low)
+    if low.startswith("news-"):
+        return Path("news") / _folder_safe(low[len("news-"):])
+    if low in ("local", "local_file"):
+        return Path("local-mp3")
+    kind = source_kind(s)
+    name = next((c.get("name") for c in CURATED_CHANNELS
+                 if c.get("name") and _norm_url(c["url"]) in _norm_url(s)), None)
+    if name is None:
+        handle = re.search(r"youtube\.com/(?:@|c/|channel/|user/)([^/?#]+)", s, re.IGNORECASE)
+        host = re.search(r"https?://(?:www\.)?([^/?#]+)", s, re.IGNORECASE)
+        name = handle.group(1) if handle else (host.group(1) if host else (s or "unknown"))
+    platform = "youtube" if kind == "youtube" else \
+        "podcasts" if kind in ("fireside", "spreaker", "anchor", "ypod") else "other"
+    return Path(platform) / _folder_safe(name)
+
+
+def data_folders(root=None):
+    """Every output folder under runs/ (one with a segments_*.csv), at any
+    depth, runs/_deleted/ excluded."""
+    seen = set()
+    for p in Path(root or RUNS_DIR).rglob("segments_*.csv"):
+        if "_deleted" in p.parts or p.parent in seen:
+            continue
+        seen.add(p.parent)
+        yield p.parent
+
+
+_folder_index = None
+
+
+def document_folders(name, refresh=False):
+    """Every folder under runs/ (not _deleted/) called `name` -- its home
+    and any staged copy. The index is built once per call with
+    refresh=True (each corpus run does that before checking what's done),
+    so looking up 1,331 recordings doesn't walk runs/ 1,331 times."""
+    global _folder_index
+    if refresh or _folder_index is None:
+        _folder_index = {}
+        for root, dirs, _files in os.walk(RUNS_DIR):
+            dirs[:] = [d for d in dirs if d != "_deleted"]
+            for d in dirs:
+                _folder_index.setdefault(d, []).append(Path(root) / d)
+    return list(_folder_index.get(name, []))
+
+
+def _segments_stamp(folder):
+    m = re.search(r"\d{8}_\d{6}", next((p.name for p in sorted(Path(folder).glob("segments_*.csv"))), ""))
+    return m.group(0) if m else ""
+
+
+def _first_row(folder):
+    import csv
+    seg = next(iter(sorted(Path(folder).glob("segments_*.csv"))), None)
+    if seg is None:
+        return None
+    try:
+        with open(seg, encoding="utf-8-sig", newline="") as f:
+            return next(csv.DictReader(f), None)
+    except OSError:
+        return None
+
+
+def _free_home(base, key):
+    """`base`, or base_2, base_3... when another document already has it.
+    None when a folder of THIS document is already there."""
+    from output_merge import _folder_key
+    dest, n = base, 2
+    while dest.exists():
+        if _folder_key(dest) == key:
+            return None
+        dest = base.with_name(f"{base.name}_{n}")
+        n += 1
+    return dest
+
+
+def publish_document(vpaths, meta):
+    """Moves a finished document's folder from its session's staging area to
+    its home (SOURCE LAYOUT above) and returns vpaths pointing there. Call it
+    last, after the merge (and caption corroboration). Leaves the folder
+    where it is -- and says why -- if it can't be moved."""
+    if not vpaths or not vpaths.get("segments"):
+        return vpaths
+    src = Path(vpaths["segments"]).parent
+    if not src.exists() or SESSIONS_DIR.resolve() not in src.resolve().parents \
+            or not any(src.glob("segments_*.csv")):
+        return vpaths
+    from output_merge import video_key
+    base = RUNS_DIR / source_folder(meta.get("source")) / src.name
+    dest = _free_home(base, video_key(meta.get("url")))
+    if dest is None:
+        tqdm.write(f"  ⚠️ runs/{base.relative_to(RUNS_DIR).as_posix()} still holds earlier output "
+                   f"of this document (the merge didn't move it) -- this run stays in "
+                   f"runs/{src.relative_to(RUNS_DIR).as_posix()}.")
+        return vpaths
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+    except OSError as e:
+        tqdm.write(f"  ⚠️ Couldn't move {src.name} to runs/{dest.relative_to(RUNS_DIR).as_posix()} "
+                   f"({e}) -- it stays in runs/{src.relative_to(RUNS_DIR).as_posix()}.")
+        return vpaths
+    try:
+        with open(src.parent / PUBLISHED_LOG, "a", encoding="utf-8") as f:
+            f.write(dest.relative_to(RUNS_DIR).as_posix() + "\n")
+    except OSError:
+        pass
+    return {k: None if v is None else (dest if Path(v) == src else dest / Path(v).name)
+            for k, v in vpaths.items()}
+
+
+def published_folders(stamp):
+    """The folders a session published (its email summary reads them)."""
+    log = session_dir(stamp) / PUBLISHED_LOG
+    if not log.exists():
+        return []
+    out = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        p = RUNS_DIR / line.strip()
+        if line.strip() and p.is_dir():
+            out.append(p)
+    return out
+
+
+_STAMPED_DIR_RE = re.compile(r"^\d{8}_\d{6}")
+
+
+def legacy_session_folders():
+    """runs/<stamp>_<label>/ folders from before the source layout."""
+    if not RUNS_DIR.exists():
+        return []
+    return sorted(p for p in RUNS_DIR.iterdir() if p.is_dir() and _STAMPED_DIR_RE.match(p.name))
+
+
+def migrate_to_source_layout(apply=False, log=print):
+    """One-off: moves every document folder out of the old
+    runs/<stamp>_<label>/<slug>/ layout to its home, then the rest of each
+    old session folder (summary files, failed attempts) to runs/_sessions/.
+    Two folders of the same document (a merge that never happened): the
+    newest run goes home, the older one to runs/_deleted/ -- the analyzers
+    only ever counted the newest anyway. apply=False only reports the plan.
+    Returns (#moved, #retired)."""
+    from output_merge import video_key, _retire, _folder_key
+    sessions = legacy_session_folders()
+    folders = [f for s in sessions for f in s.iterdir()
+               if f.is_dir() and any(f.glob("segments_*.csv"))]
+    # newest first, so the newest copy of a document claims its home
+    folders.sort(key=_segments_stamp, reverse=True)
+    moved = retired = 0
+    planned = {}      # home -> video key (for the dry run, where nothing moves)
+    for folder in tqdm(folders, desc="Moving folders", unit="folders", disable=not apply):
+        row = _first_row(folder) or {}
+        key = video_key(row.get("video_url"))
+        base = RUNS_DIR / source_folder(row.get("source")) / folder.name
+        dest, n = base, 2
+        while dest.exists() or dest in planned:
+            same =planned.get(dest) == key if dest in planned else _folder_key(dest) == key
+            if same:
+                dest = None
+                break
+            dest = base.with_name(f"{base.name}_{n}")
+            n += 1
+        if dest is None:
+            retired += 1
+            if apply:
+                _retire(folder, base, "older copy of the same document, found by the "
+                                      "move to the source layout")
+            continue
+        planned[dest] = key
+        moved += 1
+        if apply:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(folder), str(dest))
+    for s in sessions:
+        if apply and s.exists():
+            target = SESSIONS_DIR / s.name
+            if target.exists():
+                for item in s.iterdir():
+                    shutil.move(str(item), str(target / item.name))
+                s.rmdir()
+            else:
+                SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(s), str(target))
+    groups = sorted({d.relative_to(RUNS_DIR).parts[0] for d in planned})
+    log(f"{'Moved' if apply else 'Would move'} {moved} document folder(s) into "
+        f"runs/{{{', '.join(groups)}}}/ and {len(sessions)} old session folder(s) into "
+        f"runs/_sessions/" + (f"; {retired} older duplicate(s) to runs/_deleted/" if retired else "") + ".")
+    return moved, retired
 
 
 _BARE_STAMP_RE = re.compile(r"^\d{8}_\d{6}$")
@@ -552,6 +786,8 @@ _DETECTION_SOURCES = (
     "prep_engine.py", "prep_tables.py", "plural_engine.py", "plural_tables.py",
     "numeral_engine.py", "numeral_tables.py",
     "quantifier_engine.py", "quantifier_tables.py",
+    # since 2026-10-05 a rerun drops CorCenCC's bracketed notes with its code
+    "corpus_corcencc.py",
 )
 _pipeline_version = None
 
@@ -926,17 +1162,31 @@ def delete_enrich_checkpoint(checkpoint_path):
 # no admin rights needed; it lapses by itself if the program exits). It
 # can't stop sleep on closing the lid or pressing the power button, and a
 # managed device's policy may still win.
-_ES_CONTINUOUS, _ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+#
+# Since 2026-10-07 welsh_pipeline.py holds this for the WHOLE program
+# (keep_awake(program=True) at start), and the display too: on a laptop with
+# Modern Standby, the screen switching off can drop it into standby and cut
+# the wifi even while the system is "required" -- three news runs stopped
+# on lost connections in two days. keep_awake(False) from a single action
+# then leaves it on; it ends when the program exits.
+_ES_CONTINUOUS, _ES_SYSTEM_REQUIRED, _ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+_awake_for_program = False
 
 
-def keep_awake(on=True):
-    """keep_awake() before a long run, keep_awake(False) after it. Windows
+def keep_awake(on=True, program=False):
+    """keep_awake() before a long run, keep_awake(False) after it;
+    keep_awake(program=True) once for the whole program (see above). Windows
     only; elsewhere, and if the call fails, it just says so and carries on."""
+    global _awake_for_program
     if os.name != "nt":
+        return
+    if program:
+        _awake_for_program = on = True
+    elif not on and _awake_for_program:
         return
     try:
         import ctypes
-        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if on else 0)
+        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED if on else 0)
         if not ctypes.windll.kernel32.SetThreadExecutionState(flags) and on:
             tqdm.write(" ⚠️ Couldn't stop Windows from sleeping -- set Sleep to 'Never' "
                        "while plugged in, or the run will pause when the laptop sleeps.")

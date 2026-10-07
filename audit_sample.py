@@ -36,6 +36,7 @@ unless --force is given.
 """
 import argparse
 import csv
+import hashlib
 import math
 import re
 from pathlib import Path
@@ -44,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 from corpus_io import MUT_DIR, OUT_DIR
+import run_progress
 from mutation_tables import EVALUABLE_STATUSES
 
 # Round 1 (2026-09-29, Siarad, version 966c440c62) lives in analysis/audit/.
@@ -119,7 +121,7 @@ def load_rows(prefix, source):
             original = [f for f in fs if f.name.startswith("mutations_original_")]
             files.extend(corroborated or original or fs)
     frames = []
-    for p in files:
+    for p in run_progress.files(files, f"Loading {prefix}"):
         d = _read(p)
         if d.empty or "video_url" not in d.columns or "is_erosion" not in d.columns:
             continue
@@ -198,21 +200,36 @@ def _start_seconds(ts):
         return None
 
 
+def _row_key(video_url, timestamp, check):
+    return ("row", str(video_url), str(timestamp), str(check))
+
+
 def _saved_verdicts(name, out):
-    """Verdicts to carry into a redrawn file, keyed by (audit_id, check value):
-    those already in the audit file, then any in claude_verdicts_<branch>.csv
-    for rows the file has no verdict for."""
+    """Verdicts to carry into a redrawn file, then any in
+    claude_verdicts_<branch>.csv for rows the file has no verdict for.
+
+    Keyed by the ROW (video_url, timestamp, check value), not by audit_id: an
+    audit_id is a position in the sample, so once the data changes the same
+    id can be a different row, and the check value alone ("i", "o" for
+    prepositions) doesn't tell them apart -- a Siarad verdict for "erbyn i
+    hi orffen" landed on "glywais i hi" that way (2026-10-05). Sidecar lines
+    that carry video_url + timestamp are keyed the same way. Older lines
+    with only audit_id + check can't be tied to a row, so they are used
+    only for a sample's first draw (no audit file yet)."""
     saved = {}
     if out.exists():
         for _, r in _read(out).iterrows():
             if r.get("verdict", "").strip():
-                saved[(r["audit_id"], r.get(CHECK_COL[name], ""))] = (
+                saved[_row_key(r["video_url"], r["timestamp"], r.get(CHECK_COL[name], ""))] = (
                     r["verdict"], r.get("reviewer", ""), r.get("verdict_note", ""), "file")
     sidecar = AUDIT_DIR / f"claude_verdicts_{name}.csv"
     if sidecar.exists():
         for _, r in _read(sidecar).iterrows():
-            saved.setdefault((r["audit_id"], r["check"]),
-                             (r["verdict"], "claude", r.get("verdict_note", ""), "sidecar"))
+            value = (r["verdict"], "claude", r.get("verdict_note", ""), "sidecar")
+            if r.get("video_url", "") and r.get("timestamp", ""):
+                saved.setdefault(_row_key(r["video_url"], r["timestamp"], r["check"]), value)
+            elif not out.exists():
+                saved.setdefault(("id", r["audit_id"], r["check"]), value)
     return saved
 
 
@@ -239,8 +256,10 @@ def draw(source, force):
                    "video_url": r["video_url"], "speaker": r.get("speaker", ""),
                    "timestamp": r["timestamp"]}
             rec.update({c: r.get(c, "") for c in detail})
-            verdict, reviewer, note, _ = saved.pop((rec["audit_id"], rec.get(CHECK_COL[name], "")),
-                                                   ("", "", "", ""))
+            check = rec.get(CHECK_COL[name], "")
+            row = _row_key(rec["video_url"], rec["timestamp"], check)
+            hit = saved.pop(row, None) or saved.pop(("id", rec["audit_id"], check), None)
+            verdict, reviewer, note, _ = hit or ("", "", "", "")
             rec.update({"context_before": prev, "utterance": this, "context_after": nxt,
                         "english_gloss": gloss, "verdict": verdict, "reviewer": reviewer,
                         "verdict_note": note})
@@ -250,8 +269,9 @@ def draw(source, force):
             print(f"  [keep] {out.name}: {len(lost)} verdicts would not match the new sample "
                   f"(the data changed?) -- file left as is; --force redraws and drops them")
             continue
-        if saved:
-            print(f"  ⚠️ {name}: {len(saved)} saved verdicts matched no sampled row and were dropped")
+        unmatched = [k for k, v in saved.items() if v[3] == "file"]
+        if unmatched:
+            print(f"  ⚠️ {name}: {len(unmatched)} saved verdicts matched no sampled row and were dropped")
         pd.DataFrame(records).to_csv(out, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_MINIMAL)
         counts = rows["stratum"].value_counts()
         n_verdicts = sum(1 for r in records if r["verdict"])
@@ -259,6 +279,38 @@ def draw(source, force):
               f"{counts.get('correct', 0):>6,} correct -> sampled {len(records)} rows "
               f"({n_verdicts} with verdicts) -> {out.name}")
     print(f"\nFill the 'verdict' column ({' / '.join(VERDICTS)}), then: python audit_sample.py --score")
+
+
+def prune(source):
+    """Drops from each audit file the rows that are no longer in the data
+    (or no longer in their stratum), keeping every other row and its
+    verdict. Right for a change that only REMOVES contexts -- 2026-10-05:
+    CorCenCC's bracketed notes, numerals that label ("pennod pedwar"): what
+    is left of a random sample is a random sample of what is left, while a
+    seeded redraw (--force) of the smaller population would pick mostly
+    different rows, all to be judged again."""
+    _use_source(source)
+    print(f"Pruning the audit files for '{source}' ({AUDIT_DIR})")
+    for name, prefix, _n, _detail in BRANCHES:
+        out = AUDIT_DIR / f"audit_{name}.csv"
+        if not out.exists():
+            continue
+        audit = _read(out)
+        rows = load_rows(prefix, source)
+        col = CHECK_COL[name]
+        live = set() if rows.empty else set(zip(rows["video_url"], rows["timestamp"],
+                                                 rows[col], rows["stratum"]))
+        keep = [(r["video_url"], r["timestamp"], r.get(col, ""), r["stratum"]) in live
+                for _, r in audit.iterrows()]
+        gone = audit[[not k for k in keep]]
+        if gone.empty:
+            print(f"  {name:<11} all {len(audit)} rows still in the data")
+            continue
+        audit[keep].to_csv(out, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_MINIMAL)
+        print(f"  {name:<11} {len(gone)} of {len(audit)} rows no longer in the data -- dropped:")
+        for _, r in gone.iterrows():
+            print(f"      {r['audit_id']} {r['stratum']:<7} {r['video_url']} {r['timestamp']} "
+                  f"'{r.get(col, '')}' (verdict: {r.get('verdict', '') or '-'})")
 
 
 def _wilson(k, n, z=1.96):
@@ -331,16 +383,129 @@ def score(source):
           "rate (candidates judged 'ok' = real slips) is a finding.")
 
 
+# ========================= QUANTIFIER CENSUS =========================
+# Decided 2026-10-05. The quantifier branch never counts a singular on its
+# own (see the BRANCHES comment above), so its rate read 0% by construction.
+# A sample of 30 per corpus only gave a wide estimate, so EVERY singular
+# candidate, from every source, is judged by hand instead, in one file:
+#     slip    a real slip -- a count noun left singular where Welsh and
+#             English both need the plural ("un o'r bachgen")
+#     no      not a context for the plural rule: a mass or degree reading
+#             ("llawer o wahaniaeth", "gormod o babi"), "one FROM ..." ("un
+#             o'r ardal"), "o'r enw" (= called), a misparse
+#     unsure  can't tell
+# corpus_analyzer.py counts "slip" as erosion; "no", "unsure" and unjudged
+# candidates stay out of the rate, and it prints how many are left to judge.
+CENSUS_DIR = OUT_DIR / "quantifier_census"
+CENSUS_FILE = CENSUS_DIR / "census_quantifier.csv"
+CENSUS_SIDECAR = CENSUS_DIR / "claude_verdicts_census.csv"
+CENSUS_VERDICTS = ("slip", "no", "unsure")
+SNIPPET_WORDS = 15
+
+
+def census_id(video_url, timestamp, following_word):
+    """Stable id of one candidate: the same row keeps its id (and verdict)
+    after a rerun, whatever order the files are read in."""
+    key = "|".join(str(v) for v in (video_url, timestamp, following_word))
+    return "q" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+
+
+def census_verdicts():
+    """{census_id: (verdict, reviewer, note)} -- the census file's own
+    verdicts first (a person's edits there win), then Claude's sidecar for
+    candidates the file has none for. corpus_analyzer.py reads this."""
+    out = {}
+    if CENSUS_FILE.exists():
+        for _, r in _read(CENSUS_FILE).iterrows():
+            v = r.get("verdict", "").strip().lower()
+            if v:
+                out[r["census_id"]] = (v, r.get("reviewer", ""), r.get("verdict_note", ""))
+    if CENSUS_SIDECAR.exists():
+        for _, r in _read(CENSUS_SIDECAR).iterrows():
+            v = r.get("verdict", "").strip().lower()
+            if v:
+                out.setdefault(r["census_id"], (v, "claude", r.get("verdict_note", "")))
+    return out
+
+
+def _norm_token(t):
+    return t.lower().strip(".,!?;:\"()[]")
+
+
+def _snippet(text, surface, noun):
+    """The utterance cut to SNIPPET_WORDS words either side of the noun,
+    which is put in [brackets] -- CorCenCC lectures run to hundreds of words
+    per sentence. Prefers the noun that follows the quantifier within four
+    words."""
+    tokens = str(text).split()
+    low = [_norm_token(t) for t in tokens]
+    surface, noun = surface.lower(), noun.lower()
+    hits = [k for k, t in enumerate(low) if t == noun or t.endswith("'" + noun)]
+    near = [k for k in hits if any(low[j] == surface or low[j].startswith(surface + "'")
+                                   for j in range(max(0, k - 4), k))]
+    k = (near or hits or [None])[0]
+    if k is None:
+        return " ".join(tokens[:2 * SNIPPET_WORDS]) + (" …" if len(tokens) > 2 * SNIPPET_WORDS else "")
+    lo, hi = max(0, k - SNIPPET_WORDS), min(len(tokens), k + SNIPPET_WORDS + 1)
+    shown = tokens[lo:k] + [f"[{tokens[k]}]"] + tokens[k + 1:hi]
+    return ("… " if lo else "") + " ".join(shown) + (" …" if hi < len(tokens) else "")
+
+
+def census():
+    """Writes every quantifier singular candidate, all sources, to
+    CENSUS_FILE, keeping verdicts already given (file first, then sidecar)."""
+    CENSUS_DIR.mkdir(parents=True, exist_ok=True)
+    rows = load_rows("quantifier_mutations", "all")
+    if not rows.empty:
+        rows = rows[rows["status"] == "erosion_unverified"]
+    if rows.empty:
+        print("  No quantifier singular candidates.")
+        return
+    saved = census_verdicts()
+    records = []
+    for _, r in rows.sort_values(["source", "video_url", "timestamp"]).iterrows():
+        cid = census_id(r["video_url"], r["timestamp"], r["following_word"])
+        prev, this, nxt, gloss = FolderContext.get(r["folder"]).around(
+            _start_seconds(r["timestamp"]), r.get("speaker", ""))
+        verdict, reviewer, note = saved.get(cid, ("", "", ""))
+        records.append({
+            "census_id": cid, "source": r.get("source", ""), "video_url": r["video_url"],
+            "speaker": r.get("speaker", ""), "timestamp": r["timestamp"],
+            "quantifier": r.get("quantifier", ""), "quantifier_surface": r.get("quantifier_surface", ""),
+            "following_word": r["following_word"], "noun_lemma": r.get("noun_lemma", ""),
+            "snippet": _snippet(this, r.get("quantifier_surface", ""), r["following_word"]),
+            "context_before": prev[-160:], "context_after": nxt[:160], "english_gloss": gloss,
+            "verdict": verdict, "reviewer": reviewer, "verdict_note": note})
+    out = pd.DataFrame(records)
+    out.to_csv(CENSUS_FILE, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_MINIMAL)
+    judged = out["verdict"].str.strip() != ""
+    print(f"  Quantifier census: {len(out):,} singular candidates -> {CENSUS_FILE}")
+    for source, g in out.groupby(out["source"].where(~out["source"].str.startswith("http"), "youtube")):
+        j = g["verdict"].str.strip() != ""
+        print(f"    {source:<16} {len(g):>5,} candidates, {int(j.sum()):>5,} judged, "
+              f"{int((g['verdict'] == 'slip').sum()):>4,} slips")
+    print(f"  {int(judged.sum()):,} judged, {int((~judged).sum()):,} still to judge. "
+          f"Verdicts: {' / '.join(CENSUS_VERDICTS)} (put your initials in 'reviewer' when you change one).")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--census", action="store_true",
+                    help="write every quantifier singular candidate (all sources) for hand judging")
     ap.add_argument("--score", action="store_true", help="score the filled-in audit files")
+    ap.add_argument("--prune", action="store_true",
+                    help="drop audit rows that are no longer in the data, keep the rest")
     ap.add_argument("--source", default="siarad",
                     help="siarad (default), youtube (every video), patagonia, news-narration, ..., or all")
     ap.add_argument("--force", action="store_true",
                     help="rewrite a file even if some of its verdicts no longer match the sample")
     args = ap.parse_args()
-    if args.score:
+    if args.census:
+        census()
+    elif args.score:
         score(args.source)
+    elif args.prune:
+        prune(args.source)
     else:
         draw(args.source, args.force)
 
