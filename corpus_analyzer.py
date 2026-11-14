@@ -62,6 +62,9 @@ import run_progress
 
 # Seaborn theme -- clean, publication-friendly.
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
+# A plain hyphen for negative numbers: Korean fonts (figures/ko/) may lack
+# the Unicode minus sign and would print a box.
+plt.rcParams["axes.unicode_minus"] = False
 
 # Color palette keyed by mutation type for consistency across all figures.
 MUTATION_COLORS = {
@@ -125,6 +128,11 @@ _CHANNEL_ENTRIES = [
     ("https://www.youtube.com/channel/UCNH53DFjL1OBl3oWNxMmC_Q/videos",
      "UCNH53DFjL1OBl3oWNxMmC_Q", "BBC Cymru Wales"),
     ("local",                                        "local",       "Local MP3"),
+    # Podcasts (2026-10-08: Haclediad showed up as its feed URL in figures).
+    ("feeds.fireside.fm/haclediad",                  "haclediad",   "Haclediad"),
+    ("spreaker.com/show/5059223",                    "5059223",     "Colli'r Plot"),
+    ("anchor.fm/s/1064d88dc",                        "1064d88dc",   "Pryd ar Dafod"),
+    ("podcast-cwins",                                "cwins",       "Siarad Siop"),
 ]
 
 _CHANNEL_ENTRIES.insert(0, ("https://www.youtube.com/@NewyddionS4C/videos",
@@ -667,14 +675,331 @@ def prepare(df):
 
 
 # ========================= FIGURE HELPERS =========================
+# Print sizing (2026-10-09): the figures go into an A4 report, placed at the
+# text width (~16 cm). A figure drawn 13 inches wide is shrunk to about half
+# there, so its 7-9 pt labels printed at 3-5 pt. _fit_text_for_print raises
+# every text to a floor that reads as these sizes ON PAPER, by role.
+PRINT_WIDTH_IN = 6.3
+PRINT_MIN_PT = {"title": 10.0, "axis": 8.5, "note": 6.5}
+
+
+def _fit_text_for_print(fig):
+    """Raises small text so that, once the figure is shrunk to PRINT_WIDTH_IN,
+    titles print at >= 10 pt, axis labels / ticks / legends at >= 8.5 pt and
+    annotations at >= 6.5 pt. Never shrinks anything."""
+    from matplotlib.text import Text
+    scale = max(1.0, fig.get_size_inches()[0] / PRINT_WIDTH_IN)
+    roles = {}
+    if fig._suptitle is not None:
+        roles[id(fig._suptitle)] = "title"
+    for ax in fig.axes:
+        for t in (ax.title, ax._left_title, ax._right_title):
+            roles[id(t)] = "title"
+        for t in [ax.xaxis.label, ax.yaxis.label, *ax.get_xticklabels(), *ax.get_yticklabels()]:
+            roles[id(t)] = "axis"
+        leg = ax.get_legend()
+        if leg is not None:
+            for t in [*leg.get_texts(), leg.get_title()]:
+                roles[id(t)] = "axis"
+    for leg in fig.legends:
+        for t in [*leg.get_texts(), leg.get_title()]:
+            roles[id(t)] = "axis"
+    for t in fig.findobj(Text):
+        if not t.get_text():
+            continue
+        floor = PRINT_MIN_PT[roles.get(id(t), "note")] * scale
+        if t.get_fontsize() < floor:
+            t.set_fontsize(floor)
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+
+
+# ---- Korean copies of every figure (2026-10-09, for the Korean report) ----
+# After the English figure is saved, its text is translated by KO_PHRASES
+# (applied in order; regexes, so numbers inside a title survive) and the
+# figure is saved again to figures/ko/<same name>. Corpus and channel names
+# (CorCenCC, Siarad, Patagonia, Hansh, Newyddion S4C...) and Welsh examples
+# stay as they are. Needs a Korean font (Malgun Gothic ships with Windows);
+# without one the Korean copies are skipped with a note.
+KO_FIG_DIR = FIG_DIR / "ko"
+KO_PHRASES = [
+    # ---- whole titles and axis labels ----
+    (r"Mutation erosion by source and mutation type\n\(sources from most to least formal\)",
+     "자료별·변이 유형별 자음 변이 침식률\n(격식적인 자료부터 순서대로)"),
+    (r"Erosion rate \(95% Wilson CI\)\. Number = contexts; bars under (\d+) contexts left out",
+     r"침식률 (95% Wilson 신뢰구간). 숫자 = 문맥 수, 문맥 \1개 미만 제외"),
+    (r"Mutation erosion by mutation type, per corpus\n\(soft-limited counted as soft; ([\d,]+) contexts "
+     r"where two types are possible left out\)",
+     r"코퍼스별·변이 유형별 자음 변이 침식률\n(제한 연변이는 연변이로 집계; 두 유형이 모두 가능한 "
+     r"문맥 \1개 제외)"),
+    (r"Mutation erosion by grammatical environment, per corpus", "문법 환경별·코퍼스별 자음 변이 침식률"),
+    (r"Erosion rate \(%, 95% Wilson CI; bars with < (\d+) contexts omitted\)",
+     r"침식률 (%, 95% Wilson 신뢰구간; 문맥 \1개 미만 제외)"),
+    (r"Mutation Erosion Rate by Expected Mutation Type", "기대 변이 유형별 자음 변이 침식률"),
+    (r"Expected Mutation Type", "기대 변이 유형"),
+    (r"Code-Switching Rate by Channel\n\(% of all words spoken that are English, whole transcript;\n"
+     r"n = total words\)", "자료별 코드스위칭률\n(전체 단어 중 영어 단어의 비율; n = 전체 단어 수)"),
+    (r"Code-Switch Rate \(%, whole transcript\)", "코드스위칭률 (%, 전사본 전체)"),
+    (r"Code-Switch Rate \(%\)", "코드스위칭률 (%)"),
+    (r"^Channel$", "자료"),
+    (r"Evaluable Mutation Outcome Distribution by Channel, least eroded first\n.*",
+     "자료별 변이 판정 결과의 구성 (침식률이 낮은 자료부터)\n(막대 오른쪽 κ = spaCy와 Cysill의 코헨의 카파)"),
+    (r"% of evaluable mutation outcomes \(Correct / Erosion / Wrong type\)",
+     "판정 가능한 변이 환경 중 비율 (올바른 변이 / 기본형 변이 침식 / 대체형 변이 침식)"),
+    (r"([\d.]+)% eroded, n=", r"침식 \1%, n="),
+    (r"Overall Heuristic vs Tagger Agreement", "코드 판독과 태거의 전체 일치"),
+    (r"Heuristic–Tagger Agreement by Rule", "규칙별 일치율"),
+    (r"Agreement Rate \(%\)", "일치율 (%)"),
+    (r"Pipeline Validation: Heuristic vs Techiaith Tagger", "판정 코드와 태거(Cysill·spaCy)의 교차 검증"),
+    (r"^Agreement type$", "일치 유형"),
+    (r"^all_three$", "셋 모두 일치"), (r"^cysill\+heuristic$", "Cysill + 코드"),
+    (r"^parser\+heuristic$", "spaCy + 코드"), (r"^disputed$", "불일치"),
+    (r"^heuristic_only$", "코드 단독"),
+    (r"Mutation Erosion Rate vs\. Formality Score", "격식 정도(F-점수)와 자음 변이 침식률"),
+    (r"Mutation Erosion Rate vs\. Code-Switch Rate", "코드스위칭률과 자음 변이 침식률"),
+    (r"\(per video, n=(\d+), Spearman ρ=([-\d.n/a ()]+); point size = context count\)",
+     r"(문서 \1건, Spearman ρ=\2; 점의 크기 = 문맥 수)"),
+    (r"logistic fit, weighted by contexts: ", "로지스틱 회귀(문맥 수 가중): "),
+    (r"OR per 10 points", "10점당 오즈비"),
+    (r"not fitted \(fewer than (\d+) erosions, or under 5 (videos|speakers)\)",
+     r"추정하지 않음 (침식 \1건 미만 또는 단위 5개 미만)"),
+    (r"not fitted", "추정하지 않음"),
+    (r"Formality Score \(Heylighen-Dewaele F, higher = more formal\)",
+     "격식 정도 (Heylighen–Dewaele F-점수, 높을수록 격식적)"),
+    (r"F-score \(higher = more formal\)", "F-점수 (높을수록 격식적)"),
+    (r"Erosion [Rr]ate \(%\)", "침식률 (%)"),
+    (r"Erosion rate vs\. formality, per video \(point size = contexts\)",
+     "규칙별 격식 정도와 침식률 (문서 단위; 점의 크기 = 문맥 수)"),
+    (r"Erosion rate vs\. formality, per speaker \(point size = contexts\)",
+     "규칙별 격식 정도와 침식률 (화자 단위; 점의 크기 = 문맥 수)"),
+    (r"\(predicted to erode\)", "(침식 예측)"), (r"\(predicted to resist\)", "(유지 예측)"),
+    (r"videos=(\d+), Spearman", r"문서 \1건, Spearman"),
+    (r"speakers=(\d+), Spearman", r"화자 \1명, Spearman"),
+    (r"no curve \(fewer than (\d+) erosions\)", r"곡선 없음 (침식 \1건 미만)"),
+    (r"too few (video|speaker)s: (\d+) with >= (\d+) contexts", r"단위 부족: 문맥 \3개 이상인 단위 \2개"),
+    (r"Odds ratio of erosion per 10 F-points, 95% CI \(log scale; left of 1 = less erosion "
+     r"when more formal\)", "F-점수 10점당 침식 오즈비, 95% 신뢰구간\n(로그 스케일; 1보다 왼쪽 = 격식적일수록 침식 감소)"),
+    (r"Formality effect within each corpus, per video\n.*",
+     "코퍼스 내부의 격식 효과 (문서 단위)\n(코퍼스마다 따로 적합하여 코퍼스 간 차이가 섞이지 않음)"),
+    (r"Formality effect within each corpus, per speaker\n.*",
+     "코퍼스 내부의 격식 효과 (화자 단위)\n(코퍼스마다 따로 적합하여 코퍼스 간 차이가 섞이지 않음)"),
+    (r" -- (.+?) \((\d+) videos\)", r" -- \1 (문서 \2건)"),
+    (r" -- (.+?) \((\d+) speakers\)", r" -- \1 (화자 \2명)"),
+    (r"Erosion by formality band, per branch \((\d+) videos split into thirds\)",
+     r"격식 정도 3구간별·규칙별 침식률 (문서 \1건을 3등분)"),
+    (r"Erosion by formality band, per branch \((\d+) speakers split into thirds\)",
+     r"격식 정도 3구간별·규칙별 침식률 (화자 \1명을 3등분)"),
+    (r"Erosion rate \(%, pooled, 95% Wilson CI\)", "침식률 (%, 합산, 95% Wilson 신뢰구간)"),
+    (r"\(least formal third\)", "(하위 33%)"), (r"\(middle third\)", "(중간 33%)"),
+    (r"\(most formal third\)", "(상위 33%)"),
+    (r"\(erode\)", "(침식 예측)"), (r"\(resist\)", "(유지 예측)"),
+    # ---- speaker background ----
+    (r"Mutation erosion by speaker background\n\(numbers above bars = speakers\)",
+     "화자 배경별 자음 변이 침식률\n(막대 위 숫자 = 화자 수)"),
+    (r"Erosion rate \(95% CI\)", "침식률 (95% 신뢰구간)"),
+    (r"^When Welsh was acquired$", "습득 시기"),
+    (r"^Speaker age \(apparent time\)$", "나이"),
+    (r"^Language the mother spoke$", "어머니의 언어"),
+    (r"^Welsh by age 4$", "만 4세까지"), (r"^Welsh later\n\(school /\nadult\)$", "그 이후\n(학교·성인기)"),
+    # line breaks: Korean labels are wider and ran into each other (2026-10-29)
+    (r"^<30$", "30세\n미만"), (r"^30-49$", "30–\n49세"), (r"^50-69$", "50–\n69세"), (r"^70\+$", "70세\n이상"),
+    (r"^Welsh$", "웨일스어"), (r"^both$", "두 언어\n모두"), (r"^English /\nSpanish$", "접촉 언어\n(영어·\n스페인어)"),
+    # ---- legends, categories ----
+    (r"^Mutation$", "변이 유형"),
+    (r"^Soft$", "연변이"), (r"^Nasal$", "비음 변이"), (r"^Aspirate$", "기음 변이"),
+    (r"^h-prothesis$", "h 첨가"),
+    (r"^soft$", "연변이"), (r"^soft_limited$", "제한 연변이"), (r"^nasal$", "비음 변이"),
+    (r"^aspirate$", "기음 변이"), (r"^h-mutation$", "h 첨가"),
+    (r"^aspirate\|soft$", "기음/연변이"), (r"^soft_limited\|nasal$", "제한 연변이/비음"),
+    (r"^nasal\|soft_limited$", "비음/제한 연변이"),
+    (r"^Correct$", "올바른 변이"), (r"^Erosion \(radical\)$", "기본형 변이 침식"),
+    (r"^Erosion \(wrong type\)$", "대체형 변이 침식"),
+    (r"Trigger word: preposition, possessive, yn, a\.\.\.", "촉발어: 전치사, 소유격, yn, a 등"),
+    (r"Article \+ feminine noun", "정관사 + 여성 명사"),
+    (r"Feminine noun \+ adjective", "여성 명사 + 형용사"),
+    (r"un \+ feminine noun", "un + 여성 명사"), (r"dau/dwy \+ noun", "dau/dwy + 명사"),
+    (r"Numeral \+ blynedd/diwrnod", "수사 뒤 비음 변이"),   # the rule chart adds "(pum mlynedd)"
+    (r"Direct object of inflected verb", "활용 동사의 직접 목적어"), (r"Vocative", "호격"),
+    (r"Negative particle \+ verb", "부정 소사 뒤 혼합 변이"),   # the rule chart adds "(ni chaf, …)"
+    (r"h- before a vowel", "모음 앞 h 첨가"),
+    (r"Feminine 'ei'", "여성 소유격 ei"), (r"Preposed adjective \+ noun", "전치 형용사 + 명사"),
+    (r"Feminine ordinal \+ noun", "여성 서수 + 명사"),
+    (r"^word_trigger$", "촉발어"), (r"^fem_noun\+adjective$", "여성 명사 + 형용사"),
+    (r"^mixed_mutation$", "혼합 변이 (부정 소사 뒤)"), (r"^numeral\+fem_noun$", "un + 여성 명사"),
+    (r"^feminine_ordinal\+noun$", "여성 서수 + 명사"), (r"^preposed_adjective\+noun$", "전치 형용사 + 명사"),
+    (r"^feminine_ei$", "여성 소유격 ei"), (r"^spacy_obj_soft$", "동사의 직접 목적어"),
+    (r"^numeral_general\+noun$", "dau/dwy + 명사"), (r"^definite_article\+fem_noun$", "정관사 + 여성 명사"),
+    (r"^decompounded_noun$", "분리된 복합명사"), (r"^phantom_check$", "불필요한 변이 점검"),
+    (r"^restricted_nasal_numeral$", "수사 뒤 비음 변이 (blynedd/diwrnod)"), (r"^h_mutation$", "모음 앞 h 첨가"),
+    (r"Conjugated prepositions", "전치사의 인칭 활용"), (r"Numeral \+ singular noun", "수사 + 단수 명사"),
+    (r"rhai \+ plural noun", "rhai + 복수 명사"), (r"Quantifier \+ o \+ plural", "수량사 + o + 복수"),
+    (r"Controls combined", "대조 규칙 통합"), (r"^Mutation\b", "자음 변이"),
+    (r"News narration \(noise floor\)", "뉴스 본문 (측정 잡음의 기준선)"),
+    (r"News articles: narration", "뉴스 본문"), (r"News articles: quotes", "뉴스 인용문"),
+    (r"News articles: statements", "뉴스 성명"),
+    (r"News\nnarration", "뉴스\n본문"), (r"News\nstatements", "뉴스\n성명"), (r"News\nquotes", "뉴스\n인용문"),
+    (r"News narration", "뉴스 본문"), (r"News quotes", "뉴스 인용문"), (r"News statements", "뉴스 성명"),
+    (r"YouTube videos", "유튜브 영상"),
+]
+_KO_COMPILED = [(re.compile(p, re.S), r) for p, r in KO_PHRASES]
+# The report's own terms (read from the .hwp draft, 2026-10-11), applied
+# after KO_PHRASES so the figures say exactly what the text says.
+KO_REPORT_TERMS = [
+    ("제한 연변이", "제한 연음 변이"), ("연변이", "연음 변이"),
+    ("문맥", "변이 환경"),
+    ("전치사의 인칭 활용", "전치사의 활용"), ("수사 + 단수 명사", "수사 단수 규칙"),
+    ("rhai + 복수 명사", "rhai 규칙"), ("수량사 + o + 복수", "수량어 규칙"),
+    ("대조 규칙 통합", "대조군 규칙 통합"),
+    ("(침식 예측)", "(예측: 무너짐)"), ("(유지 예측)", "(예측: 유지됨)"),
+    ("격식 정도 (Heylighen–Dewaele F-점수, 높을수록 격식적)",
+     "격식 점수 F (Heylighen–Dewaele, 높을수록 격식적)"),
+    ("격식 정도(F-점수)와", "격식 점수 F와"), ("F-점수 (높을수록 격식적)", "격식 점수 F (높을수록 격식적)"),
+    ("F-점수", "격식 점수 F"),
+    # 2026-10-29, matched to the final report (OneDrive copy saved 10-28)
+    ("기대 변이 유형", "예상 변이 유형"),
+    ("3구간별", "3분위별"), ("을 3등분)", "을 3분위로 나눔)"),
+    ("코드 판독과 태거의 전체 일치", "코드와 태거의 전체 일치"),
+    ("유튜브 영상", "영상·팟캐스트"),
+    ("촉발어: 전치사, 소유격, yn, a 등", "촉발어 뒤 (전치사, 소유격, yn, a 등)"),
+    ("정관사 + 여성 명사", "정관사 뒤 여성 명사"), ("여성 명사 + 형용사", "여성 명사 뒤 형용사"),
+    ("여성 서수 + 명사", "여성 서수 뒤 명사"),
+    ("활용 동사의 직접 목적어", "활용하는 동사의 목적어"), ("동사의 직접 목적어", "활용하는 동사의 목적어"),
+]
+_ko_font = None
+
+
+def _korean_font():
+    """Name of an installed Korean font, or "" when there is none."""
+    global _ko_font
+    if _ko_font is None:
+        from matplotlib import font_manager
+        names = {f.name for f in font_manager.fontManager.ttflist}
+        _ko_font = next((n for n in ("Malgun Gothic", "NanumGothic", "NanumBarunGothic",
+                                     "AppleGothic", "Noto Sans CJK KR", "Noto Sans KR")
+                         if n in names), "")
+        if not _ko_font:
+            print("  ⚠️ No Korean font found -- Korean figure copies (figures/ko/) skipped.")
+    return _ko_font
+
+
+def _ko(text):
+    for pattern, repl in _KO_COMPILED:
+        text = pattern.sub(repl, text)
+    for old, new in KO_REPORT_TERMS:
+        text = text.replace(old, new)
+    return text
+
+
+def _koreanize(fig, font):
+    """Translates every text of fig in place (KO_PHRASES) and sets the font."""
+    from matplotlib.text import Text
+    from matplotlib.ticker import FixedFormatter, FixedLocator
+    for ax in fig.axes:
+        for axis in (ax.xaxis, ax.yaxis):
+            # Tick labels are redrawn from the formatter, so editing their Text
+            # objects does nothing. Read the labels the current formatter gives
+            # (FixedFormatter from set_ticklabels, seaborn's category formatter,
+            # ...), translate them, and pin them with a fixed locator/formatter.
+            # Numeric axes come back unchanged and are left alone (2026-10-29:
+            # category labels were still English in five figures).
+            try:
+                locs = list(axis.get_majorticklocs())
+                old = list(axis.get_major_formatter().format_ticks(locs))
+            except Exception:
+                continue
+            new = [_ko(s) for s in old]
+            if new != old:
+                axis.set_major_locator(FixedLocator(locs))
+                axis.set_major_formatter(FixedFormatter(new))
+        try:
+            ax.tick_params(labelfontfamily=font)
+        except (ValueError, TypeError):       # matplotlib < 3.8
+            for t in [*ax.get_xticklabels(), *ax.get_yticklabels()]:
+                t.set_fontfamily(font)
+    for t in fig.findobj(Text):
+        orig = getattr(t, "_orig_text", None)
+        if orig is not None:                  # a wrapped title: translate the original
+            t._orig_text = _ko(orig)
+            t.set_text(t._orig_text)
+        else:
+            s = t.get_text()
+            if s:
+                new = _ko(s)
+                if new != s:
+                    t.set_text(new)
+        t.set_fontfamily(font)
+    _wrap_titles(fig)
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+
+
+def _text_width_in(s, fontsize):
+    """Rough printed width of s in inches: Hangul/CJK about one em per
+    character, Latin about half an em (bold)."""
+    em = sum(1.0 if ord(ch) > 0x2E80 else 0.56 for ch in s)
+    return em * fontsize / 72
+
+
+def _wrap_line(line, fontsize, width_in):
+    words, out, cur = line.split(" "), [], ""
+    for w in words:
+        trial = f"{cur} {w}" if cur else w
+        if cur and _text_width_in(trial, fontsize) > width_in:
+            out.append(cur)
+            cur = w
+        else:
+            cur = trial
+    out.append(cur)
+    return "\n".join(out)
+
+
+def _wrap_titles(fig):
+    """Wraps every title (axes titles, suptitle) to the width it sits over,
+    so no title is wider than its chart (2026-10-10): saving with
+    bbox_inches="tight" made the image as wide as the longest title, and the
+    chart shrank when the image was fitted to the page. The unwrapped text is
+    kept on the Text object (_orig_text) so the Korean copy translates the
+    original and is wrapped again afterwards."""
+    fig_w = fig.get_size_inches()[0]
+    titles = []
+    if fig._suptitle is not None:
+        titles.append((fig._suptitle, fig_w * 0.96))
+    for ax in fig.axes:
+        if not ax.get_visible():
+            continue
+        width = ax.get_position().width * fig_w
+        for t in (ax.title, ax._left_title, ax._right_title):
+            titles.append((t, max(width, 2.0)))
+    for t, width in titles:
+        orig = getattr(t, "_orig_text", None)
+        if orig is None:
+            orig = t.get_text()
+            t._orig_text = orig
+        if not orig:
+            continue
+        fs = t.get_fontsize()
+        t.set_text("\n".join(_wrap_line(line, fs, width) for line in orig.split("\n")))
+
+
 def _save(fig, name):
     """Saves a figure. If Windows won't let the old file be overwritten --
     usually because it's open in an image viewer, which gave "OSError:
     [Errno 22] Invalid argument" and stopped the whole analyzer on
-    2026-10-01 -- the figure goes to a second name instead."""
+    2026-10-01 -- the figure goes to a second name instead. Then saves the
+    Korean copy to figures/ko/ (see KO_PHRASES)."""
     path = FIG_DIR / name
+    _fit_text_for_print(fig)
+    _wrap_titles(fig)
     try:
-        fig.savefig(path, dpi=150, bbox_inches="tight")
+        fig.tight_layout()
+    except Exception:
+        pass
+    try:
+        fig.savefig(path, dpi=200, bbox_inches="tight")
         print(f"  Saved: {path.name}")
     except OSError as e:
         alt = path.with_name(f"{path.stem}_{datetime.now():%H%M%S}{path.suffix}")
@@ -684,6 +1009,14 @@ def _save(fig, name):
                   f"image viewer? Saved as {alt.name} instead.")
         except OSError as e2:
             print(f"  ⚠️ Couldn't save {path.name}: {e2}")
+    try:
+        font = _korean_font()
+        if font:
+            KO_FIG_DIR.mkdir(parents=True, exist_ok=True)
+            _koreanize(fig, font)
+            fig.savefig(KO_FIG_DIR / name, dpi=200, bbox_inches="tight")
+    except Exception as e:
+        print(f"  ⚠️ Korean copy of {name} not saved: {e}")
     finally:
         plt.close(fig)
 
@@ -895,7 +1228,12 @@ def _corpus_comparison_chart(sub, cat_col, cat_order, cat_labels, title, filenam
         print(f"  [skip] {filename} -- no data")
         return
     height = 0.8 / len(groups)
-    fig, ax = plt.subplots(figsize=(11, max(4, 0.32 * len(cats) * len(groups) + 1.8)))
+    # 8 in wide. 0.19 in per bar only for long charts, so the 60-bar rule
+    # chart still fits one A4 page at text width (2026-10-09); shorter ones
+    # (the 20-bar mutation-type chart printed too small) get 0.34 in.
+    n_bars = len(cats) * len(groups)
+    per_bar = 0.19 if n_bars > 40 else 0.34
+    fig, ax = plt.subplots(figsize=(8, max(5, per_bar * n_bars + 1.8)))
     labelled, x_max = set(), 0.0
     for gi, group in enumerate(groups):
         for ci, cat in enumerate(cats):
@@ -924,7 +1262,15 @@ def _corpus_comparison_chart(sub, cat_col, cat_order, cat_labels, title, filenam
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
     ax.set_xlabel(f"Erosion rate (%, 95% Wilson CI; bars with < {MIN_CELL_CONTEXTS} contexts omitted)")
     ax.set_title(title, fontweight="bold", pad=12)
-    ax.legend(fontsize=9, loc="lower right")
+    # Short charts (mutation types): top right -- at lower right the legend
+    # covered Patagonia's h-prothesis label (2026-10-10). The long rule chart
+    # keeps lower right, where its bottom rows are short.
+    # 2026-10-29: in the long rule chart the legend covered the bottom rows
+    # (feminine ordinal), so long charts put it under the axis instead.
+    if len(cats) <= 5:
+        ax.legend(fontsize=9, loc="upper right")
+    else:
+        ax.legend(fontsize=9, loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=3)
     fig.tight_layout()
     _save(fig, filename)
 
@@ -967,69 +1313,105 @@ def fig_erosion_by_mutation_family(df, filename_prefix=""):
     _corpus_comparison_chart(
         sub, "family", FAMILY_ORDER, {},
         f"Mutation erosion by mutation type, per corpus\n"
-        f"(soft-limited counted as soft; {n_two:,} contexts where two types are possible "
-        f"-- yn: soft or nasal, a + verb: aspirate or soft -- left out)",
+        f"(soft-limited counted as soft; {n_two:,} contexts where two types are possible left out)",
         f"{filename_prefix}erosion_by_mutation_family.png")
+
+
+# Sources in erosion_by_channel, most formal first, with short two-line
+# labels; any source not listed here is appended after them.
+CHANNEL_ORDER = ["News articles: narration", "News articles: statements",
+                 "News articles: quotes", "Newyddion S4C", "CorCenCC", "Siarad",
+                 "Patagonia", "Hansh", "Haclediad"]
+CHANNEL_SHORT = {"News articles: narration": "News\nnarration",
+                 "News articles: statements": "News\nstatements",
+                 "News articles: quotes": "News\nquotes",
+                 "Newyddion S4C": "Newyddion\nS4C"}
+FAMILY_COLORS = {"Soft": MUTATION_COLORS["soft"], "Nasal": MUTATION_COLORS["nasal"],
+                 "Aspirate": MUTATION_COLORS["aspirate"],
+                 "h-prothesis": MUTATION_COLORS["h-mutation"]}
+
+
+def _count_label(n):
+    """Context count for a bar label: 429, 6.1k, 61k."""
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}k" if n < 10000 else f"{n / 1000:.0f}k"
 
 
 def fig_erosion_by_channel(df):
     """
-    Grouped bar chart: erosion rate per channel, broken down by mutation type.
-    The channel axis is the proxy for register/formality -- S4C formal
-    broadcast vs Hansh youth-oriented content vs Sgorio sports commentary.
+    Erosion rate per source (channel), split by mutation family -- soft,
+    nasal, aspirate, h-prothesis, as in erosion_by_mutation_family (contexts
+    where two families are possible left out). Sources run from most formal
+    (news narration) to least. The number over each bar is its context count;
+    bars with fewer than MIN_CELL_CONTEXTS contexts are left out, so a missing
+    bar means "too few to say", not 0%. Redrawn 2026-10-08 (was eight raw
+    mutation labels per source, with rotated "n=" labels).
     """
     if "channel" not in df.columns or "is_erosion" not in df.columns \
             or "expected_mutation" not in df.columns:
         print("  [skip] erosion_by_channel -- missing columns")
         return
-
-    sub = df[(df["is_code_switch"].isin([False])) & (df["trigger_word"] != "[OMITTED]")] \
-        if "is_code_switch" in df.columns else df
-    # Restrict to evaluable contexts only
+    # Same filter as _evaluable_mutation_rows, minus its corpus grouping
+    # (which drops news quotes/statements -- they get their own bars here).
+    sub = df
+    if "is_code_switch" in sub.columns:
+        sub = sub[sub["is_code_switch"].isin([False])]
+    if "rule" in sub.columns:
+        sub = sub[sub["rule"] != "phantom_check"]
     if "status" in sub.columns:
         sub = sub[sub["status"].isin(EVALUABLE_STATUSES)]
-
-    type_counts = sub.groupby("expected_mutation")["is_erosion"].count()
-    valid_types = type_counts[type_counts >= 10].index.tolist()
-    sub = sub[sub["expected_mutation"].isin(valid_types)]
-
+    sub = sub.dropna(subset=["is_erosion", "channel"])
+    sub = sub.assign(is_erosion=sub["is_erosion"].astype(bool),
+                     family=sub["expected_mutation"].map(_mutation_family)).dropna(subset=["family"])
     if sub.empty:
         print("  [skip] erosion_by_channel -- insufficient data")
         return
 
-    pivot        = sub.groupby(["channel", "expected_mutation"])["is_erosion"].mean().unstack(fill_value=0)
-    pivot_counts = sub.groupby(["channel", "expected_mutation"])["is_erosion"].count().unstack(fill_value=0)
+    present = set(sub["channel"])
+    channels = [c for c in CHANNEL_ORDER if c in present] + sorted(present - set(CHANNEL_ORDER))
+    families = [f for f in FAMILY_ORDER if f in set(sub["family"])]
+    stats = sub.groupby(["channel", "family"])["is_erosion"].agg(["sum", "size"])
 
-    fig, ax   = plt.subplots(figsize=(11, 5))
-    n_types   = len(pivot.columns)
-    n_channels = len(pivot)
-    bar_width = 0.8 / n_types
-    x         = range(n_channels)
+    # Horizontal bars (2026-10-09, for A4 print): one group per source, top =
+    # most formal; a group's four bars run soft -> h-prothesis downwards. The
+    # count sits right of each bar's interval, where there is room for it.
+    fig, ax = plt.subplots(figsize=(8, 0.5 * len(channels) * len(families) / 2 + 2))
+    height = 0.8 / len(families)
+    labelled = set()
+    for fi, fam in enumerate(families):
+        offset = (fi - (len(families) - 1) / 2) * height
+        for ci, ch in enumerate(channels):
+            if (ch, fam) not in stats.index:
+                continue
+            k, n = int(stats.loc[(ch, fam), "sum"]), int(stats.loc[(ch, fam), "size"])
+            if n < MIN_CELL_CONTEXTS:
+                continue
+            p = k / n
+            low, high = _wilson_interval(k, n)
+            y = ci + offset
+            ax.barh(y, 100 * p, height=height * 0.9, color=FAMILY_COLORS[fam],
+                    label=fam if fam not in labelled else None)
+            labelled.add(fam)
+            ax.errorbar(100 * p, y, xerr=[[max(0.0, 100 * (p - low))], [max(0.0, 100 * (high - p))]],
+                        fmt="none", ecolor="#555555", capsize=1.5, linewidth=0.7)
+            ax.text(100 * high + 1.2, y, _count_label(n), ha="left", va="center",
+                    fontsize=8, color="#444444")
 
-    for idx, mut_type in enumerate(pivot.columns):
-        offset = (idx - n_types / 2 + 0.5) * bar_width
-        color  = MUTATION_COLORS.get(mut_type, MUTATION_COLORS["other"])
-        xpos   = [xi + offset for xi in x]
-        bars   = ax.bar(xpos, pivot[mut_type] * 100,
-                        width=bar_width, label=mut_type, color=color,
-                        edgecolor="white", linewidth=0.4)
-        # Annotate each bar with its context count so a 0% bar is clearly
-        # distinguishable from "no contexts" (n=0) vs "contexts but no erosion".
-        for bar, xi, ch in zip(bars, xpos, pivot.index):
-            n = int(pivot_counts.loc[ch, mut_type]) if ch in pivot_counts.index else 0
-            if n > 0:
-                ax.text(xi, bar.get_height() + 0.5, f"n={n}",
-                        ha="center", va="bottom", fontsize=6, rotation=90,
-                        color="#555555")
-
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(pivot.index, rotation=15, ha="right")
-    ax.set_ylabel("Erosion Rate (%)")
-    ax.set_title("Mutation Erosion Rate by Channel and Mutation Type\n"
-                 "(register proxy: formal broadcast vs informal content)",
-                 fontweight="bold", pad=12)
-    ax.legend(title="Mutation Type", bbox_to_anchor=(1.01, 1), loc="upper left")
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    for ci in range(1, len(channels)):
+        ax.axhline(ci - 0.5, color="#e3e3e3", linewidth=0.8, zorder=0)
+    ax.set_yticks(range(len(channels)))
+    ax.set_yticklabels([CHANNEL_SHORT.get(c, c) for c in channels])
+    ax.set_ylim(len(channels) - 0.5, -0.5)          # most formal on top
+    ax.set_xlim(0, 112)
+    ax.xaxis.set_major_locator(mticker.FixedLocator(range(0, 101, 20)))
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel(f"Erosion rate (95% Wilson CI). Number = contexts; "
+                  f"bars under {MIN_CELL_CONTEXTS} contexts left out")
+    ax.set_title("Mutation erosion by source and mutation type\n(sources from most to least formal)",
+                 fontweight="bold")
+    ax.legend(title="Mutation", loc="lower right", frameon=True)
     fig.tight_layout()
     _save(fig, "erosion_by_channel.png")
 
@@ -1213,7 +1595,7 @@ def fig_status_distribution(df):
     channels = list(pivot_pct.index)
     n        = len(channels)
     bar_h    = 0.6
-    fig, ax  = plt.subplots(figsize=(12, max(3, n * 0.9)))
+    fig, ax  = plt.subplots(figsize=(9, max(3, n * 0.8)))
 
     legend_handles = [mpatches.Patch(facecolor=STATUS_COLORS.get(STATUS_LABELS[s], "#CCCCCC"),
                                       label=STATUS_LABELS[s])
@@ -1277,7 +1659,8 @@ def fig_tagger_agreement(df):
         print("  [skip] tagger_agreement -- no data")
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    # Stacked, not side by side (2026-10-09): readable at A4 text width.
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 1.25]})
 
     # Colour palette for the current pipeline vocabulary.
     # all_three = all three sources agree (best)
@@ -1305,8 +1688,7 @@ def fig_tagger_agreement(df):
         colors=pie_colors, startangle=90,
         wedgeprops={"edgecolor": "white", "linewidth": 1.5})
     ax1.legend(wedges, counts.index, title="Agreement type",
-               loc="upper center", bbox_to_anchor=(0.5, -0.05),
-               ncol=2, fontsize=9)
+               loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=9)
     ax1.set_title("Overall Heuristic vs Tagger Agreement", fontweight="bold")
 
     if "rule" in df.columns:
@@ -1705,6 +2087,9 @@ def _rate_axis_from_zero(ax):
     shows 0-5%. Points at 0% sit on the axis line: draw them with
     clip_on=False so they aren't cut in half."""
     ax.set_ylim(0, max(ax.get_ylim()[1], 5))
+    # whole-number steps only: with 2.5-point steps the "%.0f%%" labels read
+    # 2%, 5%, 8%, 12%... (2026-10-29)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(steps=[1, 2, 5, 10], integer=True))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
 
 
@@ -1732,8 +2117,10 @@ def fig_branches_vs_formality(branch_rows, formality_df, keys, filename, unit, m
         print(f"  [skip] {filename} -- no formality data")
         return
     fscores = formality_df[keys + ["f_score", "source"]].dropna(subset=["f_score"])
-    ncols = 3 if len(BRANCHES) > 4 else 2
-    fig, axes = plt.subplots(2, ncols, figsize=(6.5 * ncols, 10), sharex=True)
+    # Two columns, portrait (2026-10-09): a 2x3 grid printed at A4 text
+    # width left each panel ~5 cm, too narrow for its title.
+    nrows = math.ceil(len(BRANCHES) / 2)
+    fig, axes = plt.subplots(nrows, 2, figsize=(9.5, 4.4 * nrows), sharex=True)
     for ax in axes.flat[len(BRANCHES):]:
         ax.set_visible(False)
     for ax, (label, _prefix, prediction) in zip(axes.flat, BRANCHES):
@@ -1823,7 +2210,7 @@ def fig_within_corpus_slopes(branch_rows, formality_df, keys, filename, unit, mi
     fitted = table.dropna(subset=["odds_ratio_per_10"])
     if fitted.empty:
         return
-    fig, ax = plt.subplots(figsize=(10, max(4, 0.42 * len(fitted) + 1.5)))
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.42 * len(fitted) + 1.5)))
     y, ticks, labels, labelled = 0, [], [], set()
     for label in fitted["branch"].unique():
         rows = fitted[fitted["branch"] == label]
@@ -1849,7 +2236,8 @@ def fig_within_corpus_slopes(branch_rows, formality_df, keys, filename, unit, mi
     ax.set_title(f"Formality effect within each corpus, per {unit}\n"
                  f"(each corpus fitted on its own, so the corpus can't stand in for formality)",
                  fontweight="bold", pad=12)
-    ax.legend(fontsize=8, loc="lower right")
+    # Under the axis: at lower right it covered the rhai/quantifier rows (2026-10-29).
+    ax.legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3)
     fig.tight_layout()
     _save(fig, filename)
 
@@ -1878,7 +2266,7 @@ def fig_branches_by_formality_band(branch_rows, formality_df, keys, filename, un
 
     fig, ax = plt.subplots(figsize=(10, 6))
     plotted = 0
-    offsets = [0.06 * (k - (len(BRANCHES) - 1) / 2) for k in range(len(BRANCHES))]
+    offsets = [0.09 * (k - (len(BRANCHES) - 1) / 2) for k in range(len(BRANCHES))]
     for offset, (label, _prefix, prediction) in zip(offsets, BRANCHES):
         rows = branch_rows.get(label)
         if rows is None or rows.empty or any(k not in rows.columns for k in keys):
@@ -1901,7 +2289,10 @@ def fig_branches_by_formality_band(branch_rows, formality_df, keys, filename, un
                     linestyle="--" if prediction == "resist" else "-",
                     label=f"{label} ({prediction})")
         for x, y, n in zip(xs, ys, ns):
-            ax.annotate(f"n={n}", (x, y), textcoords="offset points", xytext=(6, 4), fontsize=7)
+            # slanted and a little smaller: the near-0% points of the formal
+            # third sit close together and their labels ran into each other
+            ax.annotate(f"n={n:,}", (x, y), textcoords="offset points", xytext=(3, 5),
+                        fontsize=6.5, rotation=40)
         plotted += 1
     if not plotted:
         plt.close(fig)
@@ -1910,10 +2301,14 @@ def fig_branches_by_formality_band(branch_rows, formality_df, keys, filename, un
     ax.set_xticks(range(len(band_labels)))
     ax.set_xticklabels(band_labels)
     ax.set_ylabel("Erosion rate (%, pooled, 95% Wilson CI)")
+    # headroom so the slanted n= label of the top point doesn't run into the title
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.12)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(steps=[1, 2, 5, 10], integer=True))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
     ax.set_title(f"Erosion by formality band, per branch ({len(units)} {unit}s split into thirds)",
                  fontweight="bold", pad=12)
-    ax.legend(fontsize=9)
+    # under the axis: inside, it covered a data point (speaker version, 2026-10-29)
+    ax.legend(fontsize=9, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3)
     fig.tight_layout()
     _save(fig, filename)
 
@@ -2066,11 +2461,326 @@ def export_utterance_level(df):
 
 
 # ========================= MAIN =========================
+# ========================= SPEAKER BACKGROUND (supplementary) =========================
+# Added 2026-10-09, after Margaret Deuchar pointed to the BangorTalk
+# questionnaire data (bangortalk.org.uk/downloads.php). A supplementary
+# analysis: it joins the speakers' questionnaire answers to the FROZEN
+# mutation results (nothing is re-detected), for Siarad and Patagonia.
+#
+# Input: BASE_DIR/speaker_background/speakers_<corpus>.csv -- cleaned copies
+# of the questionnaire sheets with only the coded background columns (the
+# Patagonia sheet's names/addresses/emails were never copied). Codes, from
+# the Siarad questionnaire (Q6) and the data itself:
+#   welsh_since   1 by age 2, 2 by age 4, 3 primary school, 4 secondary, 5 adult
+#   mother_spoke  1 Welsh, 2 the other language (English / Spanish), 0 both,
+#                 3 other -- inferred: every adult learner has 2, and the
+#                 Patagonia "first_lang" column uses the same 1/2/0.
+SPEAKER_BG_DIR = BASE_DIR / "speaker_background"
+BG_CORPORA = ("siarad", "patagonia")
+BG_MIN_CONTEXTS = 20          # a speaker's own rate needs this many contexts
+BG_BOOT = 2000
+AGE_BANDS = [(0, 30, "<30"), (30, 50, "30-49"), (50, 70, "50-69"), (70, 200, "70+")]
+
+
+def _load_speaker_background():
+    """One row per (video_url, speaker) with the coded answers."""
+    frames = []
+    for corpus in BG_CORPORA:
+        path = SPEAKER_BG_DIR / f"speakers_{corpus}.csv"
+        if path.exists():
+            frames.append(pd.read_csv(path, dtype={"files": str}, encoding="utf-8-sig"))
+    if not frames:
+        return pd.DataFrame()
+    bg = pd.concat(frames, ignore_index=True)
+    bg = bg.dropna(subset=["files"]).assign(file=lambda d: d["files"].str.split())
+    bg = bg.explode("file")
+    bg["video_url"] = bg["corpus"].str.lower() + ":" + bg["file"].str.lower()
+    bg["speaker"] = bg["speaker"].astype(str).str.upper()
+    for c in ("age", "welsh_since", "mother_spoke"):
+        bg[c] = pd.to_numeric(bg[c], errors="coerce")
+    bg["acquisition"] = np.where(bg["welsh_since"].isna(), None,
+                                 np.where(bg["welsh_since"] <= 2, "Welsh by age 4",
+                                          "Welsh later (school / adult)"))
+    home = {1: "Welsh", 0: "both", 2: "English / Spanish"}
+    bg["mother_language"] = bg["mother_spoke"].map(home)
+    bg["age_band"] = None
+    for lo, hi, name in AGE_BANDS:
+        bg.loc[(bg["age"] >= lo) & (bg["age"] < hi), "age_band"] = name
+    return bg.drop(columns=["files"]).drop_duplicates(["video_url", "speaker"])
+
+
+def _boot_group_rate(sp, rng):
+    """Pooled erosion rate of a group of speakers and its 95% interval from
+    resampling SPEAKERS (contexts of one speaker aren't independent)."""
+    e, n = sp["erosions"].to_numpy(float), sp["contexts"].to_numpy(float)
+    if len(sp) < 2 or n.sum() == 0:
+        return e.sum() / n.sum() if n.sum() else float("nan"), float("nan"), float("nan")
+    idx = rng.integers(0, len(sp), size=(BG_BOOT, len(sp)))
+    rates = e[idx].sum(axis=1) / n[idx].sum(axis=1)
+    return e.sum() / n.sum(), *np.percentile(rates, [2.5, 97.5])
+
+
+def _logit_irls(X, k, n):
+    """Binomial logistic regression on aggregated counts (k of n), by IRLS.
+    Returns the coefficient vector, or None if it doesn't converge."""
+    beta = np.zeros(X.shape[1])
+    y = k / n
+    try:
+        for _ in range(60):
+            p = np.clip(1 / (1 + np.exp(-X @ beta)), 1e-9, 1 - 1e-9)
+            w = n * p * (1 - p)
+            z = X @ beta + (y - p) / (p * (1 - p))
+            new = np.linalg.solve(X.T @ (w[:, None] * X), X.T @ (w * z))
+            if np.max(np.abs(new - beta)) < 1e-8:
+                return new if np.all(np.isfinite(new)) else None
+            beta = new
+    except np.linalg.LinAlgError:
+        return None
+    return beta if np.all(np.isfinite(beta)) else None
+
+
+def speaker_background_analysis(branch_rows, speaker_formality):
+    """Mutation erosion by the speakers' language background (Siarad,
+    Patagonia): groups by when Welsh was acquired, by age band (apparent
+    time) and by the mother's language, each with a speaker-bootstrap 95%
+    interval; and per corpus one logistic model, erosion ~ later acquirer +
+    age (per 10 years) + formality (per 10 F-points), its odds ratios with
+    speaker-bootstrap intervals. Writes speaker_background_*.csv and
+    figures/speaker_background.png."""
+    bg = _load_speaker_background()
+    rows = branch_rows.get("Mutation")
+    if bg.empty or rows is None or rows.empty or "speaker" not in rows.columns:
+        print("  [skip] speaker background -- no questionnaire data or no speaker column")
+        return
+    rows = rows[rows["source"].isin(BG_CORPORA)].copy()
+    rows["video_url"] = rows["video_url"].str.lower()
+    rows["speaker"] = rows["speaker"].astype(str).str.upper()
+    per = (rows.groupby(["source", "video_url", "speaker"])["is_erosion"]
+               .agg(erosions="sum", contexts="size").reset_index())
+    sp = per.merge(bg, on=["video_url", "speaker"], how="inner")
+    if speaker_formality is not None and not speaker_formality.empty:
+        f = speaker_formality[["video_url", "speaker", "f_score"]].copy()
+        f["video_url"] = f["video_url"].str.lower()
+        f["speaker"] = f["speaker"].astype(str).str.upper()
+        sp = sp.merge(f, on=["video_url", "speaker"], how="left")
+    else:
+        sp["f_score"] = np.nan
+    covered = per["contexts"].sum()
+    print(f"\nSpeaker background (supplementary): {len(sp)} speakers matched, "
+          f"{sp['contexts'].sum():,} of {covered:,} Siarad/Patagonia mutation contexts "
+          f"({sp['contexts'].sum() / covered:.0%})")
+    sp.drop(columns=["file"], errors="ignore").to_csv(
+        OUT_DIR / "speaker_background_speakers.csv", index=False, encoding="utf-8-sig")
+
+    rng = np.random.default_rng(20261009)
+    groups, panels = [], {"acquisition": [], "age_band": [], "mother_language": []}
+    orders = {"acquisition": ["Welsh by age 4", "Welsh later (school / adult)"],
+              "age_band": [b for _, _, b in AGE_BANDS],
+              "mother_language": ["Welsh", "both", "English / Spanish"]}
+    for var, order in orders.items():
+        for corpus in BG_CORPORA:
+            for level in order:
+                g = sp[(sp["source"] == corpus) & (sp[var] == level)]
+                if g.empty:
+                    continue
+                rate, lo, hi = _boot_group_rate(g, rng)
+                groups.append({"variable": var, "corpus": CORPUS_LABELS[corpus], "group": level,
+                               "speakers": len(g), "contexts": int(g["contexts"].sum()),
+                               "erosions": int(g["erosions"].sum()), "erosion_rate": round(rate, 4),
+                               "ci_low": round(lo, 4), "ci_high": round(hi, 4)})
+    gdf = pd.DataFrame(groups)
+    gdf.to_csv(OUT_DIR / "speaker_background_groups.csv", index=False, encoding="utf-8-sig")
+    for var in orders:
+        print(f"  by {var}:")
+        for _, r in gdf[gdf["variable"] == var].iterrows():
+            print(f"    {r['corpus']:<10} {r['group']:<30} {r['erosion_rate']:6.1%} "
+                  f"[{r['ci_low']:.1%}-{r['ci_high']:.1%}]  {r['speakers']:>3} speakers, "
+                  f"{r['contexts']:,} contexts")
+
+    # Model per corpus: all three predictors together, so each is net of the others.
+    models = []
+    for corpus in BG_CORPORA:
+        m = sp[(sp["source"] == corpus)].dropna(subset=["welsh_since", "age", "f_score"])
+        m = m[m["contexts"] >= 1]
+        if len(m) < 20 or m["erosions"].sum() < MIN_FIT_EVENTS:
+            continue
+        def design(d):
+            return np.column_stack([np.ones(len(d)), (d["welsh_since"] >= 3).astype(float),
+                                    (d["age"] - 50) / 10, (d["f_score"] - 60) / 10])
+        beta = _logit_irls(design(m), m["erosions"].to_numpy(float), m["contexts"].to_numpy(float))
+        if beta is None:
+            continue
+        boots = []
+        for _ in range(1000):
+            b = m.iloc[rng.integers(0, len(m), len(m))]
+            bb = _logit_irls(design(b), b["erosions"].to_numpy(float), b["contexts"].to_numpy(float))
+            if bb is not None:
+                boots.append(bb)
+        boots = np.array(boots)
+        for j, name in enumerate(["later acquirer (vs by age 4)", "age (per 10 years)",
+                                  "formality (per 10 F-points)"], start=1):
+            lo, hi = np.percentile(np.exp(boots[:, j]), [2.5, 97.5]) if len(boots) else (np.nan, np.nan)
+            models.append({"corpus": CORPUS_LABELS[corpus], "predictor": name, "speakers": len(m),
+                           "odds_ratio": round(float(np.exp(beta[j])), 3),
+                           "ci_low": round(float(lo), 3), "ci_high": round(float(hi), 3)})
+    mdf = pd.DataFrame(models)
+    mdf.to_csv(OUT_DIR / "speaker_background_model.csv", index=False, encoding="utf-8-sig")
+    if not mdf.empty:
+        print("  model (erosion ~ later acquirer + age + formality; speaker-bootstrap 95% CI):")
+        for _, r in mdf.iterrows():
+            print(f"    {r['corpus']:<10} {r['predictor']:<30} OR {r['odds_ratio']:.2f} "
+                  f"[{r['ci_low']:.2f}-{r['ci_high']:.2f}]  ({r['speakers']} speakers)")
+
+    # Figure: three panels, one per background variable.
+    titles = {"acquisition": "When Welsh was acquired", "age_band": "Speaker age (apparent time)",
+              "mother_language": "Language the mother spoke"}
+    fig, axes = plt.subplots(1, 3, figsize=(12, 5), sharey=True)
+    width = 0.38
+    for ax, (var, order) in zip(axes, orders.items()):
+        sub = gdf[gdf["variable"] == var]
+        for ci, corpus in enumerate(BG_CORPORA):
+            label = CORPUS_LABELS[corpus]
+            color = CORPUS_GROUP_COLORS.get(label, "#888888")
+            for li, level in enumerate(order):
+                r = sub[(sub["corpus"] == label) & (sub["group"] == level)]
+                if r.empty:
+                    continue
+                r = r.iloc[0]
+                x = li + (ci - 0.5) * width
+                ax.bar(x, 100 * r["erosion_rate"], width=width * 0.92, color=color,
+                       label=label if li == 0 or (var != "acquisition" and level == order[0]) else None)
+                ax.errorbar(x, 100 * r["erosion_rate"],
+                            yerr=[[100 * (r["erosion_rate"] - r["ci_low"])],
+                                  [100 * (r["ci_high"] - r["erosion_rate"])]],
+                            fmt="none", ecolor="#444444", capsize=2, linewidth=0.8)
+                ax.text(x, 100 * r["ci_high"] + 1, str(int(r["speakers"])), ha="center",
+                        va="bottom", fontsize=7, color="#555555")
+        ax.set_xticks(range(len(order)))
+        ax.set_xticklabels([o.replace(" (", "\n(").replace(" / ", " /\n") for o in order], fontsize=9)
+        ax.set_title(titles[var], fontweight="bold")
+        ax.grid(axis="x", visible=False)
+    axes[0].set_ylabel("Erosion rate (95% CI)")
+    axes[0].set_ylim(0, max(axes[0].get_ylim()[1], 100 * gdf["ci_high"].max() + 9))
+    axes[0].yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    handles, labels = axes[0].get_legend_handles_labels()
+    seen = dict(zip(labels, handles))
+    axes[0].legend(seen.values(), seen.keys(), loc="upper left", fontsize=9)
+    fig.suptitle("Mutation erosion by speaker background\n"
+                 "(numbers above bars = speakers)", fontweight="bold")
+    fig.tight_layout()
+    _save(fig, "speaker_background.png")
+
+
+# ---- Quick redraw from the last full run (2026-10-10) ----
+# A full run reads ~5,000 output folders and recomputes every formality
+# score (about 15 minutes). It saves what the figures are drawn from to
+# FIG_CACHE; "redraw" mode loads that and draws only the figures you pick,
+# with the CURRENT figure code. The cache is only as new as the last full
+# run -- after new data (or menu 4 / 6 -> d), do a full run.
+FIG_CACHE = OUT_DIR / "_figure_cache.pkl"
+
+
+def _figure_registry(c):
+    """{figure name: function drawing it} over a cache dict c."""
+    df, fdf, br, sdf = c["df"], c["formality_df"], c["branch_rows"], c["speaker_df"]
+    sp = sdf[sdf["pos_tagged_word_count"] >= corpus_formality.MIN_SPEAKER_WORDS] \
+        if sdf is not None and not sdf.empty else sdf
+    has_f = fdf is not None and not fdf.empty
+    has_s = sp is not None and not sp.empty
+    reg = {
+        "erosion_by_type": lambda: fig_erosion_by_type(df),
+        "erosion_by_mutation_family": lambda: fig_erosion_by_mutation_family(df),
+        "erosion_by_rule": lambda: fig_erosion_by_rule(df),
+        "erosion_by_channel": lambda: fig_erosion_by_channel(df),
+        "codeswitch_by_channel": lambda: fig_codeswitch_by_channel(df),
+        "status_distribution": lambda: fig_status_distribution(df),
+        "tagger_agreement": lambda: fig_tagger_agreement(df),
+    }
+    if has_f:
+        reg.update({
+            "erosion_vs_formality": lambda: fig_erosion_vs_formality(df, fdf),
+            "erosion_vs_codeswitch": lambda: fig_erosion_vs_codeswitch(df, fdf),
+            "branches_vs_formality": lambda: fig_branches_vs_formality(
+                br, fdf, ["video_url"], "branches_vs_formality.png", "video"),
+            "branches_by_formality_band": lambda: fig_branches_by_formality_band(
+                br, fdf, ["video_url"], "branches_by_formality_band.png", "video"),
+            "within_corpus_slopes": lambda: fig_within_corpus_slopes(
+                br, fdf, ["video_url"], "within_corpus_slopes.png", "video"),
+        })
+    if has_s:
+        reg.update({
+            "speaker_branches_vs_formality": lambda: fig_branches_vs_formality(
+                br, sp, ["video_url", "speaker"], "speaker_branches_vs_formality.png", "speaker"),
+            "speaker_branches_by_formality_band": lambda: fig_branches_by_formality_band(
+                br, sp, ["video_url", "speaker"], "speaker_branches_by_formality_band.png", "speaker"),
+            "speaker_within_corpus_slopes": lambda: fig_within_corpus_slopes(
+                br, sp, ["video_url", "speaker"], "speaker_within_corpus_slopes.png", "speaker"),
+        })
+    reg["speaker_background"] = lambda: speaker_background_analysis(br, sdf)
+    return reg
+
+
+def _save_figure_cache(df, formality_df, branch_rows, speaker_df):
+    try:
+        pd.to_pickle({"df": df, "formality_df": formality_df, "branch_rows": branch_rows,
+                      "speaker_df": speaker_df, "saved": datetime.now().isoformat(timespec="minutes")},
+                     FIG_CACHE)
+        print(f"Figure cache saved ({FIG_CACHE.name}) -- menu 5 can now redraw single figures quickly.")
+    except Exception as e:
+        print(f"  ⚠️ Figure cache not saved ({e}) -- quick redraw will need a full run first.")
+
+
+def _quick_redraw():
+    """Asks which figures to redraw and draws them from FIG_CACHE.
+    Returns False when there is no usable cache (caller does a full run)."""
+    try:
+        c = pd.read_pickle(FIG_CACHE)
+    except Exception as e:
+        print(f"  No usable figure cache ({e}) -- doing a full run.")
+        return False
+    reg = _figure_registry(c)
+    names = list(reg)
+    print(f"\nRedraw from the run of {c.get('saved', '?')}:")
+    for i, n in enumerate(names, 1):
+        print(f"  {i:>2}  {n}")
+    raw = input("Figures to redraw (e.g. 2,5-7), 'all', or q to cancel: ").strip().lower()
+    if raw in ("q", ""):
+        print("Nothing redrawn.")
+        return True
+    picked = set()
+    if raw == "all":
+        picked = set(range(1, len(names) + 1))
+    else:
+        for part in raw.replace(" ", "").split(","):
+            try:
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    picked.update(range(int(a), int(b) + 1))
+                elif part:
+                    picked.add(int(part))
+            except ValueError:
+                print(f"  couldn't read {part!r}, skipped")
+    for i in sorted(picked):
+        if 1 <= i <= len(names):
+            print(f"\n{names[i - 1]}:")
+            try:
+                reg[names[i - 1]]()
+            except Exception as e:
+                print(f"  ⚠️ {names[i - 1]} failed: {e}")
+    print(f"\nFigures in: {FIG_DIR}  (Korean copies in {KO_FIG_DIR})")
+    return True
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     FIG_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Welsh Mutation Corpus Analyzer")
+    if FIG_CACHE.exists():
+        mode = input("Full run (f), or redraw chosen figures from the last full run (r)? [f]: ") \
+            .strip().lower() or "f"
+        if mode == "r" and _quick_redraw():
+            return
     print(f"Reading from: {MUT_DIR}\n")
 
     df, batch_log = load_and_merge_mutations()
@@ -2163,6 +2873,13 @@ def main():
         fig_within_corpus_slopes(branch_rows, speakers, ["video_url", "speaker"],
                                  "speaker_within_corpus_slopes.png", "speaker")
 
+    # Supplementary: speakers' language background (BangorTalk questionnaires).
+    try:
+        speaker_background_analysis(branch_rows, speaker_df)
+    except Exception as e:
+        print(f"  ⚠️ Speaker background analysis failed ({e}) -- everything else is saved.")
+
+    _save_figure_cache(df, formality_df, branch_rows, speaker_df)
     export_utterance_level(df)
 
     print(f"\nAll outputs written to: {OUT_DIR}")

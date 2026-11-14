@@ -1,7 +1,7 @@
 # Research Journey — Contact-Induced Language Change Project
 *Merged reference document for the October final paper. Phase structure and narrative follow the more detailed account (worked with longer, in more depth); supplementary technical detail folded in where it doesn't conflict. Where the two accounts disagreed, the more detailed account's version is what's stated here.*
 
-*Last updated: 2026-10-04. Phases 0–9 were checked against commit history on all three repos (WELSH, SCRAPER, TATAR) on 2026-08-13/17; Phases 10–14 were written from the working sessions and the data on disk. Late August to mid-September is not logged here.*
+*Last updated: 2026-10-20. Phases 0–9 were checked against commit history on all three repos (WELSH, SCRAPER, TATAR) on 2026-08-13/17; Phases 10–20 were written from the working sessions and the data on disk (Phases 16–17 also against `analysis/FREEZE.md`). Late August to mid-September is not logged here.*
 
 ---
 
@@ -395,18 +395,96 @@ Listing the candidates also exposed non-contexts, now excluded in code singular 
 
 **Audit round 4**, flagged erosions that held up: mutation Siarad 22/25, CorCenCC 20/24, YouTube 18/23; prepositions Siarad 19/20, CorCenCC 11/19, YouTube 2/8. **For the limitations section**: the detector is precise on human transcripts of northern speech (Siarad), weaker on southern CorCenCC prepositions (bod forms such as "ŷn ni" look like "yn" + pronoun), and poor on prepositions in Whisper transcripts.
 
-**Where things stand:** before the Oct 8 freeze: fresh window → 4 → y → 6 → d (census) → 6 → c → 6 → b; Claude judges the census and the redrawn numeral sample; then 5. Then the speaker bootstrap, the final figures and the report (due 10-30); after that, send the results to Techiaith.
+**Where things stand (as of 10-05):** before the Oct 8 freeze: fresh window → 4 → y → 6 → d (census) → 6 → c → 6 → b; Claude judges the census and the redrawn numeral sample; then 5. Then the speaker bootstrap, the final figures and the report (due 10-30); after that, send the results to Techiaith. *(All done; see Phases 16–20.)*
+
+---
+
+## Phase 16 — The last fixes before the freeze (10-06 → 10-07)
+
+**News narration as ground truth, again.** Edited narration should hardly erode, so each of its remaining flags is either a journalist's slip or a detector error. Going through them one by one gave the final batch of detection fixes (decisions #42), for example:
+- words that never mutate ("beth", "mai", "gerllaw");
+- lemma overrides where a mutated form looks like a different radical word ("goron" → "coron", "drwm" → "trwm");
+- fixed phrases ("dan glo", "y gad", "a ganlyn");
+- the feminine-noun rule no longer fires on the second of two nouns;
+- "'na" after a curly quote read as "yna"; "'n" after "a/gyda/efo" read as "ein".
+
+Narration flags fell from **321 to 197 (0.65%)**. The two news-driven passes removed about **1,400 false erosions from CorCenCC** (20,574 → 19,194), yet the CorCenCC formality slope barely moved across all versions (0.631 → 0.634 → 0.629). **For the methods section**: that stability is the robustness check — the headline result doesn't depend on the detector's remaining errors.
+
+**Infrastructure:**
+- **A by-source layout.** The run stamps in folder names had stopped meaning anything, so every document now lives under `runs/<source>/[<channel>/]<document>/`. Each run works in a staging area (`runs/_sessions/`) and moves each finished document home; a one-off migration moved the old folders. One empty CorCenCC recording ended up in `runs/other/unknown` — harmless.
+- **The laptop kept stopping long runs.** After the third Wi-Fi drop killed an overnight run, the pipeline now keeps Windows awake for as long as it runs, and the Cysill client waits up to six hours for the network to return instead of failing the document.
+- **Progress bars** for every long step, including the news reprocessing.
+
+---
+
+## Phase 17 — The Freeze (10-07 → 10-08)
+
+The user declared the data good enough to stop changing — the threshold the project had been working toward since September. **Frozen at pipeline version `79294d2fd3`** (tagging `3ce714c2bf`):
+- **Snapshots**: data in `welsh_analysis_freeze_20261008`, code in `WELSH_freeze_79294d2fd3`, plus the lemma cache. The user zipped both onto an SSD and Google Drive.
+- **The record**: `analysis/FREEZE.md` — counts, every headline table, decisions, limitations, and what may still be run (analyzer and scoring only; no detection edits, no new data).
+- **The census was finished**: 1,040 quantifier singulars judged, **49 slips**, 14 unsure, 977 not slips.
+
+**The frozen results:**
+
+| | Siarad | CorCenCC | YouTube/podcast | Patagonia |
+|---|---|---|---|---|
+| Mutation erosion (audit-corrected) | 18.9% (16.5–21.2) | 21.5% (15.7–30.4) | 23.3% (18.1–29.2) | 26.9% raw |
+| Formality OR per 10 F-points | 1.08 n.s. | **0.629** (0.57–0.695) | 0.254 (0.145–0.447) | 1.30 n.s. |
+
+Prepositions erode 5–6% with no formality slope; numeral 0.5–0.7%; the controls about 1%. News narration 0.65% is the noise floor.
+
+**The reading the project settled on:** mutation (no English counterpart) erodes about 20× more than the controls, and the numeral rule — the *opposite* of English — barely erodes. So erosion follows "English has no such category", not "differs from English". The numeral branch was built in Phase 10 as a test that could separate those two readings; it failed as a prediction and succeeded as a test. Formality is the main result; contact is the interpretation, offered as extrapolation from the pattern rather than as proven.
+
+---
+
+## Phase 18 — Deuchar replies (10-09)
+
+Margaret Deuchar answered the October 1 email: the speaker questionnaires for Siarad and Patagonia were already downloadable from BangorTalk. (The user's question on seeing the site — "what's Miami, is this a corpus we missed?" — was about Bangor's Spanish–English corpus, which is outside this project.)
+
+The questionnaires were joined to per-speaker erosion as a **supplementary** analysis; the main analysis stays the five branches and formality. Privacy: the Patagonia sheet has name, address and email columns, which were never read; Claude wrote PII-free speaker tables (151 Siarad and 87 Patagonia speakers) keyed only by file name and speaker code. The parents'-language codes had to be inferred from the data (every adult learner has code 2, so 2 = the contact language, 0 = both); the first reading had them wrong and was corrected.
+
+**Results** (149 Siarad, 80 Patagonia speakers):
+- Learned Welsh after age 4: more erosion (Siarad 18.7% vs 29.7%, Patagonia 22.3% vs 41.2%).
+- Younger: more erosion (Siarad 24.3% under 30 vs 13.8% at 70+; Patagonia 52.5% vs 18.5%).
+- Mother spoke the contact language: most erosion (Siarad 25.0%, Patagonia 48.4%).
+- Model with acquisition, age and formality together (speaker bootstrap): Siarad later acquirer OR 1.85 (1.29–2.75) and age 0.88 per 10 years, formality n.s.; in Patagonia only age is significant (0.79), because its late learners are mostly young and the two can't be separated.
+
+**For the discussion:** Patagonia's contact language is Spanish, which has no mutation either — so the pattern fits contact with a language *without the category*, not with English as such. **For the limitations:** a single point in time can't tell language change in progress from people speaking more conservatively as they age.
+
+---
+
+## Phase 19 — Figures fit for paper (10-09 → 10-11)
+
+Everything about the figures was rebuilt for an A4 report, all in the analyzer (no detection code):
+- **Print sizing**: text sized for the printed page width, titles wrapped to their plot, 200 dpi; tall single-column layouts instead of grids too narrow to read.
+- **Korean copies** of every figure in `figures/ko/`. The user read the first Korean labels, found Claude's terms clunky, and wrote their own in the report; Claude parsed the .hwp itself (in the browser: OLE container → deflated BodyText → paragraph records) and switched the figures to the report's terms (연음 변이, 변이 환경, 격식 점수 F, 올바른 변이 / 변이 침식...).
+- **Quick redraw**: a full analyzer run takes ~15 minutes, so it now caches its data and redraws only chosen figures in seconds.
+- `erosion_by_channel` became horizontal bars by mutation type, with readable source names (Haclediad's Fireside feed had been showing as a URL).
+
+---
+
+## Phase 20 — Writing (10-10 → 10-20)
+
+The report (Korean, the school's .hwp template, team "룩셈부르크에는 해군이 없다": 김지안 11208 team lead, 김용민 11206, 전현우 11226) went from Ⅰ–Ⅳ-2 to a complete **38-page** draft. Claude drafted Ⅳ-5 (speaker background) and rewrote Ⅰ and Ⅴ in the user's terms. From 10-11, the user flagged problems as they wrote, and Claude collected them in `welsh_analysis/report_polish_flags.md` (F1–F6) for one final polishing pass instead of fixing as they went.
+
+Moments worth keeping:
+- **The user's own methodological catch (F1):** a per-speaker F-score describes the *situation*, not the speaker — "I can speak formally and casually." The report now treats formality as situational throughout, and the per-speaker results as a robustness check.
+- **Citations checked online:** the two open [확인 필요] items were resolved (Stammers & Deuchar pp. 630–643; Minsafina is a book chapter), DOIs added, and the tools the method depends on (Whisper, spaCy, Cysill, the Bangor lexicon) added to the references. One claim — that the aspirate is known to decline first — still needs a checked source (candidate: Bob Morris Jones, *Mutations in spoken Welsh*).
+- **The abstract** opens with the cat from Ⅱ-1-1 — *cath* is also *nghath*, *gath* and *chath*, "one cat, four names" — and ends: 웨일스어는 사라지고 있지 않다. 다만 고양이의 이름이 하나씩 줄고 있을 뿐이다.
+- **The team name, explained.** Weinreich's "a language is a dialect with an army and a navy" — but Luxembourg has no navy, and Luxembourgish is a language anyway. The user's update for the AI era: *a language is a dialect with a dataset and a trained model.* And the project's data adds the twist: that digital army guards the formal frontier (news narration 0.65%) while everyday speech (~20%) goes undefended.
+
+**Still open:** the polish pass over the full list; swapping in the Korean figures; the user's check of the census slips; a thank-you reply to Deuchar; after the October 30 submission, the results to Techiaith (Dewi Bryn Jones asked to see them).
 
 ---
 
 ## Suggested Paper Structure Mapping
 
-- **Methods — Data Collection**: Phases 0, 3, 5 (corpus sources, multilingual scraper, YouTube/audio pipeline), 10–13 (Siarad, Patagonia, CorCenCC, news text baseline)
-- **Methods — Erosion Detection**: Phases 0–1, 4 (three-layer corroboration, corroboration-integrity fixes), 10 (five branches, coding decisions, version stamps), 13 (Controls combined)
-- **Methods — Validation**: Phases 11–13 (audit rounds, the noise floor), 14 (why small branches get rates, not slopes), 15 (quantifier census, audit round 4)
+- **Methods — Data Collection**: Phases 0, 3, 5 (corpus sources, multilingual scraper, YouTube/audio pipeline), 10–13 (Siarad, Patagonia, CorCenCC, news text baseline), 17 (the frozen dataset), 18 (speaker questionnaires)
+- **Methods — Erosion Detection**: Phases 0–1, 4 (three-layer corroboration, corroboration-integrity fixes), 10 (five branches, coding decisions, version stamps), 13 (Controls combined), 16 (final news-driven fixes)
+- **Methods — Validation**: Phases 11–13 (audit rounds, the noise floor), 14 (why small branches get rates, not slopes), 15 (quantifier census, audit round 4), 16 (slope stable across detector versions)
 - **Methods — Language Identification**: Phase 3 (weighted-vote panel, abstain-first design)
-- **Theory / Framing**: Phase 6 (unifying contact-pressure hypothesis, literature grounding), Phase 10 (the five-branch test)
-- **Results**: Phases 12–14 (formality ladder, failed numeral prediction, within-corpus slopes, mutation vs prepositions)
-- **Limitations**: Phase 3 (Cysill lockout), Phase 4 (denominator/cache issues, pre/post-fix comparability), Phase 5 (Whisper hallucination, diagnostic saga), Phase 9 (PO-token dependency, resumed-download 403s, client-mismatch/low-view-video CDN asymmetry, unpinned-nightly reproducibility risk), Phase 12 (YouTube ASR error), Phase 13 (CorCenCC learner status per recording only), Phase 14 (too few erosions for slopes on the small branches)
+- **Theory / Framing**: Phase 6 (unifying contact-pressure hypothesis, literature grounding), Phase 10 (the five-branch test), Phase 20 (Weinreich, and the "dataset and model" update)
+- **Results**: Phases 12–14 (formality ladder, failed numeral prediction, within-corpus slopes, mutation vs prepositions), 17 (frozen numbers; "no category" vs "different"), 18 (speaker background, supplementary)
+- **Limitations**: Phase 3 (Cysill lockout), Phase 4 (denominator/cache issues, pre/post-fix comparability), Phase 5 (Whisper hallucination, diagnostic saga), Phase 9 (PO-token dependency, resumed-download 403s, client-mismatch/low-view-video CDN asymmetry, unpinned-nightly reproducibility risk), Phase 12 (YouTube ASR error), Phase 13 (CorCenCC learner status per recording only), Phase 14 (too few erosions for slopes on the small branches), Phase 18 (apparent time; Patagonia age/acquisition collinear), Phase 20 (formality is situational; no within-speaker comparison)
 - **Background (no measured results)**: Phase 6–7 (Tatar arm — background only since 2026-10-01)
 - **Appendix / Reproducibility**: `SITE_OVERRIDES` table, consensus thresholds, model versions, `limitations.txt`, `pipeline_version` of the frozen data
